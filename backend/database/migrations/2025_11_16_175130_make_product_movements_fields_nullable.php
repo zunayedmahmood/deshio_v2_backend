@@ -1,0 +1,36 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('product_movements', function (Blueprint $table) {
+            $table->foreignId('from_store_id')->nullable()->change();
+            $table->foreignId('product_dispatch_id')->nullable()->change();
+            $table->decimal('unit_price', 10, 2)->nullable()->change();
+            $table->string('reference_number')->nullable()->change();
+            $table->foreignId('performed_by')->nullable()->change();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('product_movements', function (Blueprint $table) {
+            $table->foreignId('from_store_id')->nullable(false)->change();
+            $table->foreignId('product_dispatch_id')->nullable(false)->change();
+            $table->decimal('unit_price', 10, 2)->nullable(false)->change();
+            $table->string('reference_number')->nullable(false)->change();
+            $table->foreignId('performed_by')->nullable(false)->change();
+        });
+    }
+};

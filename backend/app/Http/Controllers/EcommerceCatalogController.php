@@ -142,9 +142,9 @@ class EcommerceCatalogController extends Controller
         }
 
         // Apply price and stock filters first (in HAVING)
-        if ($inStock === 'true' || $inStock === true) {
+        if ($inStock === 'true' || $inStock === true || $inStock === 'in_stock') {
             $q->havingRaw('COALESCE(SUM(product_batches.quantity), 0) > 0');
-        } elseif ($inStock === 'false' || $inStock === false) {
+        } elseif ($inStock === 'false' || $inStock === false || $inStock === 'out_of_stock' || $inStock === 'not_in_stock') {
             $q->havingRaw('COALESCE(SUM(product_batches.quantity), 0) = 0');
         }
 

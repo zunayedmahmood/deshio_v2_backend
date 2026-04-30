@@ -863,7 +863,7 @@ class ReportingController extends Controller
                     $card += $amount;
                 } elseif (str_contains($methodName, 'bkash')) {
                     $bkash += $amount;
-                } elseif (str_contains($methodName, 'nagad')) {
+                } elseif (str_contains($methodName, 'nagad') || str_contains($methodName, 'bank transfer')) {
                     $nagad += $amount;
                 }
             }

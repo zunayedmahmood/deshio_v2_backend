@@ -623,13 +623,13 @@ class ProductSearchController extends Controller
                 $query->whereHas('batches', function($q) {
                     $q->where('is_active', true)
                       ->where('availability', true)
-                      ->where('stock_qty', '>', 0);
+                      ->where('quantity', '>', 0);
                 });
-            } elseif ($filters['stock_status'] === 'not_in_stock') {
+            } elseif ($filters['stock_status'] === 'not_in_stock' || $filters['stock_status'] === 'out_of_stock') {
                 $query->whereDoesntHave('batches', function($q) {
                     $q->where('is_active', true)
                       ->where('availability', true)
-                      ->where('stock_qty', '>', 0);
+                      ->where('quantity', '>', 0);
                 });
             }
         }

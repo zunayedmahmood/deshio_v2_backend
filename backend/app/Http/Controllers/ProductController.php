@@ -79,13 +79,13 @@ class ProductController extends Controller
                 $query->whereHas('batches', function($q) {
                     $q->where('is_active', true)
                       ->where('availability', true)
-                      ->where('stock_qty', '>', 0);
+                      ->where('quantity', '>', 0);
                 });
-            } elseif ($stockStatus === 'not_in_stock' || $stockStatus === 'false' || $stockStatus === false) {
+            } elseif ($stockStatus === 'not_in_stock' || $stockStatus === 'out_of_stock' || $stockStatus === 'false' || $stockStatus === false) {
                 $query->whereDoesntHave('batches', function($q) {
                     $q->where('is_active', true)
                       ->where('availability', true)
-                      ->where('stock_qty', '>', 0);
+                      ->where('quantity', '>', 0);
                 });
             }
         }
@@ -111,23 +111,31 @@ class ProductController extends Controller
         $allowedSortFields = ['name', 'sku', 'created_at', 'updated_at', 'price'];
 
         // Handle Grouping by SKU
+        // Base columns for selection
+        $selectColumns = ['products.*'];
+
+        // Add subqueries for price and stock stats to improve performance (avoid N+1)
+        $query->addSelect([
+            'selling_price' => \App\Models\ProductBatch::select('sell_price')
+                ->whereColumn('product_id', 'products.id')
+                ->where('is_active', true)
+                ->where('availability', true)
+                ->orderBy('sell_price', 'asc')
+                ->limit(1),
+            'stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(quantity), 0)')
+                ->whereColumn('product_id', 'products.id')
+                ->where('is_active', true),
+            'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
+                ->whereColumn('product_id', 'products.id')
+                ->where('is_active', true)
+                ->where('availability', true)
+        ]);
+
         if ($request->boolean('group_by_sku', true)) {
             // Step 1: Get the list of SKUs that match the filters
             // We use a subquery approach to ensure pagination works on groups, not individual products
             $filteredSkuQuery = clone $query;
             
-            // If sorting by price, we need to join batches to the subquery
-            if ($sortBy === 'price') {
-                $filteredSkuQuery->addSelect([
-                    'min_price' => \App\Models\ProductBatch::select('sell_price')
-                        ->whereColumn('product_id', 'products.id')
-                        ->where('is_active', true)
-                        ->where('availability', true)
-                        ->orderBy('sell_price', 'asc')
-                        ->limit(1)
-                ]);
-            }
-
             // Create a sub-select to get unique SKUs and their representative (latest created product)
             $subQuery = DB::table('products')
                 ->whereIn('id', function($q) use ($filteredSkuQuery) {
@@ -138,16 +146,13 @@ class ProductController extends Controller
 
             // Apply sorting to the groups
             if ($sortBy === 'name') {
-                // For name, we pick the MAX name in the group (usually consistent)
                 $subQuery->addSelect(DB::raw('MAX(name) as sort_name'))->orderBy('sort_name', $sortDirection);
             } elseif ($sortBy === 'sku') {
                 $subQuery->orderBy('sku', $sortDirection);
             } elseif ($sortBy === 'price') {
-                // This is slightly complex, ideally we sort by the MIN price within the SKU group
                 $subQuery->addSelect(DB::raw('(SELECT MIN(sell_price) FROM product_batches WHERE product_id IN (SELECT id FROM products p2 WHERE p2.sku = products.sku)) as min_group_price'))
                          ->orderBy('min_group_price', $sortDirection);
             } else {
-                // Default to created_at
                 $subQuery->addSelect(DB::raw('MAX(created_at) as latest_created'))->orderBy('latest_created', $sortDirection);
             }
 
@@ -155,10 +160,25 @@ class ProductController extends Controller
             $representativeIds = collect($pagedGroups->items())->pluck('representative_id')->filter()->values();
             $skus = collect($pagedGroups->items())->pluck('sku')->filter()->values();
 
-            // Load full models for the representatives
+            // Load full models for the representatives with price/stock subqueries
             $products = Product::with(['category', 'vendor', 'productFields.field', 'images' => function($q) {
                 $q->where('is_active', true)->orderBy('is_primary', 'desc')->orderBy('sort_order');
             }])
+            ->addSelect([
+                'selling_price' => \App\Models\ProductBatch::select('sell_price')
+                    ->whereColumn('product_id', 'products.id')
+                    ->where('is_active', true)
+                    ->where('availability', true)
+                    ->orderBy('sell_price', 'asc')
+                    ->limit(1),
+                'stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(quantity), 0)')
+                    ->whereColumn('product_id', 'products.id')
+                    ->where('is_active', true),
+                'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
+                    ->whereColumn('product_id', 'products.id')
+                    ->where('is_active', true)
+                    ->where('availability', true)
+            ])
             ->whereIn('id', $representativeIds)
             ->get();
 
@@ -167,15 +187,36 @@ class ProductController extends Controller
                 return $representativeIds->search($product->id);
             })->values();
 
-            // Load variants for these SKUs
+            // Load variants for these SKUs with price/stock subqueries
             $allVariants = Product::with(['productFields.field', 'images' => function($q) {
                 $q->where('is_active', true)->orderBy('is_primary', 'desc')->orderBy('sort_order');
             }])
+            ->addSelect([
+                'selling_price' => \App\Models\ProductBatch::select('sell_price')
+                    ->whereColumn('product_id', 'products.id')
+                    ->where('is_active', true)
+                    ->where('availability', true)
+                    ->orderBy('sell_price', 'asc')
+                    ->limit(1),
+                'stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(quantity), 0)')
+                    ->whereColumn('product_id', 'products.id')
+                    ->where('is_active', true),
+                'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
+                    ->whereColumn('product_id', 'products.id')
+                    ->where('is_active', true)
+                    ->where('availability', true)
+            ])
             ->whereIn('sku', $skus)
-            ->whereNotIn('id', $representativeIds)
-            ->where('is_archived', false) // Only active variants by default
-            ->get()
-            ->groupBy('sku');
+            ->whereNotIn('id', $representativeIds);
+
+            // Respect is_archived filter for variants as well
+            if ($request->has('is_archived')) {
+                $allVariants->where('is_archived', $request->boolean('is_archived'));
+            } else {
+                $allVariants->where('is_archived', false);
+            }
+
+            $allVariants = $allVariants->get()->groupBy('sku');
 
             foreach ($products as $product) {
                 $product->variants = $allVariants->get($product->sku, collect());
@@ -197,14 +238,7 @@ class ProductController extends Controller
         // --- Flat (non-grouped) fallback logic ---
         
         if ($sortBy === 'price') {
-            $query->addSelect([
-                'min_price' => \App\Models\ProductBatch::select('sell_price')
-                    ->whereColumn('product_id', 'products.id')
-                    ->where('is_active', true)
-                    ->where('availability', true)
-                    ->orderBy('sell_price', 'asc')
-                    ->limit(1)
-            ])->orderBy('min_price', $sortDirection);
+            $query->orderBy('selling_price', $sortDirection);
         } elseif (in_array($sortBy, $allowedSortFields)) {
             $query->orderBy($sortBy, $sortDirection);
         }

@@ -1,6 +1,0 @@
-ItemType,StoreName,MerchantOrderId,RecipientName(*),RecipientPhone(*),RecipientAddress(*),RecipientCity(*),RecipientZone(*),RecipientArea,AmountToCollect(*),ItemQuantity,ItemWeight,ItemDesc,SpecialInstruction
-parcel,Cutsy BD,,Zubayer,01553301806,"H-41, R19, S11, Uttara",,,,500,2,0.5,,
-parcel,Cutsy BD,,Zunayed,01705058873,Tungipara,,,,900,3,0.5,,
-parcel,Cutsy BD,,Zunayed,01705058874,"Tutpara, Khulna",,,,900,3,0.5,,
-parcel,Cutsy BD,,Zunayed,01705058875,"Jomidarbari, Faridpur",,,,900,3,0.5,,
-parcel,Cutsy BD,,Zunayed,01705058876,"Errum BD, Pallabi, Mirpur",,,,900,3,0.5,,

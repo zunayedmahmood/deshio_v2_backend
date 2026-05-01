@@ -1,2 +1,0 @@
-this image is only for styling purposes. 
-the original footer text and links will be source of truth.

@@ -1,9 +1,0 @@
-Super admin:
-email: mueedibnesami.anoy@gmail.com
-password: 12345678
-
-Branch Manager:
-email: branchmanager@manager.com
-password: 12345678
-
-base frontend-url: https://errum-v2.vercel.app/ 

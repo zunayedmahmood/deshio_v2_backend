@@ -78,14 +78,14 @@ export default function DailyBranchReportPage() {
   const { role, storeId: userStoreId, isAdmin, isSuperAdmin } = useAuth() as any;
   const router = useRouter();
 
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [stores, setStores] = useState<Store[]>([]);
+  const [sidebarOpen, setSidebarOpen]   = useState(false);
+  const [stores, setStores]             = useState<Store[]>([]);
   const [selectedStore, setSelectedStore] = useState<number | ''>('');
-  const [dateFrom, setDateFrom] = useState(yesterday());
-  const [dateTo, setDateTo] = useState(yesterday());
-  const [rows, setRows] = useState<DailyBranchRow[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [dateFrom, setDateFrom]         = useState(yesterday());
+  const [dateTo, setDateTo]             = useState(yesterday());
+  const [rows, setRows]                 = useState<DailyBranchRow[]>([]);
+  const [loading, setLoading]           = useState(false);
+  const [error, setError]               = useState<string | null>(null);
 
   // Which date is currently shown in the detail cards (when multi-day range)
   const [activeDateIdx, setActiveDateIdx] = useState(0);
@@ -102,7 +102,7 @@ export default function DailyBranchReportPage() {
 
   useEffect(() => {
     if (canSelectStore) {
-      storeService.getAllStores().then(setStores).catch(() => { });
+      storeService.getAllStores().then(setStores).catch(() => {});
     }
   }, [canSelectStore]);
 
@@ -113,8 +113,8 @@ export default function DailyBranchReportPage() {
     setError(null);
     try {
       const res = await dailyBranchReportService.getReport({
-        from: dateFrom,
-        to: dateTo,
+        from:     dateFrom,
+        to:       dateTo,
         store_id: selectedStore || undefined,
       });
       setRows(res.data);
@@ -134,23 +134,23 @@ export default function DailyBranchReportPage() {
   const dates = [...new Set(rows.map(r => r.date))].sort();
 
   // Rows for the currently visible date
-  const activeDate = dates[activeDateIdx] ?? dateFrom;
-  const activeRows = rows.filter(r => r.date === activeDate);
+  const activeDate   = dates[activeDateIdx] ?? dateFrom;
+  const activeRows   = rows.filter(r => r.date === activeDate);
 
   // Aggregate across all branches for the active date
   const agg = activeRows.reduce(
     (acc, r) => ({
-      pos_sales: acc.pos_sales + r.pos_sales,
-      online_sales: acc.online_sales + r.online_sales,
+      pos_sales:             acc.pos_sales             + r.pos_sales,
+      online_sales:          acc.online_sales          + r.online_sales,
       social_commerce_sales: acc.social_commerce_sales + r.social_commerce_sales,
-      total_sales: acc.total_sales + r.total_sales,
-      cash_in: acc.cash_in + r.cash_in,
-      card_in: acc.card_in + r.card_in,
-      mfs_in: acc.mfs_in + r.mfs_in,
-      bank_in: acc.bank_in + r.bank_in,
-      total_money_in: acc.total_money_in + r.total_money_in,
-      daily_expenses: acc.daily_expenses + r.daily_expenses,
-      net_cash_position: acc.net_cash_position + r.net_cash_position,
+      total_sales:           acc.total_sales           + r.total_sales,
+      cash_in:               acc.cash_in               + r.cash_in,
+      card_in:               acc.card_in               + r.card_in,
+      mfs_in:                acc.mfs_in                + r.mfs_in,
+      bank_in:               acc.bank_in               + r.bank_in,
+      total_money_in:        acc.total_money_in        + r.total_money_in,
+      daily_expenses:        acc.daily_expenses        + r.daily_expenses,
+      net_cash_position:     acc.net_cash_position     + r.net_cash_position,
     }),
     {
       pos_sales: 0, online_sales: 0, social_commerce_sales: 0, total_sales: 0,
@@ -159,24 +159,21 @@ export default function DailyBranchReportPage() {
     }
   );
 
-  const [downloading, setDownloading] = useState(false);
-
   // ── download ──
 
-  async function handleDownload() {
-    setDownloading(true);
-    try {
-      await dailyBranchReportService.downloadCsv({
-        from: dateFrom,
-        to: dateTo,
-        store_id: selectedStore || undefined,
-        combined: true,
-      });
-    } catch (e: any) {
-      setError('CSV download failed. Please try again.');
-    } finally {
-      setDownloading(false);
-    }
+  function handleDownload() {
+    const url = dailyBranchReportService.downloadUrl({
+      from:     dateFrom,
+      to:       dateTo,
+      store_id: selectedStore || undefined,
+      combined: true,
+    });
+    // Open in same tab — browser will treat CSV/zip as download
+    const a = document.createElement('a');
+    a.href = url;
+    // Pass auth token via header isn't possible with <a href>, so rely on cookie/session
+    // If your app uses Bearer tokens, generate a signed URL on the backend instead.
+    a.click();
   }
 
   // ── quick-jump: set range to a single day ──
@@ -231,14 +228,10 @@ export default function DailyBranchReportPage() {
 
                   <button
                     onClick={handleDownload}
-                    disabled={downloading}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-black dark:bg-white text-white dark:text-black rounded-md hover:bg-gray-800 dark:hover:bg-gray-100 transition-colors font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-black dark:bg-white text-white dark:text-black rounded-md hover:bg-gray-800 dark:hover:bg-gray-100 transition-colors font-medium"
                   >
-                    {downloading
-                      ? <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                      : <Download className="w-3.5 h-3.5" />
-                    }
-                    {downloading ? 'Preparing…' : 'Download CSV'}
+                    <Download className="w-3.5 h-3.5" />
+                    Download CSV
                   </button>
                 </div>
               </div>
@@ -329,10 +322,11 @@ export default function DailyBranchReportPage() {
                           <button
                             key={d}
                             onClick={() => setActiveDateIdx(i)}
-                            className={`flex-shrink-0 px-3 py-1 text-xs rounded-full border transition-colors ${i === activeDateIdx
+                            className={`flex-shrink-0 px-3 py-1 text-xs rounded-full border transition-colors ${
+                              i === activeDateIdx
                                 ? 'bg-black dark:bg-white text-white dark:text-black border-transparent font-medium'
                                 : 'border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800'
-                              }`}
+                            }`}
                           >
                             {new Date(d + 'T00:00:00').toLocaleDateString('en-BD', { day: 'numeric', month: 'short' })}
                           </button>
@@ -364,9 +358,9 @@ export default function DailyBranchReportPage() {
                   {/* ── Summary cards (aggregate across all visible branches) ── */}
                   <Divider label="Sales" />
                   <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 mb-1">
-                    <StatCard label="POS Sales" value={fmt(agg.pos_sales)} icon={ShoppingCart} accent="text-gray-900 dark:text-white" />
-                    <StatCard label="Online Sales" value={fmt(agg.online_sales)} icon={Globe} accent="text-blue-600 dark:text-blue-400" />
-                    <StatCard label="Social Commerce" value={fmt(agg.social_commerce_sales)} icon={Users} accent="text-violet-600 dark:text-violet-400" />
+                    <StatCard label="POS Sales"        value={fmt(agg.pos_sales)}             icon={ShoppingCart} accent="text-gray-900 dark:text-white" />
+                    <StatCard label="Online Sales"     value={fmt(agg.online_sales)}           icon={Globe}        accent="text-blue-600 dark:text-blue-400" />
+                    <StatCard label="Social Commerce"  value={fmt(agg.social_commerce_sales)}  icon={Users}        accent="text-violet-600 dark:text-violet-400" />
                     <StatCard
                       label="Total Sales"
                       value={fmt(agg.total_sales)}
@@ -378,10 +372,10 @@ export default function DailyBranchReportPage() {
 
                   <Divider label="Money collected" />
                   <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 mb-1">
-                    <StatCard label="Cash In" value={fmt(agg.cash_in)} icon={Banknote} accent="text-gray-900 dark:text-white" />
-                    <StatCard label="Card In" value={fmt(agg.card_in)} icon={CreditCard} accent="text-blue-600 dark:text-blue-400" />
-                    <StatCard label="MFS In" value={fmt(agg.mfs_in)} icon={Smartphone} accent="text-pink-600 dark:text-pink-400" sub="bKash, Nagad, etc." />
-                    <StatCard label="Bank Transfer In" value={fmt(agg.bank_in)} icon={Building2} accent="text-indigo-600 dark:text-indigo-400" />
+                    <StatCard label="Cash In"         value={fmt(agg.cash_in)}        icon={Banknote}   accent="text-gray-900 dark:text-white" />
+                    <StatCard label="Card In"         value={fmt(agg.card_in)}         icon={CreditCard} accent="text-blue-600 dark:text-blue-400" />
+                    <StatCard label="MFS In"          value={fmt(agg.mfs_in)}          icon={Smartphone} accent="text-pink-600 dark:text-pink-400"   sub="bKash, Nagad, etc." />
+                    <StatCard label="Bank Transfer In" value={fmt(agg.bank_in)}        icon={Building2}  accent="text-indigo-600 dark:text-indigo-400" />
                   </div>
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 gap-3 mb-1 max-w-md">
                     <StatCard
@@ -426,10 +420,11 @@ export default function DailyBranchReportPage() {
                             >
                               <div className="flex items-center justify-between mb-3">
                                 <span className="text-sm font-semibold text-gray-900 dark:text-white">{row.branch}</span>
-                                <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${branchPos
+                                <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                                  branchPos
                                     ? 'bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400'
                                     : 'bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-400'
-                                  }`}>
+                                }`}>
                                   {branchPos ? '+' : ''}{fmt(branchNet)}
                                 </span>
                               </div>

@@ -1,7 +1,0 @@
-for the new arrivals, the categories selection, use subcategories for errum. there is no need for nesting them under categories.
-Also, instead of showing few new ones, we'll show upto 100 products arranged by date. All products selection will select from all subcategories, and individual selection will show from them. if a subcategory doesn't have 50-60 products, we'll show whatever count they have.
-
-we're going to keep the instagram viewer.
-the new arrival ticker is to be removed.
-
-it should be mobile optimised.

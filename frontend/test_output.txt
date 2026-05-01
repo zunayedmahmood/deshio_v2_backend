@@ -1,8 +1,0 @@
-Logging in...
-Login successful
-TEST: Advanced Search "Nike"
-STATUS: 200 | TIME: 2574ms | SUCCESS: true
-DEBUG: data keys: [data, total, current_page, last_page, per_page, query, search_terms, search_metadata]
-DEBUG: data.data type: object, isArray: false
-ITEMS: undefined | TOTAL: 577
--------------------

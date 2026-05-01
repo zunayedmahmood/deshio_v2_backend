@@ -1,1 +1,0 @@
-this is how navbar will look in mobile view instead of a sidebar.

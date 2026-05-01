@@ -34,6 +34,34 @@ class ProductBatchController extends Controller
             $query->byStore($request->store_id);
         }
 
+        if ($request->filled('product_ids')) {
+            $ids = $request->product_ids;
+            if (is_string($ids)) {
+                $ids = preg_split('/,/', $ids);
+            }
+            $ids = collect((array) $ids)
+                ->map(fn ($id) => (int) $id)
+                ->filter(fn ($id) => $id > 0)
+                ->unique()
+                ->values()
+                ->all();
+            if (!empty($ids)) {
+                $query->whereIn('product_id', $ids);
+            }
+        }
+
+        if ($request->filled('exact_price')) {
+            $query->where('sell_price', (float) $request->exact_price);
+        }
+
+        if ($request->filled('min_sell_price')) {
+            $query->where('sell_price', '>=', (float) $request->min_sell_price);
+        }
+
+        if ($request->filled('max_sell_price')) {
+            $query->where('sell_price', '<=', (float) $request->max_sell_price);
+        }
+
         // Filter by status
         if ($request->filled('status')) {
             switch ($request->status) {
@@ -70,14 +98,21 @@ class ProductBatchController extends Controller
 
         // Search by batch number, product name, or product SKU
         if ($request->filled('search')) {
-            $search = $request->search;
-            $query->where(function ($q) use ($search) {
-                $this->whereLike($q, 'batch_number', $search);
-                $q->orWhereHas('product', function ($pq) use ($search) {
-                    $this->whereLike($pq, 'name', $search);
-                    $this->orWhereLike($pq, 'sku', $search);
+            $term = trim((string) $request->search);
+            if ($term !== '') {
+                $query->where(function ($q) use ($term) {
+                    $q->where('batch_number', 'like', "%{$term}%")
+                        ->orWhereHas('barcode', function($bq) use ($term) {
+                            $bq->where('barcode', 'like', "%{$term}%");
+                        })
+                        ->orWhereHas('product', function ($productQuery) use ($term) {
+                            $productQuery->where('name', 'like', "%{$term}%")
+                                ->orWhere('base_name', 'like', "%{$term}%")
+                                ->orWhere('variation_suffix', 'like', "%{$term}%")
+                                ->orWhere('sku', 'like', "%{$term}%");
+                        });
                 });
-            });
+            }
         }
 
         // Sort

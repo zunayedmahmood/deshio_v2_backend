@@ -87,6 +87,15 @@ class ProductController extends Controller
                       ->where('availability', true)
                       ->where('quantity', '>', 0);
                 });
+            } elseif ($stockStatus === 'available_online') {
+                $query->whereHas('batches', function($q) {
+                    $q->where('is_active', true)
+                      ->where('availability', true)
+                      ->where('quantity', '>', 0)
+                      ->whereHas('store', function($q2) {
+                          $q2->where('is_online', true);
+                      });
+                });
             }
         }
 
@@ -125,6 +134,16 @@ class ProductController extends Controller
             'stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(quantity), 0)')
                 ->whereColumn('product_id', 'products.id')
                 ->where('is_active', true),
+            'online_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
+                ->join('stores', 'stores.id', '=', 'product_batches.store_id')
+                ->whereColumn('product_batches.product_id', 'products.id')
+                ->where('product_batches.is_active', true)
+                ->where('stores.is_online', true),
+            'offline_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
+                ->join('stores', 'stores.id', '=', 'product_batches.store_id')
+                ->whereColumn('product_batches.product_id', 'products.id')
+                ->where('product_batches.is_active', true)
+                ->where('stores.is_online', false),
             'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
                 ->whereColumn('product_id', 'products.id')
                 ->where('is_active', true)
@@ -174,6 +193,16 @@ class ProductController extends Controller
                 'stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(quantity), 0)')
                     ->whereColumn('product_id', 'products.id')
                     ->where('is_active', true),
+                'online_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
+                    ->join('stores', 'stores.id', '=', 'product_batches.store_id')
+                    ->whereColumn('product_batches.product_id', 'products.id')
+                    ->where('product_batches.is_active', true)
+                    ->where('stores.is_online', true),
+                'offline_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
+                    ->join('stores', 'stores.id', '=', 'product_batches.store_id')
+                    ->whereColumn('product_batches.product_id', 'products.id')
+                    ->where('product_batches.is_active', true)
+                    ->where('stores.is_online', false),
                 'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
                     ->whereColumn('product_id', 'products.id')
                     ->where('is_active', true)
@@ -201,6 +230,16 @@ class ProductController extends Controller
                 'stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(quantity), 0)')
                     ->whereColumn('product_id', 'products.id')
                     ->where('is_active', true),
+                'online_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
+                    ->join('stores', 'stores.id', '=', 'product_batches.store_id')
+                    ->whereColumn('product_batches.product_id', 'products.id')
+                    ->where('product_batches.is_active', true)
+                    ->where('stores.is_online', true),
+                'offline_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
+                    ->join('stores', 'stores.id', '=', 'product_batches.store_id')
+                    ->whereColumn('product_batches.product_id', 'products.id')
+                    ->where('product_batches.is_active', true)
+                    ->where('stores.is_online', false),
                 'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
                     ->whereColumn('product_id', 'products.id')
                     ->where('is_active', true)

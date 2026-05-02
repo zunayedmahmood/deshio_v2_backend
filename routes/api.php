@@ -39,6 +39,7 @@ use App\Http\Controllers\PriceController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\BusinessAnalyticsController;
 use App\Http\Controllers\StockIntelligenceController;
+use App\Http\Controllers\ExchangeController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 

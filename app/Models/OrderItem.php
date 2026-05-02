@@ -46,13 +46,23 @@ class OrderItem extends Model
 
         static::creating(function ($item) {
             if (empty($item->total_amount)) {
-                $item->total_amount = ($item->quantity * $item->unit_price) - $item->discount_amount + $item->tax_amount;
+                $taxMode = config('app.tax_mode', 'inclusive');
+                if ($taxMode === 'inclusive') {
+                    $item->total_amount = ($item->quantity * $item->unit_price) - ($item->discount_amount ?? 0);
+                } else {
+                    $item->total_amount = ($item->quantity * $item->unit_price) - ($item->discount_amount ?? 0) + ($item->tax_amount ?? 0);
+                }
             }
         });
 
         static::updating(function ($item) {
             if ($item->isDirty(['quantity', 'unit_price', 'discount_amount', 'tax_amount'])) {
-                $item->total_amount = ($item->quantity * $item->unit_price) - $item->discount_amount + $item->tax_amount;
+                $taxMode = config('app.tax_mode', 'inclusive');
+                if ($taxMode === 'inclusive') {
+                    $item->total_amount = ($item->quantity * $item->unit_price) - ($item->discount_amount ?? 0);
+                } else {
+                    $item->total_amount = ($item->quantity * $item->unit_price) - ($item->discount_amount ?? 0) + ($item->tax_amount ?? 0);
+                }
             }
         });
     }

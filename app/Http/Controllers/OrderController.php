@@ -604,25 +604,12 @@ class OrderController extends Controller
                 }
             }
 
-            // Calculate order totals based on tax mode
-            $taxMode = config('app.tax_mode', 'inclusive');
-            $orderDiscount = $request->discount_amount ?? 0;
-            $shippingAmount = $request->shipping_amount ?? 0;
+            // Calculate order totals using centralized logic
+            $order->calculateTotals();
             
-            if ($taxMode === 'inclusive') {
-                // Inclusive: tax already in subtotal
-                $totalAmount = $subtotal - ($orderDiscount + $totalItemDiscount) + $shippingAmount;
-            } else {
-                // Exclusive: add tax to subtotal
-                $totalAmount = $subtotal + $taxTotal - ($orderDiscount + $totalItemDiscount) + $shippingAmount;
-            }
-
+            // Mark as pre-order if any items lack batches
             $order->update([
-                'subtotal' => $subtotal,
-                'tax_amount' => $taxTotal,
-                'total_amount' => $totalAmount,
-                'outstanding_amount' => $totalAmount,
-                'is_preorder' => $hasPreOrderItems,  // Mark order as pre-order if any items lack batches
+                'is_preorder' => $hasPreOrderItems,
             ]);
 
             // Setup installment plan if requested
@@ -767,36 +754,15 @@ class OrderController extends Controller
             }
 
             if ($request->has('discount_amount')) {
-                $oldDiscount = $order->discount_amount;
                 $order->discount_amount = $request->discount_amount;
-                
-                $totalItemDiscount = $order->items->sum('discount_amount');
-                $taxTotal = $order->items->sum('tax_amount');
-                $taxMode = config('app.tax_mode', 'inclusive');
-
-                if ($taxMode === 'inclusive') {
-                    $order->total_amount = $order->subtotal - $request->discount_amount - $totalItemDiscount + $order->shipping_amount;
-                } else {
-                    $order->total_amount = $order->subtotal + $taxTotal - $request->discount_amount - $totalItemDiscount + $order->shipping_amount;
-                }
-                $order->outstanding_amount = $order->total_amount - $order->paid_amount;
             }
 
             if ($request->has('shipping_amount')) {
-                $oldShipping = $order->shipping_amount;
                 $order->shipping_amount = $request->shipping_amount;
-                
-                $totalItemDiscount = $order->items->sum('discount_amount');
-                $taxTotal = $order->items->sum('tax_amount');
-                $taxMode = config('app.tax_mode', 'inclusive');
-
-                if ($taxMode === 'inclusive') {
-                    $order->total_amount = $order->subtotal - $order->discount_amount - $totalItemDiscount + $request->shipping_amount;
-                } else {
-                    $order->total_amount = $order->subtotal + $taxTotal - $order->discount_amount - $totalItemDiscount + $request->shipping_amount;
-                }
-                $order->outstanding_amount = $order->total_amount - $order->paid_amount;
             }
+
+            // Sync totals
+            $order->calculateTotals();
 
             if ($request->has('notes')) {
                 $order->notes = $request->notes;

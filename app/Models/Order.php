@@ -689,29 +689,37 @@ class Order extends Model
     {
         $taxMode = config('app.tax_mode', 'inclusive');
         
-        $itemsSubtotal = $this->items->sum('total_amount');
-        $servicesSubtotal = $this->serviceItems->sum('total_price');
-        $subtotal = $itemsSubtotal + $servicesSubtotal;
+        // 1. Calculate Gross Subtotal (Sum of quantity * unit_price)
+        $itemsGrossSubtotal = $this->items->sum(fn($i) => (float) bcmul((string)$i->quantity, (string)$i->unit_price, 2));
+        $servicesGrossSubtotal = $this->serviceItems->sum(fn($i) => (float) bcmul((string)$i->quantity, (string)$i->unit_price, 2));
+        $grossSubtotal = $itemsGrossSubtotal + $servicesGrossSubtotal;
         
-        $taxAmount = $this->items->sum('tax_amount'); // Services currently don't have separate tax_amount in schema
-        
+        // 2. Sum up all item-level discounts
         $itemsDiscount = $this->items->sum('discount_amount');
         $servicesDiscount = $this->serviceItems->sum('discount_amount');
-        $discountAmount = $itemsDiscount + $servicesDiscount;
+        $totalItemDiscount = $itemsDiscount + $servicesDiscount;
 
-        $this->subtotal = $subtotal;
+        // 3. Sum up all item-level taxes
+        $taxAmount = $this->items->sum('tax_amount'); 
+        
+        // 4. Update order fields
+        $this->subtotal = $grossSubtotal; // Now standardized as Gross Subtotal
         $this->tax_amount = $taxAmount;
-        $this->discount_amount = $discountAmount;
-
+        
+        // discount_amount field is now treated EXCLUSIVELY as a Global/Bulk discount.
+        $globalDiscount = $this->discount_amount ?? 0;
+        
         if ($taxMode === 'inclusive') {
-            // Inclusive: Tax is already included in subtotal
-            // Total = subtotal - discount + shipping
-            $this->attributes['total_amount'] = bcadd(bcsub($subtotal, $discountAmount, 2), $this->shipping_amount, 2);
+            // Inclusive: Tax is already part of the unit price/gross
+            // Total = Gross - ItemDiscounts - GlobalDiscount + Shipping
+            $netAmount = bcsub(bcsub((string)$grossSubtotal, (string)$totalItemDiscount, 2), (string)$globalDiscount, 2);
+            $this->attributes['total_amount'] = (float) bcadd($netAmount, (string)$this->shipping_amount, 2);
         } else {
-            // Exclusive: Tax is calculated on top of subtotal
-            // Total = subtotal + tax - discount + shipping
-            $totalBeforeShipping = bcadd(bcsub($subtotal, $discountAmount, 2), $taxAmount, 2);
-            $this->attributes['total_amount'] = bcadd($totalBeforeShipping, $this->shipping_amount, 2);
+            // Exclusive: Tax is added on top of the net amount
+            // Total = (Gross - ItemDiscounts - GlobalDiscount) + Tax + Shipping
+            $netAmount = bcsub(bcsub((string)$grossSubtotal, (string)$totalItemDiscount, 2), (string)$globalDiscount, 2);
+            $withTax = bcadd($netAmount, (string)$taxAmount, 2);
+            $this->attributes['total_amount'] = (float) bcadd($withTax, (string)$this->shipping_amount, 2);
         }
 
         $this->save();

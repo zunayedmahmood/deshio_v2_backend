@@ -59,7 +59,7 @@ class ServiceOrderItem extends Model
 
         static::creating(function ($item) {
             if (empty($item->total_price)) {
-                $item->total_price = $item->quantity * $item->unit_price;
+                $item->total_price = ($item->quantity * $item->unit_price) - ($item->discount_amount ?? 0);
             }
 
             // Set service details if not provided
@@ -72,8 +72,8 @@ class ServiceOrderItem extends Model
         });
 
         static::updating(function ($item) {
-            if ($item->isDirty(['quantity', 'unit_price'])) {
-                $item->total_price = $item->quantity * $item->unit_price;
+            if ($item->isDirty(['quantity', 'unit_price', 'discount_amount'])) {
+                $item->total_price = ($item->quantity * $item->unit_price) - ($item->discount_amount ?? 0);
             }
         });
     }

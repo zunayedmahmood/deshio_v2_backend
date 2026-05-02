@@ -645,13 +645,7 @@ class EcommerceOrderController extends Controller
 
     // Helper methods
 
-    private function generateOrderNumber(): string
-    {
-        $prefix = 'ORD';
-        $timestamp = now()->format('ymd');
-        $random = str_pad(random_int(1, 9999), 4, '0', STR_PAD_LEFT);
-        return "{$prefix}-{$timestamp}-{$random}";
-    }
+
 
     private function calculateDeliveryCharge(CustomerAddress $address): float
     {

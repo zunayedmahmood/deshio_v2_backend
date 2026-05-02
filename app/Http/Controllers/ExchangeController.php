@@ -148,7 +148,7 @@ class ExchangeController extends Controller
 
 
             // --- 2. CREATE REPLACEMENT ORDER ---
-            $orderNumber = $this->generateOrderNumber();
+            $orderNumber = Order::generateOrderNumber();
             $replacementOrder = Order::create([
                 'order_number' => $orderNumber,
                 'customer_id' => $customer_id,
@@ -380,12 +380,7 @@ class ExchangeController extends Controller
         return 'RET-' . $date . '-' . str_pad($count, 4, '0', STR_PAD_LEFT);
     }
 
-    private function generateOrderNumber(): string
-    {
-        $date = now()->format('Ymd');
-        $count = DB::table('orders')->whereDate('created_at', now())->count() + 1;
-        return 'ORD-' . $date . '-' . str_pad($count, 4, '0', STR_PAD_LEFT);
-    }
+
 
     private function calculateTax($unitPrice, $quantity, $taxPercentage)
     {

@@ -848,11 +848,25 @@ class Order extends Model
     // Static methods
     public static function generateOrderNumber(): string
     {
-        do {
-            $orderNumber = 'ORD-' . date('Ymd') . '-' . strtoupper(substr(md5(uniqid()), 0, 6));
-        } while (static::where('order_number', $orderNumber)->exists());
+        // Find the latest order with the sequential pattern ORD-<number>
+        $latestOrder = static::where('order_number', 'REGEXP', '^ORD-[0-9]+$')
+            ->orderByRaw('CAST(SUBSTRING(order_number, 5) AS UNSIGNED) DESC')
+            ->first();
 
-        return $orderNumber;
+        if ($latestOrder) {
+            $lastNumber = (int) substr($latestOrder->order_number, 4);
+            $nextNumber = $lastNumber + 1;
+        } else {
+            // If no ORD-<number> exists, start from 1
+            $nextNumber = 1;
+            
+            // Safety: Check if ORD-1 already exists (e.g. from a previous partial implementation)
+            while (static::where('order_number', 'ORD-' . $nextNumber)->exists()) {
+                $nextNumber++;
+            }
+        }
+
+        return 'ORD-' . $nextNumber;
     }
 
     public static function getOrderStats($storeId = null)

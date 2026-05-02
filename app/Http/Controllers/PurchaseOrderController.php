@@ -1,7 +1,5 @@
 <?php
-
 namespace App\Http\Controllers;
-
 use App\Models\PurchaseOrder;
 use App\Models\PurchaseOrderItem;
 use App\Models\Product;
@@ -9,8 +7,11 @@ use App\Models\Store;
 use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Validation\Rule;
-
+use App\Models\ProductBatch;
+use App\Models\ProductBarcode;
+use App\Models\MasterInventory;
 class PurchaseOrderController extends Controller
 {
     use DatabaseAgnosticSearch;
@@ -37,7 +38,6 @@ class PurchaseOrderController extends Controller
             'items.*.discount_amount' => 'nullable|numeric|min:0',
             'items.*.notes' => 'nullable|string',
         ]);
-
         // Verify store is a warehouse
         $store = Store::findOrFail($validated['store_id']);
         if (!$store->is_warehouse) {
@@ -46,7 +46,6 @@ class PurchaseOrderController extends Controller
                 'message' => 'Only warehouse can receive products from vendors'
             ], 422);
         }
-
         DB::beginTransaction();
         try {
             // Create purchase order
@@ -65,7 +64,6 @@ class PurchaseOrderController extends Controller
                 'notes' => $validated['notes'] ?? null,
                 'terms_and_conditions' => $validated['terms_and_conditions'] ?? null,
             ]);
-
             // Create purchase order items
             foreach ($validated['items'] as $itemData) {
                 $product = Product::findOrFail($itemData['product_id']);
@@ -83,13 +81,10 @@ class PurchaseOrderController extends Controller
                     'notes' => $itemData['notes'] ?? null,
                 ]);
             }
-
             // Calculate totals
             $po->calculateTotals();
             $po->save();
-
             DB::commit();
-
             return response()->json([
                 'success' => true,
                 'message' => 'Purchase order created successfully',
@@ -103,52 +98,41 @@ class PurchaseOrderController extends Controller
             ], 500);
         }
     }
-
     /**
      * Get all purchase orders with filters
      */
     public function index(Request $request)
     {
         $query = PurchaseOrder::with(['vendor', 'store', 'createdBy']);
-
         // Filters
         if ($request->has('vendor_id')) {
             $query->where('vendor_id', $request->vendor_id);
         }
-
         if ($request->has('store_id')) {
             $query->where('store_id', $request->store_id);
         }
-
         if ($request->has('status')) {
             $query->where('status', $request->status);
         }
-
         if ($request->has('payment_status')) {
             $query->where('payment_status', $request->payment_status);
         }
-
         if ($request->has('search')) {
             $this->whereLike($query, 'po_number', $request->search);
         }
-
         if ($request->has('from_date') && $request->has('to_date')) {
             $query->whereBetween('created_at', [$request->from_date, $request->to_date]);
         }
-
         // Sorting
         $sortBy = $request->get('sort_by', 'created_at');
         $sortDirection = $request->get('sort_direction', 'desc');
         $query->orderBy($sortBy, $sortDirection);
-
         $purchaseOrders = $query->paginate($request->get('per_page', 15));
-
         return response()->json([
             'success' => true,
             'data' => $purchaseOrders
         ]);
     }
-
     /**
      * Get single purchase order with details
      */
@@ -164,27 +148,23 @@ class PurchaseOrderController extends Controller
             'items.productBatch',
             'payments.vendorPayment'
         ])->findOrFail($id);
-
         return response()->json([
             'success' => true,
             'data' => $po
         ]);
     }
-
     /**
      * Update purchase order (only in draft status)
      */
     public function update(Request $request, $id)
     {
         $po = PurchaseOrder::findOrFail($id);
-
         if ($po->status !== 'draft') {
             return response()->json([
                 'success' => false,
                 'message' => 'Can only update draft purchase orders'
             ], 422);
         }
-
         $validated = $request->validate([
             'vendor_id' => 'sometimes|exists:vendors,id',
             'expected_delivery_date' => 'nullable|date',
@@ -194,32 +174,27 @@ class PurchaseOrderController extends Controller
             'notes' => 'nullable|string',
             'terms_and_conditions' => 'nullable|string',
         ]);
-
         $po->update($validated);
         $po->calculateTotals();
         $po->save();
-
         return response()->json([
             'success' => true,
             'message' => 'Purchase order updated successfully',
             'data' => $po->load('items', 'vendor', 'store')
         ]);
     }
-
     /**
      * Add item to purchase order
      */
     public function addItem(Request $request, $id)
     {
         $po = PurchaseOrder::findOrFail($id);
-
         if ($po->status !== 'draft') {
             return response()->json([
                 'success' => false,
                 'message' => 'Can only add items to draft purchase orders'
             ], 422);
         }
-
         $validated = $request->validate([
             'product_id' => 'required|exists:products,id',
             'quantity_ordered' => 'required|integer|min:1',
@@ -229,9 +204,7 @@ class PurchaseOrderController extends Controller
             'discount_amount' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string',
         ]);
-
         $product = Product::findOrFail($validated['product_id']);
-
         $item = PurchaseOrderItem::create([
             'purchase_order_id' => $po->id,
             'product_id' => $product->id,
@@ -244,17 +217,14 @@ class PurchaseOrderController extends Controller
             'discount_amount' => $validated['discount_amount'] ?? 0,
             'notes' => $validated['notes'] ?? null,
         ]);
-
         $po->calculateTotals();
         $po->save();
-
         return response()->json([
             'success' => true,
             'message' => 'Item added to purchase order',
             'data' => $item
         ]);
     }
-
     /**
      * Update item in purchase order
      */
@@ -263,14 +233,12 @@ class PurchaseOrderController extends Controller
         $po = PurchaseOrder::findOrFail($id);
         $item = PurchaseOrderItem::where('purchase_order_id', $id)
             ->findOrFail($itemId);
-
         if ($po->status !== 'draft') {
             return response()->json([
                 'success' => false,
                 'message' => 'Can only update items in draft purchase orders'
             ], 422);
         }
-
         $validated = $request->validate([
             'quantity_ordered' => 'sometimes|integer|min:1',
             'unit_cost' => 'sometimes|numeric|min:0',
@@ -279,18 +247,15 @@ class PurchaseOrderController extends Controller
             'discount_amount' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string',
         ]);
-
         $item->update($validated);
         $po->calculateTotals();
         $po->save();
-
         return response()->json([
             'success' => true,
             'message' => 'Item updated successfully',
             'data' => $item
         ]);
     }
-
     /**
      * Remove item from purchase order
      */
@@ -299,64 +264,54 @@ class PurchaseOrderController extends Controller
         $po = PurchaseOrder::findOrFail($id);
         $item = PurchaseOrderItem::where('purchase_order_id', $id)
             ->findOrFail($itemId);
-
         if ($po->status !== 'draft') {
             return response()->json([
                 'success' => false,
                 'message' => 'Can only remove items from draft purchase orders'
             ], 422);
         }
-
         $item->delete();
         $po->calculateTotals();
         $po->save();
-
         return response()->json([
             'success' => true,
             'message' => 'Item removed successfully'
         ]);
     }
-
     /**
      * Approve purchase order
      */
     public function approve($id)
     {
         $po = PurchaseOrder::findOrFail($id);
-
         if ($po->status !== 'draft') {
             return response()->json([
                 'success' => false,
                 'message' => 'Can only approve draft purchase orders'
             ], 422);
         }
-
         $po->status = 'approved';
         $po->approved_by = auth()->id();
         $po->approved_at = now();
         $po->save();
-
         return response()->json([
             'success' => true,
             'message' => 'Purchase order approved successfully',
             'data' => $po
         ]);
     }
-
     /**
      * Receive purchase order (create product batches)
      */
     public function receive(Request $request, $id)
     {
         $po = PurchaseOrder::findOrFail($id);
-
         if (!in_array($po->status, ['approved', 'partially_received'])) {
             return response()->json([
                 'success' => false,
                 'message' => 'Purchase order must be approved before receiving'
             ], 422);
         }
-
         $validated = $request->validate([
             'items' => 'required|array|min:1',
             'items.*.item_id' => 'required|exists:purchase_order_items,id',
@@ -365,7 +320,6 @@ class PurchaseOrderController extends Controller
             'items.*.manufactured_date' => 'nullable|date',
             'items.*.expiry_date' => 'nullable|date',
         ]);
-
         try {
             $po->markAsReceived($validated['items']);
             
@@ -373,7 +327,6 @@ class PurchaseOrderController extends Controller
             $po->received_by = auth()->id();
             $po->received_at = now();
             $po->save();
-
             return response()->json([
                 'success' => true,
                 'message' => 'Products received successfully',
@@ -386,47 +339,39 @@ class PurchaseOrderController extends Controller
             ], 500);
         }
     }
-
     /**
      * Cancel purchase order
      */
     public function cancel(Request $request, $id)
     {
         $po = PurchaseOrder::findOrFail($id);
-
         if ($po->status === 'received') {
             return response()->json([
                 'success' => false,
                 'message' => 'Cannot cancel received purchase order'
             ], 422);
         }
-
         $validated = $request->validate([
             'reason' => 'nullable|string'
         ]);
-
         $po->cancel($validated['reason'] ?? null);
         $po->cancelled_at = now();
         $po->save();
-
         return response()->json([
             'success' => true,
             'message' => 'Purchase order cancelled successfully'
         ]);
     }
-
     /**
      * Get purchase order statistics
      */
     public function statistics(Request $request)
     {
         $query = PurchaseOrder::query();
-
         // Date range filter
         if ($request->has('from_date') && $request->has('to_date')) {
             $query->whereBetween('created_at', [$request->from_date, $request->to_date]);
         }
-
         $stats = [
             'total_purchase_orders' => $query->count(),
             'by_status' => (clone $query)->selectRaw('status, COUNT(*) as count')
@@ -444,10 +389,87 @@ class PurchaseOrderController extends Controller
                 ->limit(5)
                 ->get(),
         ];
-
         return response()->json([
             'success' => true,
             'data' => $stats
         ]);
+    }
+    /**
+     * Check if purchase order can be deleted
+     */
+    public function canDelete($id)
+    {
+        $po = PurchaseOrder::findOrFail($id);
+        $canDelete = $po->paid_amount <= 0;
+        
+        return response()->json([
+            'success' => true,
+            'can_delete' => $canDelete,
+            'reason' => $canDelete ? null : 'Cannot delete purchase order with existing payments'
+        ]);
+    }
+    /**
+     * Delete purchase order and related inventory records
+     */
+    public function destroy(Request $request, $id)
+    {
+        $po = PurchaseOrder::with('items')->findOrFail($id);
+        // 1. Check if user is admin
+        // (Assuming middleware handles basic auth, but we can double check roles if needed)
+        // The frontend will only show the button for admins.
+        // 2. Check if PO is unpaid
+        if ($po->paid_amount > 0 || $po->payment_status !== 'unpaid') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot delete purchase order as it has already been paid or partially paid.'
+            ], 422);
+        }
+        // 3. Verify password
+        $request->validate([
+            'password' => 'required|string'
+        ]);
+        if (!Hash::check($request->password, auth()->user()->password)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Invalid password. Deletion aborted.'
+            ], 401);
+        }
+        DB::beginTransaction();
+        try {
+            $productIdsToSync = [];
+            foreach ($po->items as $item) {
+                $productIdsToSync[] = $item->product_id;
+                
+                if ($item->product_batch_id) {
+                    $batch = ProductBatch::find($item->product_batch_id);
+                    if ($batch) {
+                        // Delete all barcodes for this batch
+                        ProductBarcode::where('batch_id', $batch->id)->delete();
+                        
+                        // Delete the batch
+                        $batch->delete();
+                    }
+                }
+            }
+            // Delete PO items
+            $po->items()->delete();
+            // Delete the purchase order
+            $po->delete();
+            // Update quantity of all products in PO (Sync Master Inventory)
+            foreach (array_unique($productIdsToSync) as $productId) {
+                MasterInventory::syncProductInventory($productId);
+            }
+            DB::commit();
+            return response()->json([
+                'success' => true,
+                'message' => 'Purchase order and related inventory records deleted successfully.'
+            ]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to delete purchase order: ' . $e->getMessage()
+            ], 500);
+        }
     }
 }

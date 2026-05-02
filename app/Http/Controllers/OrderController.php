@@ -578,10 +578,10 @@ class OrderController extends Controller
             
             if ($taxMode === 'inclusive') {
                 // Inclusive: tax already in subtotal
-                $totalAmount = $subtotal - max($orderDiscount, $totalItemDiscount) + $shippingAmount;
+                $totalAmount = $subtotal - ($orderDiscount + $totalItemDiscount) + $shippingAmount;
             } else {
                 // Exclusive: add tax to subtotal
-                $totalAmount = $subtotal + $taxTotal - max($orderDiscount, $totalItemDiscount) + $shippingAmount;
+                $totalAmount = $subtotal + $taxTotal - ($orderDiscount + $totalItemDiscount) + $shippingAmount;
             }
 
             $order->update([

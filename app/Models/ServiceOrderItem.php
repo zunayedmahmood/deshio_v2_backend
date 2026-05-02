@@ -13,6 +13,7 @@ class ServiceOrderItem extends Model
 
     protected $fillable = [
         'service_order_id',
+        'order_id',
         'service_id',
         'service_field_id',
         'service_name',
@@ -20,6 +21,7 @@ class ServiceOrderItem extends Model
         'service_description',
         'quantity',
         'unit_price',
+        'discount_amount',
         'base_price',
         'total_price',
         'selected_options',
@@ -80,6 +82,11 @@ class ServiceOrderItem extends Model
     public function serviceOrder(): BelongsTo
     {
         return $this->belongsTo(ServiceOrder::class);
+    }
+
+    public function order(): BelongsTo
+    {
+        return $this->belongsTo(Order::class);
     }
 
     public function service(): BelongsTo

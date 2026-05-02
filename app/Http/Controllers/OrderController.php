@@ -12,6 +12,8 @@ use App\Models\Employee;
 use App\Models\PaymentMethod;
 use App\Models\Transaction;
 use App\Models\ReservedProduct;
+use App\Models\Service;
+use App\Models\ServiceOrderItem;
 use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -34,6 +36,7 @@ class OrderController extends Controller
             'store', // Nullable - E-commerce orders have no store until manually assigned
             'items.product',
             'items.batch',
+            'serviceItems',
             'payments.paymentMethod',
         ]);
 
@@ -163,6 +166,7 @@ class OrderController extends Controller
             'payments.processedBy',
             'payments.paymentSplits.paymentMethod',
             'payments.cashDenominations',
+            'serviceItems.service',
         ])->find($id);
 
         if (!$order) {
@@ -232,6 +236,11 @@ class OrderController extends Controller
             'items.*.quantity' => 'required|integer|min:1',
             'items.*.unit_price' => 'required|numeric|min:0',
             'items.*.discount_amount' => 'nullable|numeric|min:0',
+            'services' => 'nullable|array',
+            'services.*.service_id' => 'required|exists:services,id',
+            'services.*.quantity' => 'required|integer|min:1',
+            'services.*.unit_price' => 'required|numeric|min:0',
+            'services.*.discount_amount' => 'nullable|numeric|min:0',
             'discount_amount' => 'nullable|numeric|min:0',
             'shipping_amount' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string',
@@ -564,11 +573,35 @@ class OrderController extends Controller
 
                 // Stock deduction is now centralizing in OrderController@complete
                 // Reservations are handled by OrderItemObserver
-                Log::info('Order item created, reservation handled by observer', [
-                    'order_id' => $order->id,
-                    'product_id' => $product->id,
-                    'quantity' => $quantity,
-                ]);
+            }
+
+            // Add services
+            if ($request->filled('services')) {
+                foreach ($request->services as $serviceData) {
+                    $service = Service::findOrFail($serviceData['service_id']);
+                    
+                    $qty = $serviceData['quantity'];
+                    $uPrice = $serviceData['unit_price'];
+                    $sDiscount = $serviceData['discount_amount'] ?? 0;
+                    $sTotal = ($qty * $uPrice) - $sDiscount;
+
+                    $order->serviceItems()->create([
+                        'service_id' => $service->id,
+                        'service_name' => $service->name,
+                        'service_code' => $service->service_code,
+                        'service_description' => $service->description,
+                        'quantity' => $qty,
+                        'unit_price' => $uPrice,
+                        'discount_amount' => $sDiscount,
+                        'base_price' => $service->base_price,
+                        'total_price' => $sTotal,
+                        'status' => 'pending',
+                        'scheduled_date' => now(), // Default to now
+                    ]);
+
+                    $subtotal += ($qty * $uPrice);
+                    $totalItemDiscount += $sDiscount;
+                }
             }
 
             // Calculate order totals based on tax mode
@@ -769,6 +802,37 @@ class OrderController extends Controller
                 $order->notes = $request->notes;
             }
             
+            if ($request->has('services')) {
+                // Remove all existing services
+                $order->serviceItems()->delete();
+                
+                // Add new services
+                foreach ($request->services as $serviceData) {
+                    $service = \App\Models\Service::findOrFail($serviceData['service_id']);
+                    
+                    $qty = $serviceData['quantity'];
+                    $uPrice = $serviceData['unit_price'];
+                    $sDiscount = $serviceData['discount_amount'] ?? 0;
+                    $sTotal = ($qty * $uPrice) - $sDiscount;
+
+                    $order->serviceItems()->create([
+                        'service_id' => $service->id,
+                        'service_name' => $service->name,
+                        'service_code' => $service->service_code,
+                        'service_description' => $service->description,
+                        'quantity' => $qty,
+                        'unit_price' => $uPrice,
+                        'discount_amount' => $sDiscount,
+                        'base_price' => $service->base_price,
+                        'total_price' => $sTotal,
+                        'status' => 'pending',
+                        'scheduled_date' => now(),
+                    ]);
+                }
+                
+                $order->calculateTotals();
+            }
+
             $order->save();
 
             DB::commit();
@@ -1673,6 +1737,21 @@ class OrderController extends Controller
                     'total_amount' => number_format((float)$item->total_amount, 2),
                     'cogs' => number_format((float)($item->cogs ?? (($item->batch?->cost_price ?? 0) * $item->quantity)), 2),
                     'item_gross_margin' => number_format((float)$item->total_amount - (float)($item->cogs ?? (($item->batch?->cost_price ?? 0) * $item->quantity)), 2),
+                ];
+            });
+
+            $response['services'] = $order->serviceItems->map(function ($service) {
+                return [
+                    'id' => $service->id,
+                    'service_id' => $service->service_id,
+                    'service_name' => $service->service_name,
+                    'service_code' => $service->service_code,
+                    'quantity' => $service->quantity,
+                    'unit_price' => number_format((float)$service->unit_price, 2),
+                    'discount_amount' => number_format((float)($service->discount_amount ?? 0), 2),
+                    'total_price' => number_format((float)$service->total_price, 2),
+                    'status' => $service->status,
+                    'category' => $service->service?->category,
                 ];
             });
 

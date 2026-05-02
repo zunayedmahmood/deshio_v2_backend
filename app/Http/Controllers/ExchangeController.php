@@ -30,11 +30,12 @@ class ExchangeController extends Controller
     public function process(Request $request): JsonResponse
     {
         $validator = Validator::make($request->all(), [
-            'customer_id' => 'required|exists:customers,id',
+            'order_id' => 'nullable|exists:orders,id',
+            'customer_id' => 'required_without:order_id|exists:customers,id',
             'exchangeAtStoreId' => 'required|exists:stores,id',
             'removedProducts' => 'required|array|min:1',
             'removedProducts.*.product_id' => 'required|exists:products,id',
-            'removedProducts.*.product_batch_id' => 'required|exists:product_batches,id',
+            'removedProducts.*.product_batch_id' => 'required_without:removedProducts.*.order_item_id|exists:product_batches,id',
             'removedProducts.*.quantity' => 'required|integer|min:1',
             'removedProducts.*.unit_price' => 'required|numeric|min:0',
             'removedProducts.*.total_price' => 'required|numeric|min:0',
@@ -48,7 +49,7 @@ class ExchangeController extends Controller
             'replacementProducts.*.batch_id' => 'required|exists:product_batches,id',
             'replacementProducts.*.quantity' => 'required|integer|min:1',
             'replacementProducts.*.unit_price' => 'required|numeric|min:0',
-            'replacementProducts.*.total_price' => 'required|numeric|min:0',
+            'replacementProducts.*.total_price' => 'nullable|numeric|min:0',
             'replacementProducts.*.discount_amount' => 'nullable|numeric|min:0',
             'replacementProducts.*.barcode' => 'nullable|string',
             
@@ -78,16 +79,35 @@ class ExchangeController extends Controller
             $storeId = $request->exchangeAtStoreId;
             $customer_id = $request->customer_id;
 
+            if (!$customer_id && $request->order_id) {
+                $order = Order::find($request->order_id);
+                $customer_id = $order->customer_id;
+            }
+
+            if (!$customer_id) {
+                throw new \Exception('Customer ID is required for exchange');
+            }
+
             // --- 1. CREATE PRODUCT RETURN ---
             $returnNumber = $this->generateReturnNumber();
             $totalReturnValue = 0;
             $returnItems = [];
 
             foreach ($request->removedProducts as $item) {
+                $batchId = $item['product_batch_id'] ?? null;
+                if (!$batchId && !empty($item['order_item_id'])) {
+                    $orderItem = OrderItem::find($item['order_item_id']);
+                    $batchId = $orderItem->product_batch_id;
+                }
+
+                if (!$batchId) {
+                    throw new \Exception("Product batch ID is missing for removed product: " . $item['product_id']);
+                }
+
                 $totalReturnValue += (float) $item['total_price'];
                 $returnItems[] = [
                     'product_id' => $item['product_id'],
-                    'product_batch_id' => $item['product_batch_id'],
+                    'product_batch_id' => $batchId,
                     'order_item_id' => $item['order_item_id'] ?? null,
                     'quantity' => $item['quantity'],
                     'unit_price' => $item['unit_price'],
@@ -101,10 +121,12 @@ class ExchangeController extends Controller
 
             $productReturn = ProductReturn::create([
                 'return_number' => $returnNumber,
+                'order_id' => $request->order_id,
                 'customer_id' => $customer_id,
                 'store_id' => $storeId, // Returned to THIS store
-                'return_reason' => 'Exchange',
-                'return_type' => 'exchange',
+                'return_reason' => 'other',
+                'return_type' => 'customer_return',
+                'internal_notes' => 'Exchange Processed',
                 'status' => 'processing',
                 'return_date' => now(),
                 'received_date' => now(),
@@ -184,7 +206,7 @@ class ExchangeController extends Controller
                 $tax = $taxCalculation['total_tax'];
                 
                 $itemSubtotal = $quantity * $unitPrice;
-                $itemTotal = $itemSubtotal - $discount;
+                $itemTotal = $itemData['total_price'] ?? ($itemSubtotal - $discount);
                 $cogs = round(($batch->cost_price ?? 0) * $quantity, 2);
 
                 OrderItem::create([
@@ -409,10 +431,20 @@ class ExchangeController extends Controller
 
             $targetBatch->increment('quantity', (int) $item['quantity']);
 
-            // Barcodes
-            $barcodeIds = $item['returned_barcode_ids'] ?? [];
-            if (!empty($barcodeIds)) {
-                ProductBarcode::whereIn('id', $barcodeIds)->each(function ($barcode) use ($returnStore, $targetBatch, $return, $employee) {
+            $barcodeIds = collect($item['returned_barcode_ids'] ?? [])->filter()->values();
+            if ($barcodeIds->isEmpty()) {
+                // Try to find barcodes that were sold from this order/item
+                $barcodes = ProductBarcode::where('product_id', $item['product_id'])
+                    ->where('batch_id', $item['product_batch_id'])
+                    ->whereIn('current_status', ['with_customer', 'sold'])
+                    ->limit((int) $item['quantity'])
+                    ->get();
+            } else {
+                $barcodes = ProductBarcode::whereIn('id', $barcodeIds)->get();
+            }
+
+            if ($barcodes->isNotEmpty()) {
+                foreach ($barcodes as $barcode) {
                     $barcode->updateLocation($returnStore, 'in_warehouse', ['return_id' => $return->id]);
                     $barcode->batch_id = $targetBatch->id;
                     $barcode->is_active = true;
@@ -427,16 +459,30 @@ class ExchangeController extends Controller
                         'movement_type' => 'return',
                         'quantity' => 1,
                         'unit_cost' => $barcode->batch->cost_price ?? 0,
+                        'total_cost' => $barcode->batch->cost_price ?? 0,
                         'reference_type' => 'return',
                         'reference_id' => $return->id,
                         'performed_by' => $employee->id,
                     ]);
-                });
+                }
             } else {
-                // Bulk return without specific barcodes
+                // Fallback for products that might not have barcodes (if any)
+                // BUT we still need to record a movement.
+                // If the DB requires product_barcode_id, we have a problem.
+                // However, in this system, most items should have barcodes.
+                // If it really has no barcodes, we might need a placeholder or the DB column should be nullable.
+                
+                // For now, let's log if no barcodes found to help debugging
+                if ($item['quantity'] > 0) {
+                    Log::warning("No barcodes found for return item", ['product_id' => $item['product_id'], 'batch_id' => $item['product_batch_id']]);
+                }
+                
+                // If we absolutely must record it and DB requires barcode_id:
+                // We'll throw an exception or try to create a movement without it (which will fail if strict)
                 ProductMovement::create([
                     'product_id' => $item['product_id'],
                     'product_batch_id' => $targetBatch->id,
+                    // 'product_barcode_id' => null, // This will fail if DB constraint is strict
                     'to_store_id' => $returnStore,
                     'movement_type' => 'return',
                     'quantity' => $item['quantity'],

@@ -131,6 +131,11 @@ class Order extends Model
         return $this->hasMany(OrderItem::class);
     }
 
+    public function serviceItems(): HasMany
+    {
+        return $this->hasMany(ServiceOrderItem::class);
+    }
+
     public function payments(): HasMany
     {
         return $this->hasMany(OrderPayment::class);
@@ -684,9 +689,15 @@ class Order extends Model
     {
         $taxMode = config('app.tax_mode', 'inclusive');
         
-        $subtotal = $this->items->sum('total_amount');
-        $taxAmount = $this->items->sum('tax_amount');
-        $discountAmount = $this->items->sum('discount_amount');
+        $itemsSubtotal = $this->items->sum('total_amount');
+        $servicesSubtotal = $this->serviceItems->sum('total_price');
+        $subtotal = $itemsSubtotal + $servicesSubtotal;
+        
+        $taxAmount = $this->items->sum('tax_amount'); // Services currently don't have separate tax_amount in schema
+        
+        $itemsDiscount = $this->items->sum('discount_amount');
+        $servicesDiscount = $this->serviceItems->sum('discount_amount');
+        $discountAmount = $itemsDiscount + $servicesDiscount;
 
         $this->subtotal = $subtotal;
         $this->tax_amount = $taxAmount;

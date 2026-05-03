@@ -95,7 +95,7 @@ class Order extends Model
 
         static::creating(function ($order) {
             if (empty($order->order_number)) {
-                $order->order_number = static::generateOrderNumber();
+                $order->order_number = static::generateOrderNumber($order->order_type);
             }
             $order->order_date = $order->order_date ?? now();
         });
@@ -390,9 +390,9 @@ class Order extends Model
             'remaining_amount' => $this->getRemainingAmount(),
             'refunded_amount' => $this->getTotalRefundedAmount(),
             'payment_count' => $payments->count(),
-            'completed_payments' => $payments->completed()->count(),
-            'pending_payments' => $payments->pending()->count(),
-            'failed_payments' => $payments->failed()->count(),
+            'completed_payments' => $payments->where('status', 'completed')->count(),
+            'pending_payments' => $payments->where('status', 'pending')->count(),
+            'failed_payments' => $payments->where('status', 'failed')->count(),
             'is_fully_paid' => $this->isFullyPaid(),
             'is_partially_paid' => $this->isPartiallyPaid(),
         ];
@@ -846,27 +846,33 @@ class Order extends Model
     }
 
     // Static methods
-    public static function generateOrderNumber(): string
+    public static function generateOrderNumber($orderType = 'counter'): string
     {
-        // Find the latest order with the sequential pattern ORD-<number>
-        $latestOrder = static::where('order_number', 'REGEXP', '^ORD-[0-9]+$')
-            ->orderByRaw('CAST(SUBSTRING(order_number, 5) AS UNSIGNED) DESC')
+        // Define prefix based on order type
+        // S/E for Social Commerce and E-commerce, P for POS (counter)
+        $prefix = in_array($orderType, ['social_commerce', 'ecommerce']) ? 'ORD-S/E-' : 'ORD-P-';
+        $prefixLength = strlen($prefix);
+
+        // Find the latest order with the specific prefix pattern using REGEXP
+        // Pattern: ^ORD-P-[0-9]+$ or ^ORD-S/E-[0-9]+$
+        $latestOrder = static::where('order_number', 'REGEXP', '^' . $prefix . '[0-9]+$')
+            ->orderByRaw('CAST(SUBSTRING(order_number, ' . ($prefixLength + 1) . ') AS UNSIGNED) DESC')
             ->first();
 
         if ($latestOrder) {
-            $lastNumber = (int) substr($latestOrder->order_number, 4);
+            $lastNumber = (int) substr($latestOrder->order_number, $prefixLength);
             $nextNumber = $lastNumber + 1;
         } else {
-            // If no ORD-<number> exists, start from 1
+            // Start from 1 if no orders with this prefix exist
             $nextNumber = 1;
             
-            // Safety: Check if ORD-1 already exists (e.g. from a previous partial implementation)
-            while (static::where('order_number', 'ORD-' . $nextNumber)->exists()) {
+            // Safety check to avoid collisions with any existing orders
+            while (static::where('order_number', $prefix . $nextNumber)->exists()) {
                 $nextNumber++;
             }
         }
 
-        return 'ORD-' . $nextNumber;
+        return $prefix . $nextNumber;
     }
 
     public static function getOrderStats($storeId = null)

@@ -124,7 +124,14 @@ class OrderItem extends Model
         $this->quantity = $newQuantity;
         $subtotal = bcmul((string)$newQuantity, (string)$this->unit_price, 2);
         $afterDiscount = bcsub($subtotal, (string)$this->discount_amount, 2);
-        $this->total_amount = (float) bcadd($afterDiscount, (string)$this->tax_amount, 2);
+        
+        $taxMode = config('app.tax_mode', 'inclusive');
+        if ($taxMode === 'inclusive') {
+            $this->total_amount = (float) $afterDiscount;
+        } else {
+            $this->total_amount = (float) bcadd($afterDiscount, (string)$this->tax_amount, 2);
+        }
+        
         $this->save();
 
         $this->order->calculateTotals();
@@ -137,7 +144,14 @@ class OrderItem extends Model
         $this->discount_amount = $discountAmount;
         $subtotal = bcmul((string)$this->quantity, (string)$this->unit_price, 2);
         $afterDiscount = bcsub($subtotal, (string)$discountAmount, 2);
-        $this->total_amount = bcadd($afterDiscount, (string)$this->tax_amount, 2);
+        
+        $taxMode = config('app.tax_mode', 'inclusive');
+        if ($taxMode === 'inclusive') {
+            $this->total_amount = (float) $afterDiscount;
+        } else {
+            $this->total_amount = (float) bcadd($afterDiscount, (string)$this->tax_amount, 2);
+        }
+        
         $this->save();
 
         $this->order->calculateTotals();
@@ -150,7 +164,14 @@ class OrderItem extends Model
         $this->tax_amount = $taxAmount;
         $subtotal = bcmul((string)$this->quantity, (string)$this->unit_price, 2);
         $afterDiscount = bcsub($subtotal, (string)$this->discount_amount, 2);
-        $this->total_amount = (float) bcadd($afterDiscount, (string)$taxAmount, 2);
+        
+        $taxMode = config('app.tax_mode', 'inclusive');
+        if ($taxMode === 'inclusive') {
+            $this->total_amount = (float) $afterDiscount;
+        } else {
+            $this->total_amount = (float) bcadd($afterDiscount, (string)$taxAmount, 2);
+        }
+        
         $this->save();
 
         $this->order->calculateTotals();

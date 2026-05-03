@@ -370,16 +370,12 @@ class OrderController extends Controller
                 $fulfillmentStatus = 'pending_fulfillment';
             }
 
-            // Determine initial status based on order type and store assignment
-            // Orders without store need assignment first
+            // Determine initial order status
+            // Business rule: every newly placed order must appear as Pending.
+            // Store assignment / fulfillment progress is tracked separately through
+            // store_id and fulfillment_status. After packing/completion, complete()
+            // changes this to Confirmed.
             $initialStatus = 'pending';
-            if (in_array($request->order_type, ['social_commerce', 'ecommerce'])) {
-                if ($storeId === null) {
-                    $initialStatus = 'pending_assignment'; // Waiting for store assignment
-                } elseif ($request->order_type === 'social_commerce') {
-                    $initialStatus = 'assigned_to_store'; // Direct store assignment
-                }
-            }
 
             // Create order
             $order = Order::create([
@@ -714,6 +710,11 @@ class OrderController extends Controller
             'discount_amount' => 'nullable|numeric|min:0',
             'shipping_amount' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string',
+            'items' => 'nullable|array',
+            'items.*.id' => 'required|integer|exists:order_items,id',
+            'items.*.quantity' => 'nullable|integer|min:1',
+            'items.*.unit_price' => 'nullable|numeric|min:0',
+            'items.*.discount_amount' => 'nullable|numeric|min:0',
         ]);
 
         if ($validator->fails()) {
@@ -748,6 +749,38 @@ class OrderController extends Controller
                 }
             }
 
+            // Update items if provided (Bulk Update)
+            if ($request->filled('items')) {
+                foreach ($request->items as $itemData) {
+                    $item = OrderItem::where('order_id', $order->id)->find($itemData['id']);
+                    if (!$item) continue;
+
+                    $unitPrice = $itemData['unit_price'] ?? $item->unit_price;
+                    $quantity = $itemData['quantity'] ?? $item->quantity;
+                    $discount = $itemData['discount_amount'] ?? $item->discount_amount;
+
+                    // Recalculate tax for this item
+                    $batch = $item->batch;
+                    $taxPercentage = $batch ? ($batch->tax_percentage ?? 0) : 0;
+                    
+                    $netUnitPrice = $unitPrice;
+                    if ($discount > 0 && $quantity > 0) {
+                        $netUnitPrice = (float) bcsub((string)$unitPrice, bcdiv((string)$discount, (string)$quantity, 4), 4);
+                    }
+                    
+                    $taxCalc = $this->calculateTax($netUnitPrice, $quantity, $taxPercentage);
+                    $item->tax_amount = $taxCalc['total_tax'];
+                    
+                    $item->unit_price = $unitPrice;
+                    $item->discount_amount = $discount;
+                    $item->updateQuantity($quantity);
+                }
+                
+                // Refresh order to get updated totals from items
+                $order->load('items');
+                $order->status = 'pending'; // Keep edited orders pending
+            }
+
             // Update order fields
             if ($request->has('shipping_address')) {
                 $order->shipping_address = $request->shipping_address;
@@ -779,6 +812,9 @@ class OrderController extends Controller
                     $qty = $serviceData['quantity'];
                     $uPrice = $serviceData['unit_price'];
                     $sDiscount = $serviceData['discount_amount'] ?? 0;
+                    
+                    // Tax calculation for services (if applicable)
+                    // Currently services seem to use a simpler flat total
                     $sTotal = ($qty * $uPrice) - $sDiscount;
 
                     $order->serviceItems()->create([
@@ -1075,8 +1111,8 @@ class OrderController extends Controller
                 $addedItems[] = $orderItem;
             }
 
-            // Reset status to pending_assignment on edit
-            $order->status = 'pending_assignment';
+            // Keep edited orders pending until packing/completion confirms them
+            $order->status = 'pending';
 
             // Recalculate order totals
             $order->calculateTotals();
@@ -1159,8 +1195,11 @@ class OrderController extends Controller
 
         DB::beginTransaction();
         try {
+            $unitPrice = $request->input('unit_price', $item->unit_price);
+            $newQuantity = $request->input('quantity', $item->quantity);
+            $discountAmount = $request->input('discount_amount', $item->discount_amount);
+
             if ($request->filled('quantity')) {
-                $newQuantity = $request->quantity;
                 $diff = $newQuantity - $item->quantity;
 
                 // For increases, validate global available inventory
@@ -1172,28 +1211,28 @@ class OrderController extends Controller
                         throw new \Exception("Insufficient global stock to increase quantity for '{$item->product_name}'. Available: {$available}, needed: {$diff}");
                     }
                 }
-
-                // Recalculate tax for the new quantity
-                $batch = $item->batch;
-                $taxPercentage = $batch ? ($batch->tax_percentage ?? 0) : 0;
-                $unitPrice = $request->unit_price ?? $item->unit_price;
-                $item->tax_amount = $this->calculateTax($unitPrice, $newQuantity, $taxPercentage)['total_tax'];
-                
-                $item->updateQuantity($newQuantity);
             }
 
-            if ($request->filled('unit_price')) {
-                $item->unit_price = $request->unit_price;
+            // Always recalculate tax based on Net Price (Unit Price - Per-unit Discount)
+            $batch = $item->batch;
+            $taxPercentage = $batch ? ($batch->tax_percentage ?? 0) : 0;
+            
+            // Calculate net unit price for tax purposes
+            $netUnitPrice = $unitPrice;
+            if ($discountAmount > 0 && $newQuantity > 0) {
+                $netUnitPrice = (float) bcsub((string)$unitPrice, bcdiv((string)$discountAmount, (string)$newQuantity, 4), 4);
             }
+            
+            $taxCalc = $this->calculateTax($netUnitPrice, $newQuantity, $taxPercentage);
+            $item->tax_amount = $taxCalc['total_tax'];
+            
+            // Apply changes to the model
+            $item->unit_price = $unitPrice;
+            $item->discount_amount = $discountAmount;
+            $item->updateQuantity($newQuantity);
 
-            if ($request->filled('discount_amount')) {
-                $item->applyDiscount($request->discount_amount);
-            }
-
-            $item->save();
-
-            // Reset status to pending_assignment on edit
-            $order->status = 'pending_assignment';
+            // Keep edited orders pending until packing/completion confirms them
+            $order->status = 'pending';
 
             $order->calculateTotals();
 
@@ -1260,8 +1299,8 @@ class OrderController extends Controller
         try {
             $item->delete();
             
-            // Reset status to pending_assignment on edit
-            $order->status = 'pending_assignment';
+            // Keep edited orders pending until packing/completion confirms them
+            $order->status = 'pending';
             
             $order->calculateTotals();
 
@@ -1671,7 +1710,9 @@ class OrderController extends Controller
             ] : null,
             'subtotal' => number_format((float)$order->subtotal, 2),
             'tax_amount' => number_format((float)$order->tax_amount, 2),
+            'item_discount' => number_format((float)$order->items->sum('discount_amount') + $order->serviceItems->sum('discount_amount'), 2),
             'discount_amount' => number_format((float)$order->discount_amount, 2),
+            'total_discount' => number_format((float)($order->items->sum('discount_amount') + $order->serviceItems->sum('discount_amount') + ($order->discount_amount ?? 0)), 2),
             'shipping_amount' => number_format((float)$order->shipping_amount, 2),
             'total_amount' => number_format((float)$order->total_amount, 2),
             'paid_amount' => number_format((float)$order->paid_amount, 2),

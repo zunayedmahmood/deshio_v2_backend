@@ -148,7 +148,7 @@ class ExchangeController extends Controller
 
 
             // --- 2. CREATE REPLACEMENT ORDER ---
-            $orderNumber = Order::generateOrderNumber();
+            $orderNumber = Order::generateOrderNumber('counter');
             $replacementOrder = Order::create([
                 'order_number' => $orderNumber,
                 'customer_id' => $customer_id,

@@ -8,7 +8,7 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 
 /**
- * RoleController — Errum V2 RBAC Refactor (2026-03-30)
+ * RoleController — Deshio V2 RBAC Refactor (2026-03-30)
  *
  * Manages the simplified 7-role set. Permission management endpoints have been
  * removed because access control is now handled entirely on the frontend via

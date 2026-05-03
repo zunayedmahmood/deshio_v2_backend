@@ -830,7 +830,7 @@ class AccountingReportController extends Controller
             return $query;
         }
 
-        if ($storeId === 'global' || $storeId === 'errum') {
+        if ($storeId === 'global' || $storeId === 'Deshio') {
             return $query->whereNull('store_id');
         }
 

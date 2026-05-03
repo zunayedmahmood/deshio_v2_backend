@@ -71,7 +71,7 @@ class TransactionController extends Controller
             'type' => 'required|in:debit,credit',
             'account_id' => 'required|exists:accounts,id',
             'description' => 'nullable|string',
-            'store_id' => 'nullable|exists:stores,id', // Null for "Errum"
+            'store_id' => 'nullable|exists:stores,id', // Null for "Deshio"
             'reference_type' => 'nullable|string',
             'reference_id' => 'nullable|integer',
             'metadata' => 'nullable|array',
@@ -91,7 +91,7 @@ class TransactionController extends Controller
         $user = auth()->user();
         
         // --- Store Scoping Security ---
-        // If not admin, force their store_id and prevent 'null' (Global/Errum)
+        // If not admin, force their store_id and prevent 'null' (Global/Deshio)
         if ($user->role !== 'admin') {
             $data['store_id'] = $user->store_id; // Branch manager must use their own store
             
@@ -99,7 +99,7 @@ class TransactionController extends Controller
                  return response()->json(['success' => false, 'message' => 'User not assigned to a store.'], 403);
             }
         }
-        // If admin didn't provide store_id, it stays null (Errum/Global)
+        // If admin didn't provide store_id, it stays null (Deshio/Global)
         
         // --- Handle Image Upload (Base64) ---
         $metadata = $data['metadata'] ?? [];

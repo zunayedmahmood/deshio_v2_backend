@@ -7,10 +7,14 @@ use App\Models\Order;
 use App\Models\Store;
 use App\Traits\DatabaseAgnosticSearch;
 use App\Services\PathaoService;
+use App\Models\PathaoBulkBatch;
+use App\Jobs\SendToPathaoJob;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Artisan;
 
 class ShipmentController extends Controller
 {
@@ -379,18 +383,22 @@ class ShipmentController extends Controller
     }
 
     /**
-     * Bulk send shipments to Pathao
-     * 
+     * Bulk send shipments to Pathao (Queue-based)
+     *
      * POST /api/shipments/bulk-send-to-pathao
      * Body: {
-     *   "shipment_ids": [1, 2, 3, 4]
+     *   "shipment_ids": [1, 2, 3, 4],
+     *   "sync": false  // optional: true for synchronous (old behavior)
      * }
+     *
+     * Returns batch_code for tracking progress
      */
     public function bulkSendToPathao(Request $request)
     {
         $validator = Validator::make($request->all(), [
-            'shipment_ids' => 'required|array|min:1',
+            'shipment_ids' => 'required|array|min:1|max:500',
             'shipment_ids.*' => 'exists:shipments,id',
+            'sync' => 'nullable|boolean',
         ]);
 
         if ($validator->fails()) {
@@ -401,18 +409,584 @@ class ShipmentController extends Controller
             ], 422);
         }
 
+        // If sync mode requested (for small batches or debugging), use old behavior
+        if ($request->boolean('sync')) {
+            return $this->bulkSendToPathaoSync($request->shipment_ids);
+        }
+
+        // Pre-validate shipments before queueing
+        $shipments = Shipment::with(['order', 'store'])
+            ->whereIn('id', $request->shipment_ids)
+            ->get();
+
+        $eligibleIds = [];
+        $immediateFailures = [];
+
+        foreach ($shipments as $shipment) {
+            if (!$shipment->isPending()) {
+                $immediateFailures[] = [
+                    'shipment_id' => $shipment->id,
+                    'shipment_number' => $shipment->shipment_number,
+                    'reason' => "Status is '{$shipment->status}', expected 'pending'"
+                ];
+                continue;
+            }
+
+            if ($shipment->pathao_consignment_id) {
+                $immediateFailures[] = [
+                    'shipment_id' => $shipment->id,
+                    'shipment_number' => $shipment->shipment_number,
+                    'reason' => 'Already sent to Pathao'
+                ];
+                continue;
+            }
+
+            if (!$shipment->store?->pathao_store_id) {
+                $immediateFailures[] = [
+                    'shipment_id' => $shipment->id,
+                    'shipment_number' => $shipment->shipment_number,
+                    'reason' => 'Store not registered with Pathao'
+                ];
+                continue;
+            }
+
+            $eligibleIds[] = $shipment->id;
+        }
+
+        if (empty($eligibleIds)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'No eligible shipments to send',
+                'data' => [
+                    'immediate_failures' => $immediateFailures
+                ]
+            ], 400);
+        }
+
+        return $this->dispatchPathaoBulkBatch(
+            $eligibleIds,
+            $shipments->first()?->store_id,
+            $immediateFailures
+        );
+    }
+
+    /**
+     * Bulk send orders to Pathao without the frontend checking/creating shipments one-by-one.
+     *
+     * POST /api/shipments/bulk-send-orders-to-pathao
+     * Body: {
+     *   "order_ids": [1, 2, 3],
+     *   "delivery_type": "home_delivery",
+     *   "package_weight": 1.0
+     * }
+     */
+    public function bulkSendOrdersToPathao(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'order_ids' => 'required|array|min:1|max:500',
+            'order_ids.*' => 'integer|exists:orders,id',
+            'delivery_type' => 'nullable|in:home_delivery,express',
+            'package_weight' => 'nullable|numeric|min:0',
+            'special_instructions' => 'nullable|string',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $orderIds = collect($request->order_ids)
+            ->map(fn ($id) => (int) $id)
+            ->filter(fn ($id) => $id > 0)
+            ->unique()
+            ->values();
+
+        $orders = Order::with(['items.batch.barcode', 'customer', 'store', 'shipments'])
+            ->whereIn('id', $orderIds)
+            ->get()
+            ->keyBy('id');
+
+        $eligibleIds = [];
+        $immediateFailures = [];
+        $firstStoreId = null;
+
+        DB::beginTransaction();
+
+        try {
+            foreach ($orderIds as $orderId) {
+                /** @var \App\Models\Order|null $order */
+                $order = $orders->get($orderId);
+
+                if (!$order) {
+                    $immediateFailures[] = [
+                        'order_id' => $orderId,
+                        'order_number' => null,
+                        'shipment_id' => null,
+                        'shipment_number' => null,
+                        'reason' => 'Order not found',
+                    ];
+                    continue;
+                }
+
+                $firstStoreId ??= $order->store_id;
+
+                if (!$order->store?->pathao_store_id) {
+                    $immediateFailures[] = [
+                        'order_id' => $order->id,
+                        'order_number' => $order->order_number,
+                        'shipment_id' => null,
+                        'shipment_number' => null,
+                        'reason' => 'Store not registered with Pathao',
+                    ];
+                    continue;
+                }
+
+                $shipment = $order->shipments
+                    ->whereNotIn('status', ['cancelled', 'delivered'])
+                    ->sortByDesc('created_at')
+                    ->first();
+
+                if (!$shipment) {
+                    $shipment = Shipment::createFromOrder($order, [
+                        'delivery_type' => $request->input('delivery_type', 'home_delivery'),
+                        'package_weight' => $request->input('package_weight', 1.0),
+                        'special_instructions' => $request->input('special_instructions'),
+                        'created_by' => Auth::id(),
+                    ]);
+
+                    $shipment->cod_amount = $this->resolveShipmentCodAmount($order);
+                    $shipment->save();
+                }
+
+                if ($shipment->pathao_consignment_id) {
+                    $immediateFailures[] = [
+                        'order_id' => $order->id,
+                        'order_number' => $order->order_number,
+                        'shipment_id' => $shipment->id,
+                        'shipment_number' => $shipment->shipment_number,
+                        'reason' => 'Already sent to Pathao',
+                    ];
+                    continue;
+                }
+
+                if (!$shipment->isPending()) {
+                    $immediateFailures[] = [
+                        'order_id' => $order->id,
+                        'order_number' => $order->order_number,
+                        'shipment_id' => $shipment->id,
+                        'shipment_number' => $shipment->shipment_number,
+                        'reason' => "Shipment status is '{$shipment->status}', expected 'pending'",
+                    ];
+                    continue;
+                }
+
+                $eligibleIds[] = $shipment->id;
+            }
+
+            DB::commit();
+        } catch (\Throwable $e) {
+            DB::rollBack();
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to prepare bulk Pathao send: ' . $e->getMessage(),
+            ], 500);
+        }
+
+        return $this->dispatchPathaoBulkBatch($eligibleIds, $firstStoreId, $immediateFailures);
+    }
+
+    /**
+     * Create a Pathao bulk batch and dispatch the jobs in throttled waves.
+     */
+    protected function dispatchPathaoBulkBatch(array $eligibleIds, ?int $storeId, array $immediateFailures = []): \Illuminate\Http\JsonResponse
+    {
+        $eligibleIds = array_values(array_unique(array_map('intval', $eligibleIds)));
+
+        if (empty($eligibleIds)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'No eligible shipments to send',
+                'data' => [
+                    'immediate_failures' => $immediateFailures,
+                ],
+            ], 400);
+        }
+
+        $batch = PathaoBulkBatch::create([
+            'created_by' => Auth::id(),
+            'store_id' => $storeId,
+            'status' => 'pending',
+            'total_shipments' => count($eligibleIds),
+            'shipment_ids' => $eligibleIds,
+            'results' => [],
+        ]);
+
+        $batch->markAsProcessing();
+
+        // Pathao rate limit: 19 orders per 60 seconds.
+        $rateLimitPerMinute = 19;
+
+        foreach ($eligibleIds as $index => $shipmentId) {
+            $delaySeconds = (int) floor(($index * 60) / $rateLimitPerMinute);
+
+            SendToPathaoJob::dispatch($shipmentId, $batch->id)
+                ->onConnection('database')
+                ->delay(now()->addSeconds($delaySeconds));
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => count($eligibleIds) . ' shipments queued for processing',
+            'data' => [
+                'batch_code' => $batch->batch_code,
+                'batch_id' => $batch->id,
+                'queued_count' => count($eligibleIds),
+                'immediate_failures' => $immediateFailures,
+                'status_url' => url("/api/shipments/bulk-status/{$batch->batch_code}"),
+            ],
+        ]);
+    }
+
+
+    /**
+     * Process a small Pathao queue tick from the frontend runner.
+     *
+     * This avoids relying on exec()/shell background workers from HTTP requests,
+     * which are commonly blocked on shared cPanel hosting.
+     */
+    public function runPathaoQueueTick(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'max_jobs' => 'nullable|integer|min:1|max:10',
+            'max_time' => 'nullable|integer|min:5|max:25',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $queues = ['pathao', 'default'];
+        $maxJobs = (int) $request->input('max_jobs', 5);
+        $maxTime = (int) $request->input('max_time', 25);
+
+        $pendingBefore = (int) DB::table('jobs')
+            ->whereIn('queue', $queues)
+            ->count();
+
+        if ($pendingBefore <= 0) {
+            return response()->json([
+                'success' => true,
+                'message' => 'Queue is already clear.',
+                'data' => [
+                    'pending_before' => 0,
+                    'pending_after' => 0,
+                    'processed' => 0,
+                    'already_running' => false,
+                ],
+            ]);
+        }
+
+        $lock = Cache::lock('pathao_queue_tick_runner', $maxTime + 10);
+
+        if (! $lock->get()) {
+            return response()->json([
+                'success' => true,
+                'message' => 'Another Pathao queue tick is already running.',
+                'data' => [
+                    'pending_before' => $pendingBefore,
+                    'pending_after' => $pendingBefore,
+                    'processed' => 0,
+                    'already_running' => true,
+                ],
+            ]);
+        }
+
+        try {
+            Artisan::call('queue:work', [
+                'connection' => 'database',
+                '--queue' => 'pathao,default',
+                '--stop-when-empty' => true,
+                '--sleep' => 1,
+                '--tries' => 10,
+                '--timeout' => 300,
+                '--max-jobs' => $maxJobs,
+                '--max-time' => $maxTime,
+            ]);
+
+            $pendingAfter = (int) DB::table('jobs')
+                ->whereIn('queue', $queues)
+                ->count();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Pathao queue tick completed.',
+                'data' => [
+                    'pending_before' => $pendingBefore,
+                    'pending_after' => $pendingAfter,
+                    'processed' => max(0, $pendingBefore - $pendingAfter),
+                    'already_running' => false,
+                    'output' => trim(Artisan::output()),
+                ],
+            ]);
+        } catch (\Throwable $e) {
+            report($e);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Pathao queue tick failed: ' . $e->getMessage(),
+            ], 500);
+        } finally {
+            optional($lock)->release();
+        }
+    }
+
+
+
+    /**
+     * Re-queue failed Pathao shipments from a bulk batch.
+     *
+     * POST /api/shipments/bulk-status/{batchCode}/retry-failed
+     */
+    public function retryFailedPathaoBatch(Request $request, string $batchCode)
+    {
+        $validator = Validator::make($request->all(), [
+            'max_retries' => 'nullable|integer|min:1|max:5',
+            'wave_size' => 'nullable|integer|min:1|max:20',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $maxRetries = (int) $request->input('max_retries', 3);
+        $waveSize = (int) $request->input('wave_size', (int) config('services.pathao.bulk_wave_size', 5));
+        $waveSize = max(1, min($waveSize, 20));
+
+        $batch = PathaoBulkBatch::where('batch_code', $batchCode)->first();
+
+        if (!$batch) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Batch not found',
+            ], 404);
+        }
+
+        if ($batch->isCancelled()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cancelled batch cannot be retried',
+            ], 422);
+        }
+
+        $lock = Cache::lock('pathao_retry_failed_batch_' . $batch->id, 20);
+
+        if (! $lock->get()) {
+            return response()->json([
+                'success' => true,
+                'message' => 'Retry is already running for this batch.',
+                'data' => [
+                    'batch_code' => $batch->batch_code,
+                    'queued_count' => 0,
+                    'already_running' => true,
+                    'skipped' => [],
+                ],
+            ]);
+        }
+
+        try {
+            $retryPayload = DB::transaction(function () use ($batch, $maxRetries) {
+                /** @var PathaoBulkBatch $lockedBatch */
+                $lockedBatch = PathaoBulkBatch::whereKey($batch->id)->lockForUpdate()->firstOrFail();
+                $results = $lockedBatch->results ?? [];
+                $candidateIds = [];
+                $retryAttemptsByShipment = [];
+                $skipped = [];
+
+                foreach ($results as $shipmentId => $result) {
+                    $shipmentIdInt = (int) $shipmentId;
+
+                    if (!empty($result['success'])) {
+                        continue;
+                    }
+
+                    if (!empty($result['retrying'])) {
+                        $skipped[] = [
+                            'shipment_id' => $shipmentIdInt,
+                            'reason' => 'Already queued for retry',
+                        ];
+                        continue;
+                    }
+
+                    $retryAttempts = (int) ($result['retry_attempts'] ?? 0);
+
+                    if ($retryAttempts >= $maxRetries) {
+                        $skipped[] = [
+                            'shipment_id' => $shipmentIdInt,
+                            'reason' => "Retry limit reached ({$retryAttempts}/{$maxRetries})",
+                        ];
+                        continue;
+                    }
+
+                    $candidateIds[] = $shipmentIdInt;
+                    $retryAttemptsByShipment[$shipmentIdInt] = $retryAttempts + 1;
+                }
+
+                if (empty($candidateIds)) {
+                    return [
+                        'batch' => $lockedBatch,
+                        'shipment_ids' => [],
+                        'skipped' => $skipped,
+                    ];
+                }
+
+                $shipments = Shipment::whereIn('id', $candidateIds)
+                    ->with('store')
+                    ->get()
+                    ->keyBy('id');
+
+                $retryIds = [];
+
+                foreach ($candidateIds as $shipmentId) {
+                    /** @var Shipment|null $shipment */
+                    $shipment = $shipments->get($shipmentId);
+                    $key = (string) $shipmentId;
+
+                    if (!$shipment) {
+                        $skipped[] = [
+                            'shipment_id' => $shipmentId,
+                            'reason' => 'Shipment no longer exists',
+                        ];
+                        continue;
+                    }
+
+                    if ($shipment->pathao_consignment_id) {
+                        $skipped[] = [
+                            'shipment_id' => $shipmentId,
+                            'reason' => 'Already sent to Pathao outside of batch',
+                        ];
+                        // Also mark it as successful in batch so it doesn't get picked up again
+                        $results[$key]['success'] = true;
+                        $results[$key]['consignment_id'] = $shipment->pathao_consignment_id;
+                        $results[$key]['message'] = 'Resolved externally';
+                        continue;
+                    }
+
+                    $retryIds[] = $shipmentId;
+                    $results[$key]['retrying'] = true;
+                    $results[$key]['retry_attempts'] = $retryAttemptsByShipment[$shipmentId];
+                }
+
+                $lockedBatch->results = $results;
+
+                if ($lockedBatch->isCompleted() && !empty($retryIds)) {
+                    $lockedBatch->status = 'processing';
+                    $lockedBatch->completed_at = null;
+                }
+
+                $lockedBatch->save();
+
+                return [
+                    'batch' => $lockedBatch,
+                    'shipment_ids' => $retryIds,
+                    'skipped' => $skipped,
+                ];
+            });
+
+            /** @var PathaoBulkBatch $batch */
+            $batch = $retryPayload['batch'];
+            $retryIds = $retryPayload['shipment_ids'];
+            $skipped = $retryPayload['skipped'];
+
+            if (empty($retryIds)) {
+                return response()->json([
+                    'success' => true,
+                    'message' => 'No shipments eligible for retry',
+                    'data' => [
+                        'batch_code' => $batch->batch_code,
+                        'queued_count' => 0,
+                        'already_running' => false,
+                        'skipped' => $skipped,
+                    ],
+                ]);
+            }
+
+            // Pathao rate limit: 19 orders per 60 seconds.
+            $rateLimitPerMinute = 19;
+
+            foreach ($retryIds as $index => $shipmentId) {
+                $delaySeconds = (int) floor(($index * 60) / $rateLimitPerMinute);
+
+                SendToPathaoJob::dispatch($shipmentId, $batch->id)
+                    ->onConnection('database')
+                    ->delay(now()->addSeconds($delaySeconds));
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => count($retryIds) . ' shipments re-queued for processing',
+                'data' => [
+                    'batch_code' => $batch->batch_code,
+                    'batch_id' => $batch->id,
+                    'queued_count' => count($retryIds),
+                    'already_running' => false,
+                    'skipped' => $skipped,
+                    'status_url' => url("/api/shipments/bulk-status/{$batch->batch_code}"),
+                ],
+            ]);
+
+        } catch (\Throwable $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to prepare retry batch: ' . $e->getMessage(),
+            ], 500);
+        } finally {
+            optional($lock)->release();
+        }
+    }
+
+    /**
+     * Resolve COD amount for shipment creation from order payment fields.
+     */
+    protected function resolveShipmentCodAmount(Order $order): float
+    {
+        if ($order->outstanding_amount !== null) {
+            return max(0, (float) $order->outstanding_amount);
+        }
+
+        $total = (float) ($order->total_amount ?? 0);
+        $paid = (float) ($order->paid_amount ?? 0);
+
+        return max(0, $total - $paid);
+    }
+
+    /**
+     * Synchronous bulk send (old behavior, for small batches)
+     */
+    protected function bulkSendToPathaoSync(array $shipmentIds): \Illuminate\Http\JsonResponse
+    {
         $results = [
             'success' => [],
             'failed' => [],
         ];
 
         $shipments = Shipment::with(['order', 'store'])
-                             ->whereIn('id', $request->shipment_ids)
-                             ->get();
+            ->whereIn('id', $shipmentIds)
+            ->get();
 
         foreach ($shipments as $shipment) {
             try {
-                // Check if eligible
                 if (!$shipment->isPending()) {
                     $results['failed'][] = [
                         'shipment_id' => $shipment->id,
@@ -431,7 +1005,6 @@ class ShipmentController extends Controller
                     continue;
                 }
 
-                // Send to Pathao
                 $this->sendToPathao($shipment);
 
                 $results['success'][] = [
@@ -453,6 +1026,115 @@ class ShipmentController extends Controller
             'success' => true,
             'message' => count($results['success']) . ' shipments sent successfully, ' . count($results['failed']) . ' failed',
             'data' => $results
+        ]);
+    }
+
+    /**
+     * Get bulk batch summary status
+     *
+     * GET /api/shipments/bulk-status/{batchCode}
+     */
+    public function bulkStatus($batchCode)
+    {
+        $batch = PathaoBulkBatch::where('batch_code', $batchCode)->first();
+
+        if (!$batch) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Batch not found'
+            ], 404);
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => $batch->getSummary()
+        ]);
+    }
+
+    /**
+     * Get detailed results for a bulk batch
+     *
+     * GET /api/shipments/bulk-status/{batchCode}/details
+     */
+    public function bulkStatusDetails($batchCode)
+    {
+        $batch = PathaoBulkBatch::where('batch_code', $batchCode)->first();
+
+        if (!$batch) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Batch not found'
+            ], 404);
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'summary' => $batch->getSummary(),
+                'results' => $batch->getDetailedResults(),
+            ]
+        ]);
+    }
+
+    /**
+     * Cancel a bulk batch (stops pending jobs)
+     *
+     * POST /api/shipments/bulk-status/{batchCode}/cancel
+     */
+    public function bulkCancel($batchCode)
+    {
+        $batch = PathaoBulkBatch::where('batch_code', $batchCode)->first();
+
+        if (!$batch) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Batch not found'
+            ], 404);
+        }
+
+        if ($batch->isCompleted()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Batch already completed'
+            ], 400);
+        }
+
+        $batch->cancel();
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Batch cancelled',
+            'data' => $batch->getSummary()
+        ]);
+    }
+
+    /**
+     * List recent bulk batches
+     *
+     * GET /api/shipments/bulk-batches?status=processing&days=7
+     */
+    public function listBulkBatches(Request $request)
+    {
+        $query = PathaoBulkBatch::query()
+            ->orderBy('created_at', 'desc');
+
+        if ($request->filled('status')) {
+            $query->where('status', $request->status);
+        }
+
+        $days = $request->input('days', 7);
+        $query->recent($days);
+
+        $batches = $query->paginate($request->input('per_page', 20));
+
+        // Transform to include summary
+        $batches->through(function ($batch) {
+            return $batch->getSummary();
+        });
+
+        return response()->json([
+            'success' => true,
+            'data' => $batches
         ]);
     }
 

@@ -6,7 +6,7 @@ use App\Models\Role;
 use Illuminate\Database\Seeder;
 
 /**
- * RolesSeeder — Errum V2 RBAC Refactor (2026-03-30)
+ * RolesSeeder — Deshio V2 RBAC Refactor (2026-03-30)
  *
  * Seeds the canonical 7 business roles. Levels and permissions are removed;
  * access control is enforced entirely on the frontend based on role slug.

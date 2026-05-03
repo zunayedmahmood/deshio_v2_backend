@@ -16,7 +16,7 @@ class SslcommerzController extends Controller
      */
     private function getFrontendUrl(): string
     {
-        return rtrim(env('FRONTEND_URL', 'https://errum-v2.vercel.app'), '/');
+        return rtrim(env('FRONTEND_URL', 'https://Deshio-v2.vercel.app'), '/');
     }
 
     /**

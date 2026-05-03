@@ -1170,8 +1170,10 @@ Route::middleware('auth:api')->group(function () {
         Route::post('/pathao/stores', [ShipmentController::class, 'createPathaoStore']);
 
         // Bulk operations
+        Route::post('/bulk-send-orders-to-pathao', [ShipmentController::class, 'bulkSendOrdersToPathao']);
         Route::post('/bulk-send-to-pathao', [ShipmentController::class, 'bulkSendToPathao']);
         Route::post('/bulk-sync-pathao-status', [ShipmentController::class, 'bulkSyncPathaoStatus']);
+        Route::post('/pathao-queue-tick', [ShipmentController::class, 'runPathaoQueueTick']);
         
         // Pathao status sync scheduler trigger (manual trigger for admins)
         Route::post('/trigger-pathao-sync', [ShipmentController::class, 'triggerPathaoSync']);
@@ -1182,6 +1184,7 @@ Route::middleware('auth:api')->group(function () {
         Route::get('/bulk-status/{batchCode}', [ShipmentController::class, 'bulkStatus']);
         Route::get('/bulk-status/{batchCode}/details', [ShipmentController::class, 'bulkStatusDetails']);
         Route::post('/bulk-status/{batchCode}/cancel', [ShipmentController::class, 'bulkCancel']);
+        Route::post('/bulk-status/{batchCode}/retry-failed', [ShipmentController::class, 'retryFailedPathaoBatch']);
 
         // Create shipment from order
         Route::post('/', [ShipmentController::class, 'create']);

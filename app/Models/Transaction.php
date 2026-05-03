@@ -189,7 +189,7 @@ class Transaction extends Model
             return $query;
         }
         
-        if ($storeId === 'global' || $storeId === 'errum' || $storeId === 'NULL') {
+        if ($storeId === 'global' || $storeId === 'Deshio' || $storeId === 'NULL') {
             return $query->whereNull('store_id');
         }
 

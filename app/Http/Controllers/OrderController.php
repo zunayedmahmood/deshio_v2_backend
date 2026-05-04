@@ -88,13 +88,39 @@ class OrderController extends Controller
             $query->where('created_by', $request->created_by);
         }
 
-        // Filter by date range
-        if ($request->filled('date_from')) {
-            $query->where('order_date', '>=', $request->date_from);
+        // Filter by intended courier (marker)
+        if ($request->filled('intended_courier')) {
+            if ($request->intended_courier === 'unassigned' || $request->intended_courier === 'null') {
+                $query->whereNull('intended_courier');
+            } else {
+                $query->where('intended_courier', $request->intended_courier);
+            }
         }
 
-        if ($request->filled('date_to')) {
-            $query->where('order_date', '<=', $request->date_to);
+        // Filter by multiple order types
+        if ($request->filled('order_types') && is_array($request->order_types)) {
+            $query->whereIn('order_type', $request->order_types);
+        }
+
+        // Date filtering logic
+        $dateField = $request->input('date_type', 'order_date');
+        // Validate date field to prevent SQL injection or bad queries
+        if (!in_array($dateField, ['order_date', 'updated_at', 'created_at', 'confirmed_at', 'fulfilled_at'])) {
+            $dateField = 'order_date';
+        }
+
+        // Shortcut for today's orders
+        if ($request->boolean('today')) {
+            $query->whereDate($dateField, now()->toDateString());
+        } else {
+            // Filter by date range
+            if ($request->filled('date_from')) {
+                $query->where($dateField, '>=', $request->date_from . ' 00:00:00');
+            }
+
+            if ($request->filled('date_to')) {
+                $query->where($dateField, '<=', $request->date_to . ' 23:59:59');
+            }
         }
 
         // Search by order number or customer name
@@ -1721,6 +1747,7 @@ class OrderController extends Controller
             'gross_margin' => number_format($grossMargin, 2),
             'gross_margin_percentage' => $order->total_amount > 0 ? number_format(($grossMargin / (float)$order->total_amount) * 100, 2) : '0.00',
             'is_installment' => $order->is_installment_payment,
+            'intended_courier' => $order->intended_courier,
             'order_date' => $order->order_date->format('Y-m-d H:i:s'),
             'created_at' => $order->created_at->format('Y-m-d H:i:s'),
         ];

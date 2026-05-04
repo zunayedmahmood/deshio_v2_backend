@@ -78,6 +78,23 @@ class ProductDispatchController extends Controller
             }
         }
 
+        // Filter by type (via Order relationship)
+        if ($request->filled('type')) {
+            $type = $request->input('type');
+            if ($type === 'store_transfer') {
+                $query->whereNull('order_id');
+            } else {
+                $query->whereHas('order', function ($q) use ($type) {
+                    $q->where('type', $type);
+                });
+            }
+        }
+
+        // Filter by "Today"
+        if ($request->boolean('today')) {
+            $query->whereDate('created_at', now()->toDateString());
+        }
+
         // Filter by store
         if ($request->filled('source_store_id')) {
             $query->bySourceStore($request->source_store_id);
@@ -586,6 +603,78 @@ if (!$barcodeAtSourceStore) {
                         'total_value' => number_format((float)$dispatch->fresh()->total_value, 2),
                     ]
                 ]
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage()
+            ], 422);
+        }
+    }
+
+    /**
+     * Submit a dispatch for approval
+     *
+     * PATCH /api/dispatches/{id}/submit
+     */
+    public function submit($id)
+    {
+        $dispatch = ProductDispatch::find($id);
+
+        if (!$dispatch) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Dispatch not found'
+            ], 404);
+        }
+
+        DB::beginTransaction();
+        try {
+            $dispatch->submitForApproval();
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Dispatch submitted for approval successfully. Stock has been deducted from source store.',
+                'data' => $this->formatDispatchResponse($dispatch->fresh(), true)
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage()
+            ], 422);
+        }
+    }
+
+    /**
+     * Reject a dispatch
+     *
+     * PATCH /api/dispatches/{id}/reject
+     */
+    public function reject(Request $request, $id)
+    {
+        $dispatch = ProductDispatch::find($id);
+
+        if (!$dispatch) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Dispatch not found'
+            ], 404);
+        }
+
+        DB::beginTransaction();
+        try {
+            $dispatch->reject($request->notes);
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Dispatch rejected successfully. Stock has been restored to source store.',
+                'data' => $this->formatDispatchResponse($dispatch->fresh(), true)
             ]);
 
         } catch (\Exception $e) {

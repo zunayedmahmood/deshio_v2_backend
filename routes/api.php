@@ -1453,10 +1453,13 @@ Route::middleware('auth:api')->group(function () {
             Route::post('/items/{itemId}/receive-barcode', [ProductDispatchController::class, 'receiveBarcode']);
             Route::get('/items/{itemId}/received-barcodes', [ProductDispatchController::class, 'getReceivedBarcodes']);
             
+            Route::patch('/submit', [ProductDispatchController::class, 'submit']);
             Route::patch('/approve', [ProductDispatchController::class, 'approve']);
+            Route::patch('/reject', [ProductDispatchController::class, 'reject']);
             Route::patch('/dispatch', [ProductDispatchController::class, 'markDispatched']);
             Route::patch('/deliver', [ProductDispatchController::class, 'markDelivered']);
             Route::patch('/cancel', [ProductDispatchController::class, 'cancel']);
+            Route::get('/pdf', [ProductDispatchController::class, 'exportPdf']);
             
             // Create shipment from dispatch
             Route::post('/create-shipment', [ProductDispatchController::class, 'createShipment']);

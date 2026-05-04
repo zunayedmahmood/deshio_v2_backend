@@ -120,7 +120,12 @@ class ProductDispatch extends Model
 
     public function scopeCancelled($query)
     {
-        return $query->where('status', 'cancelled');
+        return $query->whereIn('status', ['cancelled', 'rejected']);
+    }
+
+    public function scopePendingApproval($query)
+    {
+        return $query->where('status', 'pending_approval');
     }
 
     public function scopeBySourceStore($query, $storeId)
@@ -190,17 +195,68 @@ class ProductDispatch extends Model
 
     public function canBeApproved(): bool
     {
-        return $this->status === 'pending' && is_null($this->approved_by);
+        return $this->status === 'pending_approval' && is_null($this->approved_by);
     }
 
     public function canBeDispatched(): bool
     {
-        return $this->status === 'pending' && !is_null($this->approved_by);
+        return in_array($this->status, ['pending_approval', 'approved']) && !!$this->approved_by;
     }
 
     public function canBeDelivered(): bool
     {
         return $this->status === 'in_transit';
+    }
+
+    public function submitForApproval()
+    {
+        if ($this->status !== 'pending') {
+            throw new \Exception('Dispatch is not in a state that can be submitted for approval.');
+        }
+
+        if ($this->items()->count() === 0) {
+            throw new \Exception('Cannot submit a dispatch without items.');
+        }
+
+        return \Illuminate\Support\Facades\DB::transaction(function () {
+            // Deduct stock from source batches when sent for approval
+            foreach ($this->items as $item) {
+                $item->batch->removeStock($item->quantity);
+                
+                // Decrement reservation since it's now physically deducted
+                $this->decrementReservation($item->product_id, $item->quantity);
+            }
+
+            $this->update(['status' => 'pending_approval']);
+            
+            return $this;
+        });
+    }
+
+    public function reject($notes = null)
+    {
+        if ($this->status !== 'pending_approval') {
+            throw new \Exception('Only dispatches pending approval can be rejected.');
+        }
+
+        return \Illuminate\Support\Facades\DB::transaction(function () use ($notes) {
+            // Restore stock back to source batches
+            foreach ($this->items as $item) {
+                $item->batch->increment('quantity', $item->quantity);
+            }
+
+            $this->update([
+                'status' => 'rejected',
+                'notes' => $notes ?? $this->notes,
+                'approved_by' => null,
+                'approved_at' => null
+            ]);
+            
+            // Release barcodes status if they were scanned
+            $this->releaseBarcodes();
+
+            return $this;
+        });
     }
 
     public function approve(Employee $employee)
@@ -211,6 +267,7 @@ class ProductDispatch extends Model
 
         return \Illuminate\Support\Facades\DB::transaction(function () use ($employee) {
             $this->update([
+                'status' => 'approved',
                 'approved_by' => $employee->id,
                 'approved_at' => now(),
             ]);
@@ -272,9 +329,9 @@ class ProductDispatch extends Model
                 'actual_delivery_date' => now(),
             ]);
 
-            // Process inventory movement for each item
+            // Process inventory creation for each item (stock was already deducted at approval stage)
             foreach ($this->items as $item) {
-                $this->processInventoryMovement($item);
+                $this->createDestinationBatch($item);
             }
 
             return $this;
@@ -283,13 +340,47 @@ class ProductDispatch extends Model
 
     public function cancel()
     {
-        if (in_array($this->status, ['delivered', 'cancelled'])) {
-            throw new \Exception('Cannot cancel a delivered or already cancelled dispatch.');
+        if (in_array($this->status, ['delivered', 'cancelled', 'rejected'])) {
+            throw new \Exception('Cannot cancel a delivered or already terminated dispatch.');
         }
 
-        $this->update(['status' => 'cancelled']);
+        return \Illuminate\Support\Facades\DB::transaction(function () {
+            $oldStatus = $this->status;
+            
+            // If it was already deducted (pending_approval, approved, in_transit), restore stock
+            if (in_array($oldStatus, ['pending_approval', 'approved', 'in_transit'])) {
+                foreach ($this->items as $item) {
+                    $item->batch->increment('quantity', $item->quantity);
+                }
+            } else if ($oldStatus === 'pending') {
+                // If it was just pending, we only need to clear the reservations
+                foreach ($this->items as $item) {
+                    $this->decrementReservation($item->product_id, $item->quantity);
+                }
+            }
 
-        return $this;
+            $this->update(['status' => 'cancelled']);
+            
+            // Release barcodes
+            $this->releaseBarcodes();
+
+            return $this;
+        });
+    }
+
+    protected function releaseBarcodes()
+    {
+        foreach ($this->items as $item) {
+            $item->scannedBarcodes()->each(function ($barcode) {
+                $barcode->update([
+                    'current_status' => 'in_shop', // Or its original status
+                    'location_updated_at' => now(),
+                ]);
+            });
+            
+            // Clear pivot table
+            $item->scannedBarcodes()->detach();
+        }
     }
 
     public function addItem(ProductBatch $batch, int $quantity)
@@ -310,13 +401,41 @@ if (!$barcodeAtSourceStore) {
         return \Illuminate\Support\Facades\DB::transaction(function () use ($batch, $quantity) {
             $item = $this->items()->create([
                 'product_batch_id' => $batch->id,
+                'product_id' => $batch->product_id,
                 'quantity' => $quantity,
+                'unit_cost' => $batch->cost_price,
+                'unit_price' => $batch->sell_price,
+                'total_cost' => $quantity * $batch->cost_price,
+                'total_value' => $quantity * $batch->sell_price,
+                'status' => 'pending',
             ]);
 
             $this->updateTotals();
+            
+            // Increment reservation
+            $this->incrementReservation($batch->product_id, $quantity);
 
             return $item;
         });
+    }
+
+    protected function incrementReservation($productId, $quantity)
+    {
+        $reserved = ReservedProduct::firstOrCreate(
+            ['product_id' => $productId],
+            ['total_inventory' => 0, 'reserved_inventory' => 0, 'available_inventory' => 0]
+        );
+        $reserved->increment('reserved_inventory', $quantity);
+        $reserved->decrement('available_inventory', $quantity);
+    }
+
+    protected function decrementReservation($productId, $quantity)
+    {
+        $reserved = ReservedProduct::where('product_id', $productId)->first();
+        if ($reserved) {
+            $reserved->decrement('reserved_inventory', $quantity);
+            $reserved->increment('available_inventory', $quantity);
+        }
     }
 
     public function removeItem(ProductDispatchItem $item)
@@ -326,8 +445,14 @@ if (!$barcodeAtSourceStore) {
         }
 
         return \Illuminate\Support\Facades\DB::transaction(function () use ($item) {
+            $productId = $item->product_id;
+            $quantity = $item->quantity;
+            
             $item->delete();
             $this->updateTotals();
+            
+            // Decrement reservation
+            $this->decrementReservation($productId, $quantity);
 
             return $this;
         });
@@ -419,13 +544,10 @@ if (!$barcodeAtSourceStore) {
         return static::overdue()->count();
     }
 
-    protected function processInventoryMovement(ProductDispatchItem $item)
+    protected function createDestinationBatch(ProductDispatchItem $item)
     {
         $sourceBatch = $item->batch;
         $receivedQuantity = $item->received_quantity ?? $item->quantity;
-
-        // Reduce quantity in source batch
-        $sourceBatch->removeStock($item->quantity);
 
         // Create new batch at destination store
         $destinationBatch = ProductBatch::create([

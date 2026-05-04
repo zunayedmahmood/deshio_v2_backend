@@ -2285,6 +2285,9 @@ class OrderController extends Controller
         $callback = function() use ($orders) {
             $file = fopen('php://output', 'w');
             
+            // Add BOM to fix Bangla characters in Excel
+            fwrite($file, "\xEF\xBB\xBF");
+            
             // CSV Header from order_sample.csv
             fputcsv($file, [
                 'ItemType', 
@@ -2325,12 +2328,14 @@ class OrderController extends Controller
                 $itemDesc = $order->items->pluck('product_name')->implode(', ');
                 $totalItems = $order->items->sum('quantity');
 
+                $phone = $order->customer_phone ?? ($customer ? $customer->phone : '');
+
                 fputcsv($file, [
                     'parcel', // ItemType
-                    $order->store->name ?? '', // StoreName
+                    'Deshio BD - দেশীয়', // StoreName (Hardcoded as requested)
                     $order->order_number, // MerchantOrderId
                     $order->customer_name ?? ($customer ? $customer->name : ''), // RecipientName
-                    $order->customer_phone ?? ($customer ? $customer->phone : ''), // RecipientPhone
+                    "\t" . $phone, // RecipientPhone (Prepend tab to preserve leading zero in Excel)
                     $recipientAddress, // RecipientAddress
                     $shipping['city'] ?? '', // RecipientCity
                     $shipping['zone'] ?? '', // RecipientZone

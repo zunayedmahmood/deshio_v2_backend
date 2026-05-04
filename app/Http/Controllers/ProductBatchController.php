@@ -22,7 +22,7 @@ class ProductBatchController extends Controller
      */
     public function index(Request $request)
     {
-        $query = ProductBatch::with(['product', 'store', 'barcode']);
+        $query = ProductBatch::with(['product.images', 'store', 'barcode']);
 
         // Filter by product
         if ($request->filled('product_id')) {
@@ -155,6 +155,7 @@ class ProductBatchController extends Controller
     public function show($id)
     {
         $batch = ProductBatch::with([
+            'product.images',
             'product.category',
             'product.vendor',
             'store',
@@ -451,7 +452,7 @@ class ProductBatchController extends Controller
         $threshold = $request->input('threshold', 10);
         $storeId = $request->input('store_id');
 
-        $query = ProductBatch::with(['product', 'store', 'barcode'])
+        $query = ProductBatch::with(['product.images', 'store', 'barcode'])
             ->where('quantity', '<=', $threshold)
             ->where('quantity', '>', 0)
             ->where('is_active', true);
@@ -484,7 +485,7 @@ class ProductBatchController extends Controller
         $days = $request->input('days', 30);
         $storeId = $request->input('store_id');
 
-        $query = ProductBatch::with(['product', 'store', 'barcode'])
+        $query = ProductBatch::with(['product.images', 'store', 'barcode'])
             ->expiringSoon($days)
             ->where('is_active', true);
 
@@ -515,7 +516,7 @@ class ProductBatchController extends Controller
     {
         $storeId = $request->input('store_id');
 
-        $query = ProductBatch::with(['product', 'store', 'barcode'])
+        $query = ProductBatch::with(['product.images', 'store', 'barcode'])
             ->expired()
             ->where('is_active', true);
 
@@ -637,6 +638,9 @@ class ProductBatchController extends Controller
                 'id' => $batch->product->id,
                 'name' => $batch->product->name,
                 'sku' => $batch->product->sku,
+                'primary_image' => $batch->product->images->where('is_primary', true)->first() ? [
+                    'url' => $batch->product->images->where('is_primary', true)->first()->image_url
+                ] : null,
             ],
             'store' => [
                 'id' => $batch->store->id,

@@ -56,5 +56,6 @@ class AppServiceProvider extends ServiceProvider
         DefectiveProduct::observe(DefectiveProductObserver::class);
         ProductBatch::observe(ProductBatchObserver::class);
         OrderItem::observe(OrderItemObserver::class);
+        \App\Models\ProductDispatch::observe(\App\Observers\ProductDispatchObserver::class);
     }
 }

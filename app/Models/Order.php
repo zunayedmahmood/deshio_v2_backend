@@ -13,6 +13,42 @@ class Order extends Model
 {
     use HasFactory, SoftDeletes, AutoLogsActivity;
 
+    const RESERVATION_STATUSES = [
+        'pending',
+        'pending_assignment',
+        'assigned_to_store',
+        'picking',
+        'processing',
+        'ready_for_pickup',
+        'shipped'
+    ];
+
+    /**
+     * Check if the order status is one that requires stock reservation.
+     */
+    public function isReservedStatus(): bool
+    {
+        return in_array($this->status, self::RESERVATION_STATUSES);
+    }
+
+    const RESERVATION_STATUSES = [
+        'pending',
+        'pending_assignment',
+        'assigned_to_store',
+        'picking',
+        'processing',
+        'ready_for_pickup',
+        'shipped'
+    ];
+
+    /**
+     * Check if the order status is one that requires stock reservation.
+     */
+    public function isReservedStatus(): bool
+    {
+        return in_array($this->status, self::RESERVATION_STATUSES);
+    }
+
     protected $fillable = [
         'order_number',
         'customer_id',

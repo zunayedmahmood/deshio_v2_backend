@@ -1442,20 +1442,6 @@ class OrderController extends Controller
                 
                 if (!$alreadyDeducted) {
                     $batch->removeStock($item->quantity);
-
-                    // RELEASE RESERVATION concurrently to keep available_stock (Total - Reserved) consistent
-                    if ($reservedRecord = ReservedProduct::where('product_id', $item->product_id)->first()) {
-                        $reservedRecord->decrement('reserved_inventory', $item->quantity);
-                        $reservedRecord->refresh();
-                        $reservedRecord->available_inventory = $reservedRecord->total_inventory - $reservedRecord->reserved_inventory;
-                        $reservedRecord->save();
-
-                        Log::info('Reservation released at order completion', [
-                            'order_id' => $order->id,
-                            'product_id' => $item->product_id,
-                            'quantity' => $item->quantity,
-                        ]);
-                    }
                 }
                 
                 $batch->update([

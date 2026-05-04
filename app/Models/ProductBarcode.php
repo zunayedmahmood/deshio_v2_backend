@@ -144,7 +144,7 @@ class ProductBarcode extends Model
     /**
      * Update physical location and status of this barcode
      */
-    public function updateLocation($storeId, $status, array $metadata = [], $createMovement = true)
+    public function updateLocation($storeId, $status, array $metadata = [], $createMovement = true, $performedById = null)
     {
         $oldStore = $this->current_store_id;
         $oldStatus = $this->current_status;
@@ -167,7 +167,10 @@ class ProductBarcode extends Model
                 'quantity' => 1,
                 'status_before' => $oldStatus,
                 'status_after' => $status,
-                'notes' => "Location updated: {$oldStatus} → {$status}",
+                'notes' => $metadata['notes'] ?? "Location updated: {$oldStatus} → {$status}",
+                'performed_by' => $performedById ?? auth()->id(),
+                'reference_type' => $metadata['reference_type'] ?? null,
+                'reference_id' => $metadata['reference_id'] ?? null,
             ]);
         }
 

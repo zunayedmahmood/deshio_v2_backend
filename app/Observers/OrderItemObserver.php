@@ -4,6 +4,7 @@ namespace App\Observers;
 
 use App\Models\OrderItem;
 use App\Models\ReservedProduct;
+use App\Models\Order;
 use Illuminate\Support\Facades\Log;
 
 class OrderItemObserver
@@ -14,9 +15,8 @@ class OrderItemObserver
     public function created(OrderItem $orderItem): void
     {
         $order = $orderItem->order;
-        $reservationStatuses = ['pending_assignment', 'pending', 'assigned_to_store', 'picking', 'processing', 'ready_for_pickup'];
-        if ($order && in_array($order->status, $reservationStatuses)) {
-            if ($order->order_type === 'preorder') { // Preorders might not have batch/stock yet
+        if ($order && $order->isReservedStatus()) {
+            if ($order->order_type === 'preorder') {
                 return;
             }
             $this->incrementReservation($orderItem->product_id, $orderItem->quantity);
@@ -29,14 +29,23 @@ class OrderItemObserver
     public function updated(OrderItem $orderItem): void
     {
         $order = $orderItem->order;
-        $reservationStatuses = ['pending_assignment', 'pending', 'assigned_to_store', 'picking', 'processing', 'ready_for_pickup'];
-        if ($order && in_array($order->status, $reservationStatuses)) {
+        if ($order && $order->isReservedStatus()) {
             if ($order->order_type === 'preorder') {
                 return;
             }
 
+            // Handle product swap
+            if ($orderItem->isDirty('product_id')) {
+                $oldProductId = $orderItem->getOriginal('product_id');
+                $oldQty = $orderItem->getOriginal('quantity');
+                $newProductId = $orderItem->product_id;
+                $newQty = $orderItem->quantity;
 
-            if ($orderItem->isDirty('quantity')) {
+                $this->decrementReservation($oldProductId, $oldQty);
+                $this->incrementReservation($newProductId, $newQty);
+            } 
+            // Handle quantity change for the same product
+            else if ($orderItem->isDirty('quantity')) {
                 $oldQty = $orderItem->getOriginal('quantity');
                 $newQty = $orderItem->quantity;
                 $diff = $newQty - $oldQty;
@@ -56,9 +65,7 @@ class OrderItemObserver
     public function deleted(OrderItem $orderItem): void
     {
         $order = $orderItem->order;
-        $reservationStatuses = ['pending_assignment', 'pending', 'assigned_to_store', 'picking', 'processing', 'ready_for_pickup'];
-        // Check if the order still exists (it might have been deleted too)
-        if ($order && in_array($order->status, $reservationStatuses)) {
+        if ($order && $order->isReservedStatus()) {
             if ($order->order_type === 'preorder') {
                 return;
             }
@@ -68,14 +75,16 @@ class OrderItemObserver
 
     private function incrementReservation($productId, $quantity): void
     {
-        if ($reservedRecord = ReservedProduct::where('product_id', $productId)->first()) {
+        $reservedRecord = ReservedProduct::where('product_id', $productId)->lockForUpdate()->first();
+        
+        if ($reservedRecord) {
             $reservedRecord->increment('reserved_inventory', $quantity);
             $reservedRecord->decrement('available_inventory', $quantity);
             Log::info("Incremented reservation for product {$productId} by {$quantity}");
         } else {
             ReservedProduct::create([
                 'product_id' => $productId,
-                'total_inventory' => 0, // Will be corrected by ProductBatchObserver if batches exist
+                'total_inventory' => 0,
                 'reserved_inventory' => $quantity,
                 'available_inventory' => -$quantity,
             ]);
@@ -85,7 +94,8 @@ class OrderItemObserver
 
     private function decrementReservation($productId, $quantity): void
     {
-        if ($reservedRecord = ReservedProduct::where('product_id', $productId)->first()) {
+        $reservedRecord = ReservedProduct::where('product_id', $productId)->lockForUpdate()->first();
+        if ($reservedRecord) {
             $reservedRecord->decrement('reserved_inventory', $quantity);
             $reservedRecord->increment('available_inventory', $quantity);
             Log::info("Decremented reservation for product {$productId} by {$quantity}");

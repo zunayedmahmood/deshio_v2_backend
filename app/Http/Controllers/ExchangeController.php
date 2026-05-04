@@ -236,7 +236,12 @@ class ExchangeController extends Controller
                 // Update barcode status
                 if ($barcodeId) {
                     $barcode = ProductBarcode::find($barcodeId);
-                    $barcode->updateLocation(null, 'with_customer', ['order_id' => $replacementOrder->id]);
+                    $barcode->updateLocation(null, 'with_customer', [
+                        'order_id' => $replacementOrder->id,
+                        'reference_type' => 'order',
+                        'reference_id' => $replacementOrder->id,
+                        'notes' => "Sold via Exchange. Order #{$replacementOrder->order_number}"
+                    ], true, $employee->id);
                 }
 
                 $subtotal += $itemSubtotal;
@@ -440,25 +445,14 @@ class ExchangeController extends Controller
 
             if ($barcodes->isNotEmpty()) {
                 foreach ($barcodes as $barcode) {
-                    $barcode->updateLocation($returnStore, 'in_warehouse', ['return_id' => $return->id]);
-                    $barcode->batch_id = $targetBatch->id;
+                    $barcode->batch_id = $targetBatch->id; // Update batch if it changed store
                     $barcode->is_active = true;
-                    $barcode->current_status = 'in_warehouse';
-                    $barcode->save();
-
-                    ProductMovement::create([
-                        'product_id' => $barcode->product_id,
-                        'product_batch_id' => $targetBatch->id,
-                        'product_barcode_id' => $barcode->id,
-                        'to_store_id' => $returnStore,
-                        'movement_type' => 'return',
-                        'quantity' => 1,
-                        'unit_cost' => $barcode->batch->cost_price ?? 0,
-                        'total_cost' => $barcode->batch->cost_price ?? 0,
+                    $barcode->updateLocation($returnStore, 'in_warehouse', [
+                        'return_id' => $return->id,
                         'reference_type' => 'return',
                         'reference_id' => $return->id,
-                        'performed_by' => $employee->id,
-                    ]);
+                        'notes' => "Customer Return via Exchange. Reason: " . ($item['return_reason'] ?? 'N/A')
+                    ], true, $employee->id);
                 }
             } else {
                 // Fallback for products that might not have barcodes (if any)

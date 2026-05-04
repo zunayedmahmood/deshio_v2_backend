@@ -450,22 +450,11 @@ class OrderManagementController extends Controller
 
                 // b. Restore Physical Stock if it was deducted
                 if ($isDeducted) {
-                    // Update Batch Quantity
                     if ($item->product_batch_id) {
                         $batch = ProductBatch::find($item->product_batch_id);
                         if ($batch) {
                             $batch->increment('quantity', $item->quantity);
                         }
-                    }
-
-                    // Update Global Reserved Stats (Total and Reserved)
-                    if ($reserved = ReservedProduct::where('product_id', $item->product_id)->first()) {
-                        $reserved->increment('total_inventory', $item->quantity);
-                        $reserved->increment('reserved_inventory', $item->quantity);
-                        
-                        $reserved->fresh();
-                        $reserved->available_inventory = $reserved->total_inventory - $reserved->reserved_inventory;
-                        $reserved->save();
                     }
                 }
 

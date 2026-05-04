@@ -27,8 +27,6 @@ use App\Models\ProductBatch;
 use App\Observers\ProductBatchObserver;
 use App\Models\OrderItem;
 use App\Observers\OrderItemObserver;
-use App\Models\ProductDispatch;
-use App\Observers\ProductDispatchObserver;
 
 class AppServiceProvider extends ServiceProvider
 {
@@ -58,6 +56,5 @@ class AppServiceProvider extends ServiceProvider
         DefectiveProduct::observe(DefectiveProductObserver::class);
         ProductBatch::observe(ProductBatchObserver::class);
         OrderItem::observe(OrderItemObserver::class);
-        ProductDispatch::observe(ProductDispatchObserver::class);
     }
 }

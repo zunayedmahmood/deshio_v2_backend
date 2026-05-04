@@ -850,7 +850,7 @@ class Order extends Model
     {
         // Define prefix based on order type
         // S/E for Social Commerce and E-commerce, P for POS (counter)
-        $prefix = in_array($orderType, ['social_commerce', 'ecommerce']) ? 'ORD-S/E-' : 'ORD-P-';
+        $prefix = in_array($orderType, ['social_commerce', 'ecommerce']) ? 'ORD-S-' : 'ORD-P-';
         $prefixLength = strlen($prefix);
 
         // Find the latest order with the specific prefix pattern using REGEXP

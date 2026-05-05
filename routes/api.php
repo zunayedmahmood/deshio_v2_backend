@@ -1417,6 +1417,12 @@ Route::middleware('auth:api')->group(function () {
         Route::post('/generate', [ProductBarcodeController::class, 'generate']);
         Route::post('/scan', [ProductBarcodeController::class, 'scan']);
         Route::post('/batch-scan', [ProductBarcodeController::class, 'batchScan']);
+
+        // Floating replacement barcode relabeling (lost/damaged sticker recovery)
+        Route::get('/relabels', [ProductBarcodeController::class, 'relabels']);
+        Route::post('/relabels', [ProductBarcodeController::class, 'createRelabel']);
+        Route::post('/relabels/reconcile-batch', [ProductBarcodeController::class, 'reconcileRelabelBatch']);
+
         Route::get('/{barcode}/history', [ProductBarcodeController::class, 'getHistory']);
         Route::get('/{barcode}/location', [ProductBarcodeController::class, 'getCurrentLocation']);
         

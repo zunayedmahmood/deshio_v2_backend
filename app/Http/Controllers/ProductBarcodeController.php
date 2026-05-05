@@ -6,6 +6,8 @@ use App\Models\Product;
 use App\Models\ProductBarcode;
 use App\Models\ProductBatch;
 use App\Models\ProductMovement;
+use App\Models\ProductBarcodeRelabel;
+use App\Services\FloatingBarcodeRelabelService;
 use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
@@ -90,6 +92,155 @@ class ProductBarcodeController extends Controller
                     'quantity' => $scanResult['last_movement']->quantity,
                 ] : null,
             ]
+        ]);
+    }
+
+
+    /**
+     * List floating replacement barcode records.
+     *
+     * GET /api/barcodes/relabels?batch_id=1&status=open
+     */
+    public function relabels(Request $request)
+    {
+        $query = ProductBarcodeRelabel::with([
+            'product:id,name,sku',
+            'batch:id,batch_number,quantity,store_id',
+            'store:id,name',
+            'replacementBarcode:id,barcode,current_status,is_active,is_replacement,replacement_status',
+            'knownOriginalBarcode:id,barcode,current_status,is_active',
+            'reconciledOriginalBarcode:id,barcode,current_status,is_active',
+            'creator:id,name',
+        ])->latest();
+
+        if ($request->filled('product_id')) {
+            $query->where('product_id', $request->product_id);
+        }
+        if ($request->filled('batch_id')) {
+            $query->where('batch_id', $request->batch_id);
+        }
+        if ($request->filled('store_id')) {
+            $query->where('store_id', $request->store_id);
+        }
+        if ($request->filled('status')) {
+            $query->where('status', $request->status);
+        }
+
+        $perPage = (int) $request->input('per_page', 20);
+        $relabels = $query->paginate(max(1, min($perPage, 100)));
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'items' => $relabels->items(),
+                'pagination' => [
+                    'current_page' => $relabels->currentPage(),
+                    'per_page' => $relabels->perPage(),
+                    'total' => $relabels->total(),
+                    'last_page' => $relabels->lastPage(),
+                ],
+            ],
+        ]);
+    }
+
+    /**
+     * Generate a floating replacement barcode for a lost/damaged sticker.
+     *
+     * POST /api/barcodes/relabels
+     * Body: {
+     *   "batch_id": 1,
+     *   "product_id": 1,        // optional; checked if provided
+     *   "store_id": 1,          // optional; must match batch store if provided
+     *   "barcode": "111001",   // optional; auto-generated if omitted
+     *   "reason": "lost_sticker",
+     *   "notes": "Sticker lost from one item"
+     * }
+     */
+    public function createRelabel(Request $request, FloatingBarcodeRelabelService $service)
+    {
+        $validator = Validator::make($request->all(), [
+            'batch_id' => 'required|exists:product_batches,id',
+            'product_id' => 'nullable|exists:products,id',
+            'store_id' => 'nullable|exists:stores,id',
+            'barcode' => 'nullable|string|max:80|unique:product_barcodes,barcode',
+            'type' => 'nullable|string|in:CODE128,EAN13,QR',
+            'reason' => 'nullable|string|max:80',
+            'notes' => 'nullable|string|max:1000',
+            'known_original_barcode_id' => 'nullable|exists:product_barcodes,id',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        try {
+            $relabel = $service->createReplacement(
+                $validator->validated(),
+                auth('api')->id() ?: auth()->id()
+            );
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Replacement barcode generated. Stock quantity was not increased.',
+                'data' => [
+                    'relabel' => $relabel,
+                    'replacement_barcode' => [
+                        'id' => $relabel->replacementBarcode->id,
+                        'barcode' => $relabel->replacementBarcode->barcode,
+                        'type' => $relabel->replacementBarcode->type,
+                        'product_name' => $relabel->product->name ?? null,
+                        'batch_number' => $relabel->batch->batch_number ?? null,
+                        'batch_quantity_after_relabel' => $relabel->batch->quantity ?? null,
+                        'status' => $relabel->replacementBarcode->current_status,
+                        'replacement_status' => $relabel->replacementBarcode->replacement_status,
+                    ],
+                    'rule' => 'This barcode is a floating scan identity for one existing unit. It does not add stock.',
+                ],
+            ], 201);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $e->errors(),
+            ], 422);
+        } catch (\Throwable $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to create replacement barcode',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Manually force reconciliation for a batch after stock reaches zero.
+     * Normally OrderController@complete runs this automatically.
+     */
+    public function reconcileRelabelBatch(Request $request, FloatingBarcodeRelabelService $service)
+    {
+        $validator = Validator::make($request->all(), [
+            'batch_id' => 'required|exists:product_batches,id',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $batch = ProductBatch::findOrFail($request->batch_id);
+        $result = $service->reconcilePoolAfterStockChange($batch);
+
+        return response()->json([
+            'success' => true,
+            'message' => $result['reconciled'] ? 'Relabel pool reconciled.' : 'No reconciliation was needed.',
+            'data' => $result,
         ]);
     }
 
@@ -238,6 +389,10 @@ class ProductBarcodeController extends Controller
                 'type' => $barcodeRecord->type,
                 'is_primary' => $barcodeRecord->is_primary,
                 'is_active' => $barcodeRecord->is_active,
+                'current_status' => $barcodeRecord->current_status,
+                'is_replacement' => (bool) $barcodeRecord->is_replacement,
+                'replacement_status' => $barcodeRecord->replacement_status,
+                'relabel_reason' => $barcodeRecord->relabel_reason,
                 'product' => [
                     'id' => $barcodeRecord->product->id,
                     'name' => $barcodeRecord->product->name,
@@ -367,6 +522,10 @@ class ProductBarcodeController extends Controller
                         'type' => $barcode->type,
                         'is_primary' => $barcode->is_primary,
                         'is_active' => $barcode->is_active,
+                        'current_status' => $barcode->current_status,
+                        'is_replacement' => (bool) $barcode->is_replacement,
+                        'replacement_status' => $barcode->replacement_status,
+                        'relabel_reason' => $barcode->relabel_reason,
                         'current_location' => $barcode->getCurrentStore()?->name,
                         'movement_count' => $barcode->getMovementCount(),
                         'generated_at' => $barcode->generated_at?->format('Y-m-d H:i:s'),

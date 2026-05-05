@@ -12,6 +12,7 @@ use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use App\Services\FloatingBarcodeRelabelService;
 use Illuminate\Support\Facades\Validator;
 
 class StoreFulfillmentController extends Controller
@@ -218,10 +219,11 @@ class StoreFulfillmentController extends Controller
                 ], 400);
             }
 
-            // 1. Find and validate barcode
+            // 1. Find and validate barcode. Replacement barcodes are normal scan identities
+            // for the same product/batch/store pool and do not increase stock.
             $barcode = ProductBarcode::where('barcode', $request->barcode)
                 ->where('current_store_id', $employee->store_id)
-                ->where('current_status', 'in_shop')
+                ->whereIn('current_status', FloatingBarcodeRelabelService::SELLABLE_STATUSES)
                 ->with(['product', 'batch'])
                 ->first();
 
@@ -231,6 +233,8 @@ class StoreFulfillmentController extends Controller
                     'message' => 'Barcode not found or not available in this store',
                 ], 404);
             }
+
+            app(FloatingBarcodeRelabelService::class)->validateBarcodeCanBeSold($barcode, $order, $orderItem->id);
 
             // 2. Validate barcode belongs to the correct product
             if ($barcode->product_id !== $orderItem->product_id) {

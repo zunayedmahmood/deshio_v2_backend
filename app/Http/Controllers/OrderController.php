@@ -15,6 +15,7 @@ use App\Models\ReservedProduct;
 use App\Models\Service;
 use App\Models\ServiceOrderItem;
 use App\Traits\DatabaseAgnosticSearch;
+use App\Services\FloatingBarcodeRelabelService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
@@ -501,14 +502,7 @@ class OrderController extends Controller
                         throw new \Exception("Barcode {$itemData['barcode']} not found for product {$product->name}");
                     }
                     
-                    // Check if barcode is already sold
-                    if (in_array($barcode->current_status, ['sold', 'with_customer'])) {
-                        throw new \Exception("Barcode {$itemData['barcode']} has already been sold");
-                    }
-                    
-                    if ($barcode->is_defective) {
-                        throw new \Exception("Barcode {$itemData['barcode']} is marked as defective");
-                    }
+                    app(FloatingBarcodeRelabelService::class)->validateBarcodeCanBeSold($barcode, $order);
                     
                     $barcodeId = $barcode->id;
                 }
@@ -948,6 +942,7 @@ class OrderController extends Controller
         DB::beginTransaction();
         try {
             $addedItems = [];
+            $relabelService = app(FloatingBarcodeRelabelService::class);
             
             // METHOD 1: Add by barcode (counter orders)
             if ($hasBarcode) {
@@ -965,28 +960,10 @@ class OrderController extends Controller
                         throw new \Exception("Barcode {$barcodeValue} not found");
                     }
 
-                    // Validate barcode is available (not already sold/with customer)
-                    if (in_array($barcode->current_status, ['sold', 'with_customer'])) {
-                        throw new \Exception("Barcode {$barcodeValue} has already been sold and is not available");
-                    }
-
-                    // Validate barcode is not defective
-                    if ($barcode->is_defective) {
-                        throw new \Exception("Barcode {$barcodeValue} is marked as defective");
-                    }
-
-                    // Validate batch exists and has stock
-                    if (!$barcode->batch) {
-                        throw new \Exception("Barcode {$barcodeValue} is not associated with any batch");
-                    }
+                    $relabelService->validateBarcodeCanBeSold($barcode, $order);
 
                     $batch = $barcode->batch;
                     $product = $barcode->product;
-
-                    // Validate batch has stock
-                    if ($batch->quantity < 1) {
-                        throw new \Exception("Product batch {$batch->batch_number} has no stock available");
-                    }
 
                     // Validate store
                     if ($batch->store_id != $order->store_id) {
@@ -1349,10 +1326,10 @@ class OrderController extends Controller
             ], 404);
         }
 
-        if (!in_array($order->status, ['pending', 'pending_assignment', 'assigned_to_store', 'confirmed'])) {
+        if (!in_array($order->status, ['pending', 'pending_assignment', 'assigned_to_store', 'confirmed', 'picking', 'ready_for_shipment'])) {
             return response()->json([
                 'success' => false,
-                'message' => 'Only pending, pending_assignment, confirmed or store-assigned orders can be completed'
+                'message' => 'Only pending, pending_assignment, confirmed, picking, ready_for_shipment or store-assigned orders can be completed'
             ], 422);
         }
 
@@ -1388,20 +1365,9 @@ class OrderController extends Controller
                         throw new \Exception("Barcode {$barcode->barcode} for {$item->product_name} has already been sold.");
                     }
 
-                    // Mark barcode as sold but keep it active for history/returns/refunds
-                    // IMPORTANT: is_active stays TRUE to preserve history for returns/refunds/defects
-                    $barcode->update([
-                        'is_active' => true, // Keep active for history tracking
-                        'current_status' => 'with_customer', // Tracks lifecycle state
-                        'location_updated_at' => now(),
-                        'location_metadata' => [
-                            'sold_via' => 'order',
-                            'order_number' => $order->order_number,
-                            'order_id' => $order->id,
-                            'sale_date' => now()->toISOString(),
-                            'sold_by' => auth()->id(),
-                        ]
-                    ]);
+                    // Mark barcode as sold. If this is a temporary/floating replacement
+                    // barcode, the relabel record is marked as used here.
+                    app(FloatingBarcodeRelabelService::class)->markBarcodeSold($barcode, $order);
 
                     // Log barcode sale
                     $note = sprintf(
@@ -1442,6 +1408,17 @@ class OrderController extends Controller
                 
                 if (!$alreadyDeducted) {
                     $batch->removeStock($item->quantity);
+                }
+
+                $relabelReconciliation = app(FloatingBarcodeRelabelService::class)
+                    ->reconcilePoolAfterStockChange($batch, $order);
+
+                if (!empty($relabelReconciliation['voided_barcodes'])) {
+                    Log::info('Floating barcode relabel pool reconciled', [
+                        'order_id' => $order->id,
+                        'batch_id' => $batch->id,
+                        'voided_barcodes' => $relabelReconciliation['voided_barcodes'],
+                    ]);
                 }
                 
                 $batch->update([
@@ -1895,14 +1872,7 @@ class OrderController extends Controller
                         throw new \Exception("Barcode {$barcodeValue} not found for product {$orderItem->product_name}");
                     }
 
-                    // Check if barcode is already sold
-                    if (in_array($barcode->current_status, ['sold', 'with_customer'])) {
-                        throw new \Exception("Barcode {$barcodeValue} has already been sold");
-                    }
-
-                    if ($barcode->is_defective) {
-                        throw new \Exception("Barcode {$barcodeValue} is marked as defective");
-                    }
+                    app(FloatingBarcodeRelabelService::class)->validateBarcodeCanBeSold($barcode, $order, $orderItem->id);
 
                     // Verify barcode belongs to correct store
                     if ($barcode->batch && $barcode->batch->store_id != $order->store_id) {

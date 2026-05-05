@@ -7,6 +7,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use App\Traits\AutoLogsActivity;
+use App\Services\FloatingBarcodeRelabelService;
 
 class ProductBarcode extends Model
 {
@@ -21,6 +22,10 @@ class ProductBarcode extends Model
         'is_active',
         'generated_at',
         'is_defective',
+        'is_replacement',
+        'replacement_status',
+        'relabel_reason',
+        'relabel_metadata',
         'current_store_id',       // NEW: Current physical location
         'current_status',          // NEW: Current state (in_warehouse, in_shop, etc.)
         'location_updated_at',     // NEW: When location/status last changed
@@ -31,6 +36,8 @@ class ProductBarcode extends Model
         'is_primary' => 'boolean',
         'is_active' => 'boolean',
         'is_defective' => 'boolean',
+        'is_replacement' => 'boolean',
+        'relabel_metadata' => 'array',
         'generated_at' => 'datetime',
         'location_updated_at' => 'datetime',   // NEW
         'location_metadata' => 'array',         // NEW
@@ -65,6 +72,16 @@ class ProductBarcode extends Model
     public function defectiveRecord(): \Illuminate\Database\Eloquent\Relations\HasOne
     {
         return $this->hasOne(DefectiveProduct::class, 'product_barcode_id');
+    }
+
+    public function relabelRecord(): \Illuminate\Database\Eloquent\Relations\HasOne
+    {
+        return $this->hasOne(ProductBarcodeRelabel::class, 'replacement_barcode_id');
+    }
+
+    public function reconciledRelabelRecord(): \Illuminate\Database\Eloquent\Relations\HasOne
+    {
+        return $this->hasOne(ProductBarcodeRelabel::class, 'reconciled_original_barcode_id');
     }
 
     /**
@@ -134,7 +151,7 @@ class ProductBarcode extends Model
     {
         return $query->where('is_active', true)
                     ->where('is_defective', false)
-                    ->whereIn('current_status', ['in_shop', 'on_display', 'in_warehouse']);
+                    ->whereIn('current_status', FloatingBarcodeRelabelService::SELLABLE_STATUSES);
     }
 
     // ============================================
@@ -318,6 +335,9 @@ class ProductBarcode extends Model
             'is_active' => $this->is_active,
             'is_defective' => $this->is_defective,
             'is_available_for_sale' => $this->isAvailableForSale(),
+            'is_replacement' => (bool) $this->is_replacement,
+            'replacement_status' => $this->replacement_status,
+            'relabel_reason' => $this->relabel_reason,
             'location_updated_at' => $this->location_updated_at,
             'location_metadata' => $this->location_metadata,
             'batch' => $this->batch ? [
@@ -335,7 +355,7 @@ class ProductBarcode extends Model
     {
         return $this->is_active 
             && !$this->is_defective 
-            && in_array($this->current_status, ['in_shop', 'on_display', 'in_warehouse']);
+            && in_array($this->current_status, FloatingBarcodeRelabelService::SELLABLE_STATUSES, true);
     }
 
     /**
@@ -366,6 +386,8 @@ class ProductBarcode extends Model
             'in_transit' => 'In Transit',
             'in_shipment' => 'In Customer Shipment',
             'with_customer' => 'Sold - With Customer',
+            'sold' => 'Sold',
+            'available' => 'Available',
             'in_return' => 'Customer Return Processing',
             'defective' => 'Marked as Defective',
             'repair' => 'Sent for Repair',

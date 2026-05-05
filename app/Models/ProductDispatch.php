@@ -454,6 +454,7 @@ if (!$barcodeAtSourceStore) {
                     // Update barcode location to destination store and new batch
                     $barcode->update([
                         'batch_id' => $destinationBatch->id,           // ✅ Update to new destination batch
+                        'product_id' => $destinationBatch->product_id, // ✅ Sync product_id with new batch
                         'current_store_id' => $this->destination_store_id,  // ✅ Update current location
                         'current_status' => 'in_warehouse',           // ✅ Back in stock at destination
                         'location_updated_at' => now(),               // ✅ Track when updated
@@ -497,6 +498,7 @@ if (!$barcodeAtSourceStore) {
             foreach ($barcodesToUpdate as $barcode) {
                 $barcode->update([
                     'batch_id' => $destinationBatch->id,           // ✅ Update to new destination batch
+                    'product_id' => $destinationBatch->product_id, // ✅ Sync product_id with new batch
                     'current_store_id' => $this->destination_store_id,  // ✅ Update current location
                     'current_status' => 'in_warehouse',           // ✅ Back in stock at destination
                     'location_updated_at' => now(),               // ✅ Track when updated

@@ -446,6 +446,7 @@ class ExchangeController extends Controller
             if ($barcodes->isNotEmpty()) {
                 foreach ($barcodes as $barcode) {
                     $barcode->batch_id = $targetBatch->id; // Update batch if it changed store
+                    $barcode->product_id = $targetBatch->product_id; // ✅ Sync product_id
                     $barcode->is_active = true;
                     $barcode->updateLocation($returnStore, 'in_warehouse', [
                         'return_id' => $return->id,

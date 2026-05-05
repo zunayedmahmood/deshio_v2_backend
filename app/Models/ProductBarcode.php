@@ -51,6 +51,32 @@ class ProductBarcode extends Model
             if (empty($barcode->barcode)) {
                 $barcode->barcode = static::generateUniqueBarcode();
             }
+            
+            // Diagnostic Logging
+            \Illuminate\Support\Facades\Log::info('BARCODE_GENERATION_DIAGNOSTIC', [
+                'barcode' => $barcode->barcode,
+                'product_id' => $barcode->product_id,
+                'batch_id' => $barcode->batch_id,
+                'url' => request()->fullUrl(),
+                'method' => request()->method(),
+                'payload' => request()->all(),
+                'backtrace' => collect(debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 10))
+                    ->map(fn($t) => ($t['file'] ?? 'unknown') . ':' . ($t['line'] ?? 'unknown'))
+                    ->toArray()
+            ]);
+        });
+
+        static::saving(function ($barcode) {
+            // Ensure product_id always matches batch->product_id if a batch is assigned.
+            // This prevents data integrity issues where a barcode might drift from its parent product variant.
+            if ($barcode->batch_id) {
+                // We use relationship if loaded, or query it if not.
+                $batch = $barcode->relationLoaded('batch') ? $barcode->batch : \App\Models\ProductBatch::find($barcode->batch_id);
+                
+                if ($batch && (int)$barcode->product_id !== (int)$batch->product_id) {
+                    $barcode->product_id = $batch->product_id;
+                }
+            }
         });
     }
 

@@ -53,27 +53,32 @@ class Product extends Model
     protected static function boot()
     {
         parent::boot();
-
+        
         static::creating(function ($product) {
             if (empty($product->sku)) {
                 $product->sku = static::generateUniqueSku();
             }
-            
-            // Auto-set base_name if not provided (for backward compatibility)
+        });
+
+        static::saving(function ($product) {
+            // 1. Inherit base_name from SKU group if creating a new variation with an existing SKU
+            // but no base_name provided. This prevents "double suffixing" when adding variants.
+            if (empty($product->id) && !empty($product->sku) && empty($product->base_name)) {
+                $groupLeader = static::where('sku', $product->sku)->first();
+                if ($groupLeader) {
+                    $product->base_name = $groupLeader->base_name;
+                }
+            }
+
+            // 2. Auto-set base_name if not provided (for backward compatibility or direct name edits)
             if (empty($product->base_name) && !empty($product->name)) {
                 $product->base_name = $product->name;
                 $product->variation_suffix = '';
             }
             
-            // Auto-compute name from base_name + variation_suffix
+            // 3. Auto-compute display name from base_name + variation_suffix
+            // This is the source of truth for display.
             if (!empty($product->base_name)) {
-                $product->name = $product->base_name . ($product->variation_suffix ?? '');
-            }
-        });
-
-        static::updating(function ($product) {
-            // Auto-compute name when base_name or variation_suffix changes
-            if ($product->isDirty(['base_name', 'variation_suffix'])) {
                 $product->name = $product->base_name . ($product->variation_suffix ?? '');
             }
         });

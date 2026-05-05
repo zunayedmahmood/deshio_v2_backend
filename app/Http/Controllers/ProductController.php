@@ -371,19 +371,28 @@ class ProductController extends Controller
         DB::beginTransaction();
         try {
             // Determine base_name and variation_suffix
-            $baseName = $validated['base_name'] ?? $validated['name'];
+            // If SKU is provided, we prefer inheriting the base_name from the existing SKU group
+            $sku = $validated['sku'] ?? null;
+            $baseName = $validated['base_name'] ?? ($validated['name'] ?? null);
             $variationSuffix = $validated['variation_suffix'] ?? '';
-            $displayName = $baseName . $variationSuffix;
 
-            // Create product (SKU auto-generated in model boot if not provided)
+            if ($sku) {
+                $groupLeader = Product::where('sku', $sku)->first();
+                if ($groupLeader) {
+                    // Force the base_name to match the existing SKU group to prevent "DE1 - DE45" type bugs
+                    $baseName = $groupLeader->base_name;
+                }
+            }
+
+            // Create product
             $product = Product::create([
                 'category_id' => $validated['category_id'],
                 'vendor_id' => $validated['vendor_id'] ?? null,
                 'brand' => $validated['brand'] ?? null,
-                'sku' => $validated['sku'] ?? null, // Will be auto-generated if null
-                'name' => $displayName,
+                'sku' => $sku,
                 'base_name' => $baseName,
                 'variation_suffix' => $variationSuffix,
+                'name' => $baseName . $variationSuffix, // Model hook will also handle this, but explicit is fine
                 'description' => $validated['description'] ?? null,
                 'is_archived' => false,
             ]);
@@ -436,25 +445,40 @@ class ProductController extends Controller
             'category_id' => 'sometimes|exists:categories,id',
             'vendor_id' => 'nullable|exists:vendors,id',
             'brand' => 'nullable|string|max:255',
-            'sku' => 'sometimes|string', // SKU not unique - supports variations
+            'sku' => 'sometimes|string', 
             'name' => 'sometimes|string|max:255',
+            'base_name' => 'sometimes|string|max:255',
+            'variation_suffix' => 'sometimes|string|max:255',
             'description' => 'nullable|string',
             'custom_fields' => 'nullable|array',
-            'custom_fields.*.field_id' => 'required|exists:fields,id|distinct', // Prevent duplicate field_ids
+            'custom_fields.*.field_id' => 'required|exists:fields,id|distinct',
             'custom_fields.*.value' => 'nullable',
         ]);
 
         DB::beginTransaction();
         try {
+            // Handle base_name update (triggers group update for consistency)
+            if (isset($validated['base_name']) && $validated['base_name'] !== $product->base_name) {
+                $product->updateBaseNameForSkuGroup($validated['base_name']);
+                $product->refresh();
+            }
+
             // Update basic product info
             $product->update([
                 'category_id' => $validated['category_id'] ?? $product->category_id,
                 'vendor_id' => $validated['vendor_id'] ?? $product->vendor_id,
                 'brand' => $validated['brand'] ?? $product->brand,
                 'sku' => $validated['sku'] ?? $product->sku,
-                'name' => $validated['name'] ?? $product->name,
+                'variation_suffix' => $validated['variation_suffix'] ?? $product->variation_suffix,
                 'description' => $validated['description'] ?? $product->description,
             ]);
+
+            // If only name was provided without base_name/suffix, update it
+            // (The model hook will attempt to re-sync base_name/suffix if they were empty)
+            if (isset($validated['name']) && !isset($validated['base_name']) && !isset($validated['variation_suffix'])) {
+                $product->name = $validated['name'];
+                $product->save();
+            }
 
             // Update custom fields if provided
             if (isset($validated['custom_fields'])) {

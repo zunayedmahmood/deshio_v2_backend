@@ -724,7 +724,7 @@ class ProductBatchController extends Controller
             $newSellPrice = $request->sell_price;
 
             // Get all batches for this product
-            $batches = ProductBatch::where('product_id', $productId)->get();
+            $batches = ProductBatch::where('product_id', $productId)->with(['store', 'product'])->get();
 
             if ($batches->isEmpty()) {
                 return response()->json([
@@ -741,11 +741,20 @@ class ProductBatchController extends Controller
                 foreach ($batches as $batch) {
                     $oldPrice = $batch->sell_price;
                     $batch->sell_price = $newSellPrice;
+                    
+                    \Illuminate\Support\Facades\Log::info('BATCH_PRICE_UPDATE_DIAGNOSTIC', [
+                        'batch_id' => $batch->id,
+                        'product_id' => $batch->product_id,
+                        'old_price' => $oldPrice,
+                        'new_price' => $newSellPrice,
+                    ]);
+                    
                     $batch->save();
 
                     $updates[] = [
                         'batch_id' => $batch->id,
                         'batch_number' => $batch->batch_number,
+                        'product_name' => $batch->product->name ?? 'Unknown Product',
                         'store' => $batch->store->name ?? 'N/A',
                         'old_price' => number_format((float)$oldPrice, 2),
                         'new_price' => number_format((float)$newSellPrice, 2),

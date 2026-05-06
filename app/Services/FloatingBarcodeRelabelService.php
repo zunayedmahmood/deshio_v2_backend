@@ -63,6 +63,7 @@ class FloatingBarcodeRelabelService
             $replacementBarcode = ProductBarcode::create([
                 'product_id' => $batch->product_id,
                 'batch_id' => $batch->id,
+                'barcode' => $replacementCode,
                 'current_store_id' => $storeId,
                 'current_status' => $currentStatus,
                 'type' => $data['type'] ?? 'CODE128',

@@ -765,6 +765,24 @@ class OrderController extends Controller
                     $taxCalc = $this->calculateTax($netUnitPrice, $quantity, $taxPercentage);
                     $item->tax_amount = $taxCalc['total_tax'];
                     
+                    // Reconcile stock if confirmed and already deducted
+                    if ($order->isConfirmed() && $item->is_inventory_deducted) {
+                        $qtyDiff = $quantity - $item->quantity;
+                        if ($qtyDiff > 0) {
+                            $batch = $item->batch;
+                            if ($batch && $batch->quantity >= $qtyDiff) {
+                                $batch->removeStock($qtyDiff);
+                            } else {
+                                throw new \Exception("Insufficient stock in batch for item {$item->product_name}");
+                            }
+                        } else if ($qtyDiff < 0) {
+                            $batch = $item->batch;
+                            if ($batch) {
+                                $batch->addStock(abs($qtyDiff));
+                            }
+                        }
+                    }
+
                     $item->unit_price = $unitPrice;
                     $item->discount_amount = $discount;
                     $item->updateQuantity($quantity);
@@ -772,7 +790,17 @@ class OrderController extends Controller
                 
                 // Refresh order to get updated totals from items
                 $order->load('items');
-                $order->status = 'pending'; // Keep edited orders pending
+                
+                // Smart status management
+                if (!in_array($order->status, ['confirmed', 'ready_for_shipment', 'shipped', 'delivered', 'completed'])) {
+                    $order->status = 'pending';
+                } else if ($request->filled('items')) {
+                    // Check if any item quantity increased or new items might have been added (though addItem is usually separate)
+                    // For now, if items were touched, we might want to re-fulfill if it's a tracked order.
+                    if ($order->needsFulfillment()) {
+                        $order->fulfillment_status = 'pending_fulfillment';
+                    }
+                }
             }
 
             // Update order fields
@@ -1088,8 +1116,14 @@ class OrderController extends Controller
                 $addedItems[] = $orderItem;
             }
 
-            // Keep edited orders pending until packing/completion confirms them
-            $order->status = 'pending';
+            // If order was already confirmed, it stays confirmed but needs re-fulfillment for new items.
+            // If it's not confirmed, we keep it as pending/pending_assignment to ensure regular workflow.
+            if (!in_array($order->status, ['confirmed', 'ready_for_shipment', 'shipped', 'delivered', 'completed'])) {
+                $order->status = 'pending';
+            } else {
+                // For confirmed orders, we must mark as pending fulfillment so the new items can be scanned.
+                $order->fulfillment_status = 'pending_fulfillment';
+            }
 
             // Recalculate order totals
             $order->calculateTotals();
@@ -1202,14 +1236,43 @@ class OrderController extends Controller
             
             $taxCalc = $this->calculateTax($netUnitPrice, $newQuantity, $taxPercentage);
             $item->tax_amount = $taxCalc['total_tax'];
-            
+
+            // APPLY CHANGES
+            // If the order is already confirmed and inventory was already deducted, 
+            // we must reconcile the batch stock immediately for the difference.
+            if ($order->isConfirmed() && $item->is_inventory_deducted) {
+                $qtyDiff = $newQuantity - $item->quantity;
+                if ($qtyDiff > 0) {
+                    // Deduct more
+                    $batch = $item->batch;
+                    if (!$batch) throw new \Exception("Batch not found for reconciliation.");
+                    if ($batch->quantity < $qtyDiff) throw new \Exception("Insufficient stock in batch for reconciliation.");
+                    $batch->removeStock($qtyDiff);
+                } else if ($qtyDiff < 0) {
+                    // Return stock
+                    $batch = $item->batch;
+                    if ($batch) {
+                        $batch->addStock(abs($qtyDiff));
+                    }
+                }
+            }
+
             // Apply changes to the model
             $item->unit_price = $unitPrice;
             $item->discount_amount = $discountAmount;
             $item->updateQuantity($newQuantity);
 
-            // Keep edited orders pending until packing/completion confirms them
-            $order->status = 'pending';
+            // If quantity increased on a confirmed order, we might need to scan new items?
+            // Actually, if it's already deducted from batch, we assume it's physical. 
+            // But if it needs barcode tracking, this might be tricky without a scan.
+            // For now, we allow it but log a warning.
+            if ($order->isConfirmed() && $newQuantity > $item->getOriginal('quantity')) {
+                Log::warning("Quantity increased for item {$item->id} on confirmed order {$order->id}. Manual inventory reconciliation performed.");
+                // Mark as pending fulfillment if it's a barcode-tracked order so they scan the additional units.
+                if ($order->needsFulfillment()) {
+                    $order->fulfillment_status = 'pending_fulfillment';
+                }
+            }
 
             $order->calculateTotals();
 
@@ -1274,10 +1337,27 @@ class OrderController extends Controller
 
         DB::beginTransaction();
         try {
+            // Reconcile inventory if already deducted
+            if ($order->isConfirmed() && $item->is_inventory_deducted) {
+                $batch = $item->batch;
+                if ($batch) {
+                    $batch->addStock($item->quantity);
+                    
+                    // Release barcode if attached
+                    if ($item->barcode) {
+                        app(FloatingBarcodeRelabelService::class)->returnBarcodeFromSold($item->barcode, $order);
+                    }
+                    
+                    Log::info("Returned stock for removed item {$item->id} in confirmed order {$order->id}");
+                }
+            }
+
             $item->delete();
             
-            // Keep edited orders pending until packing/completion confirms them
-            $order->status = 'pending';
+            // If order was already confirmed, it stays confirmed.
+            if (!in_array($order->status, ['confirmed', 'ready_for_shipment', 'shipped', 'delivered', 'completed'])) {
+                $order->status = 'pending';
+            }
             
             $order->calculateTotals();
 
@@ -1403,11 +1483,10 @@ class OrderController extends Controller
                 $item->update(['cogs' => round($calculatedCogs, 2)]);
 
                 // Stock deduction is now centralizing here in OrderController@complete
-                // We always deduct now because early deduction was removed from Create and Scan
-                $alreadyDeducted = false; 
-                
-                if (!$alreadyDeducted) {
+                // We only deduct if it hasn't been deducted yet (handles edits on confirmed orders)
+                if (!$item->is_inventory_deducted) {
                     $batch->removeStock($item->quantity);
+                    $item->update(['is_inventory_deducted' => true]);
                 }
 
                 $relabelReconciliation = app(FloatingBarcodeRelabelService::class)

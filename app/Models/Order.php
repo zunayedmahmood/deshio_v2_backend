@@ -20,6 +20,8 @@ class Order extends Model
         'picking',
         'processing',
         'ready_for_pickup',
+        'confirmed',
+        'ready_for_shipment',
         'shipped'
     ];
 
@@ -38,6 +40,8 @@ class Order extends Model
         'picking',
         'processing',
         'ready_for_pickup',
+        'confirmed',
+        'ready_for_shipment',
         'shipped'
     ];
 

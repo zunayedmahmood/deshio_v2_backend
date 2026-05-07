@@ -15,7 +15,7 @@ class OrderItemObserver
     public function created(OrderItem $orderItem): void
     {
         $order = $orderItem->order;
-        if ($order && $order->isReservedStatus()) {
+        if ($order && $order->isReservedStatus() && !$orderItem->is_inventory_deducted) {
             if ($order->order_type === 'preorder') {
                 return;
             }
@@ -31,6 +31,19 @@ class OrderItemObserver
         $order = $orderItem->order;
         if ($order && $order->isReservedStatus()) {
             if ($order->order_type === 'preorder') {
+                return;
+            }
+
+            // If item is already deducted, it shouldn't have an active reservation.
+            // If it just became deducted, we should remove the reservation.
+            if ($orderItem->isDirty('is_inventory_deducted') && $orderItem->is_inventory_deducted) {
+                $oldQty = $orderItem->getOriginal('quantity');
+                $this->decrementReservation($orderItem->product_id, $oldQty);
+                return;
+            }
+
+            // If it's already deducted, skip any other updates (no reservation to change)
+            if ($orderItem->is_inventory_deducted) {
                 return;
             }
 
@@ -65,7 +78,7 @@ class OrderItemObserver
     public function deleted(OrderItem $orderItem): void
     {
         $order = $orderItem->order;
-        if ($order && $order->isReservedStatus()) {
+        if ($order && $order->isReservedStatus() && !$orderItem->is_inventory_deducted) {
             if ($order->order_type === 'preorder') {
                 return;
             }

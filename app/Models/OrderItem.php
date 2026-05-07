@@ -25,6 +25,7 @@ class OrderItem extends Model
         'tax_amount',
             'cogs',
         'total_amount',
+        'is_inventory_deducted', // NEW: Flag to prevent double deduction and manage edits
         'product_options',
         'notes',
     ];

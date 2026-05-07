@@ -195,6 +195,45 @@ class FloatingBarcodeRelabelService
     }
 
     /**
+     * Return a barcode from sold status to available.
+     * Used when editing a confirmed order.
+     */
+    public function returnBarcodeFromSold(ProductBarcode $barcode, Order $order): void
+    {
+        $metadata = array_merge($barcode->location_metadata ?? [], [
+            'returned_to_stock_via' => 'order_edit',
+            'order_number' => $order->order_number,
+            'order_id' => $order->id,
+            'return_date' => now()->toISOString(),
+            'returned_by' => auth()->id(),
+        ]);
+
+        $barcode->update([
+            'current_status' => 'available', // Or should we use original status? available is safest.
+            'replacement_status' => $barcode->is_replacement ? 'open' : $barcode->replacement_status,
+            'location_updated_at' => now(),
+            'location_metadata' => $metadata,
+        ]);
+
+        if ($barcode->is_replacement) {
+            $relabel = ProductBarcodeRelabel::where('replacement_barcode_id', $barcode->id)
+                ->where('status', 'used')
+                ->first();
+
+            if ($relabel) {
+                $relabel->update([
+                    'status' => 'open',
+                    'used_at' => null,
+                    'metadata' => array_merge($relabel->metadata ?? [], [
+                        'returned_from_order_id' => $order->id,
+                        'returned_from_order_number' => $order->order_number,
+                    ]),
+                ]);
+            }
+        }
+    }
+
+    /**
      * When a batch/location stock reaches zero, remove leftover floating scan identities.
      * This is where the unknown lost original barcode gets voided.
      */

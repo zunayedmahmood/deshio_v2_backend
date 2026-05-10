@@ -11,6 +11,7 @@ use App\Models\ProductBarcode;
 use App\Models\ProductMovement;
 use App\Models\Transaction;
 use App\Traits\DatabaseAgnosticSearch;
+use App\Services\FloatingBarcodeRelabelService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
@@ -20,6 +21,14 @@ use Illuminate\Support\Facades\Auth;
 class ProductReturnController extends Controller
 {
     use DatabaseAgnosticSearch;
+
+    protected $relabelService;
+
+    public function __construct(FloatingBarcodeRelabelService $relabelService)
+    {
+        $this->relabelService = $relabelService;
+    }
+
     /**
      * Get all product returns
      */
@@ -871,6 +880,11 @@ class ProductReturnController extends Controller
             }
 
             foreach ($barcodes as $barcode) {
+                // Handle replacement barcode logic (mark as open again)
+                if ($barcode->is_replacement) {
+                    $this->relabelService->returnBarcodeFromSold($barcode, $return->order);
+                }
+
                 $barcode->updateLocation(
                     $returnStore,
                     'in_warehouse',

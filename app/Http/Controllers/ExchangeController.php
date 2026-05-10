@@ -18,12 +18,35 @@ use App\Models\OrderPayment;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
+use App\Services\FloatingBarcodeRelabelService;
+use Illuminate\Validation\ValidationException;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 
 class ExchangeController extends Controller
 {
+    protected $relabelService;
+
+    public function __construct(FloatingBarcodeRelabelService $relabelService)
+    {
+        $this->relabelService = $relabelService;
+    }
+
+    /**
+     * Assert that the order is in a state that allows return or exchange.
+     */
+    protected function assertOrderCanReturnOrExchange(Order $order): void
+    {
+        $restrictedStatuses = ['pending', 'assigned_to_store', 'pending_assignment'];
+        
+        if (in_array($order->status, $restrictedStatuses, true)) {
+            throw ValidationException::withMessages([
+                'order_id' => ["Orders in '{$order->status}' status cannot be returned or exchanged yet. Please confirm or ship the order first."],
+            ]);
+        }
+    }
+
     /**
      * Process an atomic exchange: Return items + Replacement items + Financial settlement.
      */
@@ -74,6 +97,11 @@ class ExchangeController extends Controller
             $employee = auth()->user();
             if (!$employee) {
                 throw new \Exception('Employee authentication required');
+            }
+
+            if ($request->order_id) {
+                $originalOrder = Order::findOrFail($request->order_id);
+                $this->assertOrderCanReturnOrExchange($originalOrder);
             }
 
             $storeId = $request->exchangeAtStoreId;
@@ -192,7 +220,9 @@ class ExchangeController extends Controller
                         ->first();
                     
                     if (!$barcode) throw new \Exception("Barcode {$itemData['barcode']} not found");
-                    if (in_array($barcode->current_status, ['sold', 'with_customer'])) throw new \Exception("Barcode sold");
+                    
+                    // Use Relabel Service to validate
+                    $this->relabelService->validateBarcodeCanBeSold($barcode);
                     
                     $barcodeId = $barcode->id;
                 }
@@ -236,6 +266,11 @@ class ExchangeController extends Controller
                 // Update barcode status
                 if ($barcodeId) {
                     $barcode = ProductBarcode::find($barcodeId);
+                    
+                    // Use Relabel Service to mark sold (handles relabel status)
+                    $this->relabelService->markBarcodeSold($barcode, $replacementOrder);
+                    
+                    // Additionally update location with audit trail details
                     $barcode->updateLocation(null, 'with_customer', [
                         'order_id' => $replacementOrder->id,
                         'reference_type' => 'order',
@@ -448,6 +483,12 @@ class ExchangeController extends Controller
                     $barcode->batch_id = $targetBatch->id; // Update batch if it changed store
                     $barcode->product_id = $targetBatch->product_id; // ✅ Sync product_id
                     $barcode->is_active = true;
+
+                    // Handle replacement barcode logic (mark as open again)
+                    if ($barcode->is_replacement) {
+                        $this->relabelService->returnBarcodeFromSold($barcode, $return->order);
+                    }
+
                     $barcode->updateLocation($returnStore, 'in_warehouse', [
                         'return_id' => $return->id,
                         'reference_type' => 'return',

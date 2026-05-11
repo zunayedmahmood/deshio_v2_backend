@@ -20,28 +20,6 @@ class Order extends Model
         'picking',
         'processing',
         'ready_for_pickup',
-        'confirmed',
-        'ready_for_shipment',
-        'shipped'
-    ];
-
-    /**
-     * Check if the order status is one that requires stock reservation.
-     */
-    public function isReservedStatus(): bool
-    {
-        return in_array($this->status, self::RESERVATION_STATUSES);
-    }
-
-    const RESERVATION_STATUSES = [
-        'pending',
-        'pending_assignment',
-        'assigned_to_store',
-        'picking',
-        'processing',
-        'ready_for_pickup',
-        'confirmed',
-        'ready_for_shipment',
         'shipped'
     ];
 

@@ -186,7 +186,7 @@ class Refund extends Model
         return match ($this->refund_type) {
             'full' => $this->original_amount - $this->processing_fee,
             'percentage' => ($this->original_amount * $this->refund_percentage / 100) - $this->processing_fee,
-            'partial_amount' => $this->refund_amount,
+            'partial_amount', 'exchange_refund' => $this->refund_amount,
             default => 0,
         };
     }
@@ -291,6 +291,7 @@ class Refund extends Model
             'full' => 'Full Refund',
             'percentage' => 'Percentage Refund',
             'partial_amount' => 'Partial Amount',
+            'exchange_refund' => 'Exchange Refund',
             default => 'Unknown',
         };
     }

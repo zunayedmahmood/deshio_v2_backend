@@ -114,9 +114,9 @@ class RefundController extends Controller
         // Initial validation
         $request->validate([
             'return_id' => 'required|exists:product_returns,id',
-            'refund_type' => 'required|in:full,percentage,partial_amount',
+            'refund_type' => 'required|in:full,percentage,partial_amount,exchange_refund',
             'refund_percentage' => 'required_if:refund_type,percentage|numeric|min:0|max:100',
-            'refund_amount' => 'required_if:refund_type,partial_amount|numeric|min:0.01',
+            'refund_amount' => 'required_if:refund_type,partial_amount,exchange_refund|numeric|min:0.01',
             'refund_method' => 'required|in:cash,bank_transfer,card_refund,store_credit,gift_card,digital_wallet,check,other',
             'payment_reference' => 'nullable|string',
             'refund_method_details' => 'nullable|array',
@@ -125,7 +125,7 @@ class RefundController extends Controller
         ]);
 
         // Additional validation for partial amount based on available amount
-        if ($request->refund_type === 'partial_amount') {
+        if (in_array($request->refund_type, ['partial_amount', 'exchange_refund'], true)) {
             $return = ProductReturn::findOrFail($request->return_id);
             $alreadyRefunded = $return->getTotalRefundedAmount();
             $remainingAmount = $return->total_refund_amount - $alreadyRefunded;
@@ -162,7 +162,7 @@ class RefundController extends Controller
             $refundAmount = match ($request->refund_type) {
                 'full' => $originalAmount - $processingFee,
                 'percentage' => ($originalAmount * $request->refund_percentage / 100) - $processingFee,
-                'partial_amount' => $request->refund_amount,
+                'partial_amount', 'exchange_refund' => $request->refund_amount,
                 default => 0,
             };
 

@@ -120,7 +120,7 @@ class ProductReturn extends Model
 
     public function scopeProcessed($query)
     {
-        return $query->where('status', 'processed');
+        return $query->where('status', 'processing');
     }
 
     public function scopeCompleted($query)
@@ -288,7 +288,7 @@ class ProductReturn extends Model
             'pending' => 'warning',
             'approved' => 'info',
             'rejected' => 'danger',
-            'processed' => 'primary',
+            'processing' => 'primary',
             'completed' => 'success',
             'refunded' => 'success',
             default => 'secondary',
@@ -301,7 +301,7 @@ class ProductReturn extends Model
             'pending' => 'Pending Approval',
             'approved' => 'Approved',
             'rejected' => 'Rejected',
-            'processed' => 'Processed',
+            'processing' => 'Processing',
             'completed' => 'Completed',
             'refunded' => 'Refunded',
             default => 'Unknown',

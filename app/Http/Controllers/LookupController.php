@@ -517,12 +517,22 @@ class LookupController extends Controller
                     'cost_price' => $item->batch->cost_price,
                     'sell_price' => $item->batch->sell_price,
                 ] : null,
+                // Keep both nested and flat barcode fields because the Lookup return/exchange
+                // modals need the real product_barcodes.id, not the product SKU.
+                'product_id' => $item->product_id,
+                'product_batch_id' => $item->product_batch_id,
+                'batch_id' => $item->product_batch_id,
+                'product_barcode_id' => $item->product_barcode_id,
+                'barcode_id' => $item->product_barcode_id,
                 'barcode' => $item->barcode ? [
+                    'id' => $item->barcode->id,
+                    'barcode_id' => $item->barcode->id,
                     'barcode' => $item->barcode->barcode,
                     'type' => $item->barcode->type,
                     'is_active' => $item->barcode->is_active,
                     'current_status' => $item->barcode->current_status,
                 ] : null,
+                'barcode_number' => $item->barcode?->barcode,
                 'quantity' => $item->quantity,
                 'unit_price' => $item->unit_price,
                 'discount_amount' => $item->discount_amount,

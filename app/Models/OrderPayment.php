@@ -510,7 +510,10 @@ class OrderPayment extends Model
             'amount' => $amount,
             'fee_amount' => $fee,
             'net_amount' => $netAmount,
+            'payment_type' => $paymentData['payment_type'] ?? 'full',
             'payment_data' => $paymentData,
+            'metadata' => $paymentData['metadata'] ?? null,
+            'notes' => $paymentData['notes'] ?? null,
             'status' => 'pending',
         ]);
     }

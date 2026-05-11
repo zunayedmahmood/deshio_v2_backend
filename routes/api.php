@@ -40,6 +40,7 @@ use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\BusinessAnalyticsController;
 use App\Http\Controllers\StockIntelligenceController;
 use App\Http\Controllers\ExchangeController;
+use App\Http\Controllers\SizeController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -1007,6 +1008,10 @@ Route::middleware('auth:api')->group(function () {
         Route::get('/', [ProductVariantController::class, 'getOptions']);
         Route::post('/', [ProductVariantController::class, 'storeOption']);
     });
+
+    // Sizes (alias for variant-options name=Size)
+    Route::get('/sizes', [SizeController::class, 'index']);
+    Route::post('/sizes', [SizeController::class, 'store']);
     
     // Product variants
     Route::prefix('products/{productId}/variants')->group(function () {

@@ -806,8 +806,8 @@ class ReportingController extends Controller
         return Response::stream($callback, 200, $headers);
     }
 
-    /**
-     * Get Daily Sales Report data for POS
+    /**    /**
+     * Get Detailed Daily Sales Report data for POS
      * 
      * GET /api/reporting/daily-sales
      * 
@@ -830,56 +830,123 @@ class ReportingController extends Controller
         }
 
         $dateStr = $request->get('date', now()->format('Y-m-d'));
-        $startDate = $dateStr . ' 00:00:00';
-        $endDate = $dateStr . ' 23:59:59';
-
         $storeId = $request->store_id;
         $store = \App\Models\Store::findOrFail($storeId);
 
-        // Fetch all completed payments for this store on the selected date
-        $payments = \App\Models\OrderPayment::query()
+        // Fetch all POS orders (counter) for this store on the selected date
+        $orders = \App\Models\Order::query()
             ->where('store_id', $storeId)
-            ->where('status', 'completed')
-            ->whereBetween('completed_at', [$startDate, $endDate])
-            ->with('paymentMethod')
+            ->where('order_type', 'counter')
+            ->whereDate('created_at', $dateStr)
+            ->whereNotIn('status', ['cancelled', 'deleted'])
+            ->with([
+                'customer', 
+                'items.barcode', 
+                'payments.paymentMethod', 
+                'payments.paymentSplits.paymentMethod',
+                'serviceItems'
+            ])
             ->get();
 
-        $totalSales = 0;
-        $cash = 0;
-        $card = 0;
-        $bkash = 0;
-        $nagad = 0;
+        $reportData = [
+            'date' => $dateStr,
+            'branch' => [
+                'name' => $store->name,
+                'address' => $store->address,
+                'phone' => $store->phone ?? 'N/A',
+                'email' => $store->email ?? 'N/A',
+            ],
+            'orders' => []
+        ];
 
-        foreach ($payments as $payment) {
-            $amount = floatval($payment->amount);
-            $totalSales += $amount;
+        foreach ($orders as $order) {
+            $paymentDist = [
+                'cash' => 0,
+                'bkash' => 0,
+                'bank' => 0,
+                'card' => 0,
+                'installments' => (float)$order->outstanding_amount,
+            ];
 
-            if ($payment->paymentMethod) {
-                $methodName = strtolower($payment->paymentMethod->name);
-                
-                if (str_contains($methodName, 'cash')) {
-                    $cash += $amount;
-                } elseif (str_contains($methodName, 'card')) {
-                    $card += $amount;
-                } elseif (str_contains($methodName, 'bkash')) {
-                    $bkash += $amount;
-                } elseif (str_contains($methodName, 'nagad') || str_contains($methodName, 'bank transfer')) {
-                    $nagad += $amount;
+            foreach ($order->payments as $payment) {
+                if ($payment->status !== 'completed') continue;
+
+                // Handle split payments
+                if ($payment->payment_method_id === null && $payment->hasSplits()) {
+                    foreach ($payment->paymentSplits as $split) {
+                        if ($split->status !== 'completed') continue;
+                        $this->categorizePayment($split->paymentMethod, $split->amount, $paymentDist);
+                    }
+                } else {
+                    $this->categorizePayment($payment->paymentMethod, $payment->amount, $paymentDist);
                 }
             }
+
+            $items = $order->items->map(function($item) {
+                return [
+                    'name' => $item->product_name,
+                    'barcode' => $item->barcode ? $item->barcode->barcode : ($item->product_barcode_id ?? 'N/A'),
+                    'qty' => $item->quantity,
+                    'price' => $item->unit_price,
+                    'subtotal' => $item->total_amount
+                ];
+            });
+
+            // Add services as well
+            $services = $order->serviceItems->map(function($service) {
+                return [
+                    'name' => $service->service_name . ' (Service)',
+                    'barcode' => 'N/A',
+                    'qty' => $service->quantity,
+                    'price' => $service->unit_price,
+                    'subtotal' => $service->total_amount
+                ];
+            });
+
+            $reportData['orders'][] = [
+                'order_id' => $order->id,
+                'order_number' => $order->order_number,
+                'customer' => [
+                    'name' => $order->customer ? $order->customer->name : 'Walk-in Customer',
+                    'phone' => $order->customer ? $order->customer->phone : 'N/A',
+                ],
+                'items' => $items->concat($services),
+                'subtotal' => $order->subtotal,
+                'total' => $order->total_amount,
+                'payments' => $paymentDist
+            ];
         }
 
         return response()->json([
             'success' => true,
-            'data' => [
-                'date' => $dateStr,
-                'branch' => $store->name,
-                'total_sales' => $totalSales,
-                'cash' => $cash,
-                'card' => $card,
-                'bkash' => $bkash,
-                'nagad' => $nagad,
-            ]
+            'data' => $reportData
         ]);
     }
+
+    /**
+     * Categorize payment amount into the report columns
+     */
+    private function categorizePayment($method, $amount, &$dist)
+    {
+        if (!$method) {
+            $dist['cash'] += (float)$amount;
+            return;
+        }
+
+        $type = strtolower($method->type);
+        $name = strtolower($method->name);
+
+        if ($type === 'cash' || str_contains($name, 'cash')) {
+            $dist['cash'] += (float)$amount;
+        } elseif ($type === 'mobile_banking' || $type === 'digital_wallet' || str_contains($name, 'bkash') || str_contains($name, 'nagad')) {
+            $dist['bkash'] += (float)$amount;
+        } elseif ($type === 'bank_transfer' || $type === 'online_banking' || $type === 'online_pay' || str_contains($name, 'bank')) {
+            $dist['bank'] += (float)$amount;
+        } elseif ($type === 'card' || str_contains($name, 'card')) {
+            $dist['card'] += (float)$amount;
+        } else {
+            $dist['cash'] += (float)$amount; // Default to cash for others like balance_carryover if any
+        }
+    }
+
 }

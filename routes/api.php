@@ -1127,6 +1127,9 @@ Route::middleware('auth:api')->group(function () {
 
         // Create order (all 3 channels)
         Route::post('/', [OrderController::class, 'create']);
+        
+        // POS Manual Entry with Automatic Relabelling
+        Route::post('/manual-relabel-sale', [\App\Http\Controllers\ManualSaleRelabelController::class, 'create']);
 
         // Intended Courier Management
         Route::patch('/{id}/set-courier', [OrderController::class, 'setIntendedCourier']);

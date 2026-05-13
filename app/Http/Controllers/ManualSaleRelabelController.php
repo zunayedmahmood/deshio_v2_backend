@@ -38,25 +38,25 @@ class ManualSaleRelabelController extends Controller
         $validator = Validator::make($request->all(), [
             'store_id' => 'required|exists:stores,id',
             'order_type' => 'required|in:counter',
-            'items' => 'required|array|min:1',
-            'items.*.product_id' => 'required|exists:products,id',
-            'items.*.batch_id' => 'required|exists:product_batches,id',
-            'items.*.quantity' => 'required|integer|min:1',
-            'items.*.unit_price' => 'required|numeric|min:0',
+            'items' => 'required_without:services|array',
+            'items.*.product_id' => 'required_with:items|exists:products,id',
+            'items.*.batch_id' => 'required_with:items|exists:product_batches,id',
+            'items.*.quantity' => 'required_with:items|integer|min:1',
+            'items.*.unit_price' => 'required_with:items|numeric|min:0',
             'items.*.discount_amount' => 'nullable|numeric|min:0',
             'salesman_id' => 'required|exists:employees,id',
             'customer' => 'nullable|array',
-            'customer.name' => 'nullable|string',
-            'customer.phone' => 'nullable|string',
+            'customer.name' => 'required_with:customer|string',
+            'customer.phone' => 'required_with:customer|string',
             'customer.address' => 'nullable|string',
             'customer_id' => 'nullable|exists:customers,id',
             'notes' => 'nullable|string',
             'shipping_amount' => 'nullable|numeric|min:0',
             'discount_amount' => 'nullable|numeric|min:0',
-            'services' => 'nullable|array',
-            'services.*.service_id' => 'required|exists:services,id',
-            'services.*.quantity' => 'required|integer|min:1',
-            'services.*.unit_price' => 'required|numeric|min:0',
+            'services' => 'required_without:items|array',
+            'services.*.service_id' => 'required_with:services|exists:services,id',
+            'services.*.quantity' => 'required_with:services|integer|min:1',
+            'services.*.unit_price' => 'required_with:services|numeric|min:0',
             'services.*.discount_amount' => 'nullable|numeric|min:0',
         ]);
 
@@ -328,15 +328,34 @@ class ManualSaleRelabelController extends Controller
             $customer = Customer::where('phone', $customerData['phone'])->first();
             if (!$customer) {
                 $customer = Customer::create([
-                    'name' => $customerData['name'] ?? 'Walk-in Customer',
+                    'name' => $customerData['name'],
                     'phone' => $customerData['phone'],
                     'address' => $customerData['address'] ?? null,
+                    'customer_type' => 'counter',
+                    'status' => 'active',
+                    'created_by' => Auth::id(),
                 ]);
+            } else {
+                // Optionally update address if provided
+                if (!empty($customerData['address']) && empty($customer->address)) {
+                    $customer->update(['address' => $customerData['address']]);
+                }
             }
             return $customer->id;
         }
 
-        return null;
+        // No customer provided - use or create walk-in customer for counter orders
+        $customer = Customer::firstOrCreate(
+            ['phone' => 'WALK-IN'],
+            [
+                'name' => 'Walk-in Customer',
+                'customer_type' => 'counter',
+                'status' => 'active',
+                'created_by' => Auth::id(),
+            ]
+        );
+
+        return $customer->id;
     }
 
     private function calculateTax(float $unitPrice, int $quantity, float $taxPercentage): array

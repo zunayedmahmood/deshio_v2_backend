@@ -25,7 +25,7 @@ class Product extends Model
      * 
      * COMMON EDIT FEATURE:
      * - base_name: The core product name (e.g., "saree")
-     * - variation_suffix: The variation identifier (e.g., "-red-30")
+     * - variation_suffix: The variation identifier exactly as typed (e.g., "- Red Purple - XL")
      * - name: Display name = base_name + variation_suffix (auto-computed on save)
      * When base_name is updated for a SKU group, all display names update automatically.
      */

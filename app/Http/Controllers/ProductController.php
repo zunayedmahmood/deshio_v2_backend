@@ -17,6 +17,21 @@ class ProductController extends Controller
 {
     use DatabaseAgnosticSearch;
     use ProductImageFallback;
+
+    /**
+     * Preserve variation suffix text exactly as entered, only enforcing the required leading dash.
+     */
+    private function normalizeVariationSuffix(?string $suffix): string
+    {
+        $suffix = trim((string) $suffix);
+
+        if ($suffix === '') {
+            return '';
+        }
+
+        return str_starts_with($suffix, '-') ? $suffix : '- ' . $suffix;
+    }
+
     /**
      * Get all products with filters and custom fields
      */
@@ -372,7 +387,7 @@ class ProductController extends Controller
      * 
      * Supports "common edit" feature:
      * - base_name: Core product name (e.g., "saree")
-     * - variation_suffix: Variation identifier (e.g., "-red-30")
+     * - variation_suffix: Variation identifier exactly as typed (e.g., "- Red Purple - XL")
      * - name: Auto-computed as base_name + variation_suffix
      * 
      * If only 'name' is provided (backward compatible), it becomes base_name with empty suffix.
@@ -399,7 +414,7 @@ class ProductController extends Controller
             // If SKU is provided, we prefer inheriting the base_name from the existing SKU group
             $sku = $validated['sku'] ?? null;
             $baseName = $validated['base_name'] ?? ($validated['name'] ?? null);
-            $variationSuffix = $validated['variation_suffix'] ?? '';
+            $variationSuffix = $this->normalizeVariationSuffix($validated['variation_suffix'] ?? '');
 
             if ($sku) {
                 $groupLeader = Product::where('sku', $sku)->first();
@@ -494,7 +509,9 @@ class ProductController extends Controller
                 'vendor_id' => $validated['vendor_id'] ?? $product->vendor_id,
                 'brand' => $validated['brand'] ?? $product->brand,
                 'sku' => $validated['sku'] ?? $product->sku,
-                'variation_suffix' => $validated['variation_suffix'] ?? $product->variation_suffix,
+                'variation_suffix' => array_key_exists('variation_suffix', $validated)
+                    ? $this->normalizeVariationSuffix($validated['variation_suffix'])
+                    : $product->variation_suffix,
                 'description' => $validated['description'] ?? $product->description,
             ]);
 
@@ -732,8 +749,8 @@ class ProductController extends Controller
      * This is the "magic" common edit feature:
      * - Changing base_name from "saree" to "sharee"
      * - Automatically updates all products with same SKU
-     * - saree-red-30 → sharee-red-30
-     * - saree-green-40 → sharee-green-40
+     * - saree- Red - 30 → sharee- Red - 30
+     * - saree- Green - 40 → sharee- Green - 40
      * 
      * @param Request $request
      * @param int $id Product ID (any product in the SKU group)

@@ -15,7 +15,7 @@ class Collection extends Model
 
     protected $fillable = [
         'name', 'slug', 'description', 'type', 'season', 'year',
-        'launch_date', 'end_date', 'banner_image', 'status',
+        'launch_date', 'end_date', 'banner_image', 'thumbnail_image', 'status',
         'sort_order', 'metadata', 'created_by',
     ];
 
@@ -26,6 +26,22 @@ class Collection extends Model
         'sort_order' => 'integer',
         'metadata' => 'array',
     ];
+
+    protected $appends = ['thumbnail_url', 'banner_url'];
+
+    public function getThumbnailUrlAttribute()
+    {
+        if (!$this->thumbnail_image) return null;
+        if (filter_var($this->thumbnail_image, FILTER_VALIDATE_URL)) return $this->thumbnail_image;
+        return asset('storage/' . $this->thumbnail_image);
+    }
+
+    public function getBannerUrlAttribute()
+    {
+        if (!$this->banner_image) return null;
+        if (filter_var($this->banner_image, FILTER_VALIDATE_URL)) return $this->banner_image;
+        return asset('storage/' . $this->banner_image);
+    }
 
     protected static function boot()
     {

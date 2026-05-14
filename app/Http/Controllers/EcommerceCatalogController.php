@@ -1160,6 +1160,49 @@ class EcommerceCatalogController extends Controller
         }
     }
 
+
+    public function getCollection(Request $request, $slug)
+    {
+        try {
+            $collection = \App\Models\Collection::where('slug', $slug)
+                ->active()
+                ->firstOrFail();
+
+            $query = $collection->products()
+                ->with(['images', 'category', 'batches' => function ($q) {
+                    $q->where('is_active', true)->where('availability', true);
+                }])
+                ->where('products.is_archived', false);
+
+            $perPage = (int) $request->get('per_page', 40);
+            $products = $query->paginate($perPage);
+
+            $formattedProducts = collect($products->items())->map(function ($product) {
+                return $this->formatProductForApi($product);
+            });
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'collection' => $collection,
+                    'products' => $formattedProducts,
+                    'pagination' => [
+                        'current_page' => $products->currentPage(),
+                        'last_page' => $products->lastPage(),
+                        'per_page' => $products->perPage(),
+                        'total' => $products->total(),
+                        'has_more_pages' => $products->hasMorePages(),
+                    ]
+                ]
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Collection not found or error loading products: ' . $e->getMessage()
+            ], 404);
+        }
+    }
+
     private function collectCategoryAndDescendantIds(Category $category): array
     {
         $id = (int) $category->id;

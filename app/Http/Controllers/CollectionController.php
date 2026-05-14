@@ -60,7 +60,8 @@ class CollectionController extends Controller
             'year' => 'nullable|integer|min:2000|max:2100',
             'launch_date' => 'nullable|date',
             'end_date' => 'nullable|date|after:launch_date',
-            'banner_image' => 'nullable|url',
+            'banner_image' => $request->hasFile('banner_image') ? 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:5120' : 'nullable|string|max:2048',
+            'thumbnail_image' => $request->hasFile('thumbnail_image') ? 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:2048' : 'nullable|string|max:2048',
             'status' => 'nullable|in:draft,active,archived',
             'sort_order' => 'nullable|integer',
             'metadata' => 'nullable|array',
@@ -75,6 +76,22 @@ class CollectionController extends Controller
 
         if (empty($data['slug'])) {
             $data['slug'] = Str::slug($data['name']);
+        }
+
+        // Handle Banner Upload
+        if ($request->hasFile('banner_image')) {
+            $banner = $request->file('banner_image');
+            $bannerName = time() . '_banner_' . Str::slug($data['name']) . '.' . $banner->getClientOriginalExtension();
+            $bannerPath = $banner->storeAs('collections/banners', $bannerName, 'public');
+            $data['banner_image'] = $bannerPath;
+        }
+
+        // Handle Thumbnail Upload
+        if ($request->hasFile('thumbnail_image')) {
+            $thumbnail = $request->file('thumbnail_image');
+            $thumbnailName = time() . '_thumb_' . Str::slug($data['name']) . '.' . $thumbnail->getClientOriginalExtension();
+            $thumbnailPath = $thumbnail->storeAs('collections', $thumbnailName, 'public');
+            $data['thumbnail_image'] = $thumbnailPath;
         }
 
         $collection = Collection::create($data);
@@ -102,7 +119,10 @@ class CollectionController extends Controller
             'year' => 'nullable|integer|min:2000|max:2100',
             'launch_date' => 'nullable|date',
             'end_date' => 'nullable|date|after:launch_date',
-            'banner_image' => 'nullable|url',
+            'banner_image' => $request->hasFile('banner_image') ? 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:5120' : 'nullable|string|max:2048',
+            'thumbnail_image' => $request->hasFile('thumbnail_image') ? 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:2048' : 'nullable|string|max:2048',
+            'remove_banner' => 'nullable|boolean',
+            'remove_thumbnail' => 'nullable|boolean',
             'status' => 'nullable|in:draft,active,archived',
             'sort_order' => 'nullable|integer',
             'metadata' => 'nullable|array',
@@ -112,7 +132,39 @@ class CollectionController extends Controller
             return response()->json(['success' => false, 'errors' => $validator->errors()], 422);
         }
 
-        $collection->update($validator->validated());
+        $data = $validator->validated();
+
+        // Handle Banner removal/upload
+        if ($request->remove_banner && $collection->banner_image) {
+            \Storage::disk('public')->delete($collection->banner_image);
+            $data['banner_image'] = null;
+        }
+        if ($request->hasFile('banner_image')) {
+            if ($collection->banner_image) {
+                \Storage::disk('public')->delete($collection->banner_image);
+            }
+            $banner = $request->file('banner_image');
+            $bannerName = time() . '_banner_' . Str::slug($data['name'] ?? $collection->name) . '.' . $banner->getClientOriginalExtension();
+            $bannerPath = $banner->storeAs('collections/banners', $bannerName, 'public');
+            $data['banner_image'] = $bannerPath;
+        }
+
+        // Handle Thumbnail removal/upload
+        if ($request->remove_thumbnail && $collection->thumbnail_image) {
+            \Storage::disk('public')->delete($collection->thumbnail_image);
+            $data['thumbnail_image'] = null;
+        }
+        if ($request->hasFile('thumbnail_image')) {
+            if ($collection->thumbnail_image) {
+                \Storage::disk('public')->delete($collection->thumbnail_image);
+            }
+            $thumbnail = $request->file('thumbnail_image');
+            $thumbnailName = time() . '_thumb_' . Str::slug($data['name'] ?? $collection->name) . '.' . $thumbnail->getClientOriginalExtension();
+            $thumbnailPath = $thumbnail->storeAs('collections', $thumbnailName, 'public');
+            $data['thumbnail_image'] = $thumbnailPath;
+        }
+
+        $collection->update($data);
 
         return response()->json(['success' => true, 'data' => $collection->load('createdBy'), 'message' => 'Collection updated successfully']);
     }

@@ -198,6 +198,7 @@ class ProductBarcodeController extends Controller
                         'type' => $relabel->replacementBarcode->type,
                         'product_name' => $relabel->product->name ?? null,
                         'batch_number' => $relabel->batch->batch_number ?? null,
+                        'sell_price' => $relabel->batch->sell_price ?? null,
                         'batch_quantity_after_relabel' => $relabel->batch->quantity ?? null,
                         'status' => $relabel->replacementBarcode->current_status,
                         'replacement_status' => $relabel->replacementBarcode->replacement_status,

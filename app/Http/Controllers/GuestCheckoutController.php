@@ -8,6 +8,7 @@ use App\Models\OrderItem;
 use App\Models\OrderPayment;
 use App\Models\Product;
 use App\Models\ProductBatch;
+use App\Models\Promotion;
 use App\Models\ReservedProduct;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
@@ -113,18 +114,24 @@ class GuestCheckoutController extends Controller
                         ->orderBy('created_at', 'desc')
                         ->first();
 
-                    $unitPrice = $inStockBatch ? $inStockBatch->sell_price : ($anyBatch ? $anyBatch->sell_price : null);
+                    $baseUnitPrice = $inStockBatch ? $inStockBatch->sell_price : ($anyBatch ? $anyBatch->sell_price : null);
                     
                     // If price is not available (no batches), reject order
-                    if ($unitPrice === null) {
+                    if ($baseUnitPrice === null) {
                         DB::rollBack();
                         return response()->json([
                             'success' => false,
                             'message' => "Product {$product->name} has no price information available",
                         ], 400);
                     }
+
+                    // Recalculate campaign-aware storefront price on the backend.
+                    // Guest checkout payloads only contain product_id + quantity, so never trust
+                    // a browser/localStorage price for the final order value.
+                    $pricing = $this->getCampaignAwareUnitPrice($product, (float) $baseUnitPrice);
+                    $unitPrice = $pricing['unit_price'];
                     
-                    $itemTotal = $unitPrice * $item['quantity'];
+                    $itemTotal = round($unitPrice * $item['quantity'], 2);
                     
                     // Extract tax from inclusive price using category/batch tax_percentage
                     // Priority: Category tax > Batch tax
@@ -146,6 +153,7 @@ class GuestCheckoutController extends Controller
                         'tax_amount' => $itemTax,
                         'total_amount' => $itemTotal,
                         'variant_options' => $item['variant_options'] ?? null,
+                        'campaign_pricing' => $pricing['campaign_pricing'],
                     ];
                 }
 
@@ -209,6 +217,7 @@ class GuestCheckoutController extends Controller
                         'checkout_type' => 'guest',
                         'customer_phone' => $request->phone,
                         'customer_provided_name' => $request->customer_name,
+                        'campaign_pricing_applied' => collect($orderItems)->contains(fn ($item) => !empty($item['campaign_pricing'])),
                     ],
                 ]);
 
@@ -224,6 +233,10 @@ class GuestCheckoutController extends Controller
                         'tax_amount' => 0,
                         'discount_amount' => 0,
                         'total_amount' => $itemData['total_amount'],
+                        'product_options' => array_filter([
+                            'variant_options' => $itemData['variant_options'] ?? null,
+                            'campaign_pricing' => $itemData['campaign_pricing'] ?? null,
+                        ]),
                     ]);
 
                     // Note: Reservation is automatically handled by OrderItemObserver 
@@ -336,6 +349,125 @@ class GuestCheckoutController extends Controller
                 'error' => $e->getMessage(),
             ], 500);
         }
+    }
+
+    /**
+     * Resolve the current storefront selling price for a guest checkout item.
+     *
+     * The e-commerce UI applies active public percentage campaigns client-side for display,
+     * but guest checkout submits only product_id and quantity. This backend calculation is
+     * the final source of truth for order item selling_price/unit_price.
+     */
+    private function getCampaignAwareUnitPrice(Product $product, float $baseUnitPrice): array
+    {
+        $baseUnitPrice = round(max(0, $baseUnitPrice), 2);
+
+        if ($baseUnitPrice <= 0) {
+            return [
+                'unit_price' => $baseUnitPrice,
+                'campaign_pricing' => null,
+            ];
+        }
+
+        $promotion = $this->getBestStorefrontPercentagePromotion($product);
+
+        if (!$promotion) {
+            return [
+                'unit_price' => $baseUnitPrice,
+                'campaign_pricing' => null,
+            ];
+        }
+
+        $discountPercent = max(0, (float) $promotion->discount_value);
+
+        if ($discountPercent <= 0) {
+            return [
+                'unit_price' => $baseUnitPrice,
+                'campaign_pricing' => null,
+            ];
+        }
+
+        $discountAmount = round($baseUnitPrice * ($discountPercent / 100), 2);
+        $campaignUnitPrice = round(max(0, $baseUnitPrice - $discountAmount), 2);
+
+        return [
+            'unit_price' => $campaignUnitPrice,
+            'campaign_pricing' => [
+                'promotion_id' => $promotion->id,
+                'promotion_name' => $promotion->name,
+                'promotion_code' => $promotion->code,
+                'discount_percent' => $discountPercent,
+                'original_unit_price' => $baseUnitPrice,
+                'campaign_unit_price' => $campaignUnitPrice,
+                'discount_amount_per_unit' => round($baseUnitPrice - $campaignUnitPrice, 2),
+            ],
+        ];
+    }
+
+    /**
+     * Match the storefront campaign rule used by PromotionContext:
+     * active public percentage promotion, product/category scoped or sitewide,
+     * with the highest percentage winning.
+     */
+    private function getBestStorefrontPercentagePromotion(Product $product): ?Promotion
+    {
+        return Promotion::where('is_active', true)
+            ->where('is_public', true)
+            ->where('type', 'percentage')
+            ->where('start_date', '<=', now())
+            ->where(function ($q) {
+                $q->whereNull('end_date')->orWhere('end_date', '>=', now());
+            })
+            ->where(function ($q) {
+                $q->whereNull('usage_limit')
+                  ->orWhereColumn('usage_count', '<', 'usage_limit');
+            })
+            ->get()
+            ->filter(fn (Promotion $promotion) => $this->promotionAppliesToProduct($promotion, $product))
+            ->sortByDesc(fn (Promotion $promotion) => (float) $promotion->discount_value)
+            ->first();
+    }
+
+    private function promotionAppliesToProduct(Promotion $promotion, Product $product): bool
+    {
+        $productIds = $this->normalizePromotionIdList($promotion->applicable_products);
+        $categoryIds = $this->normalizePromotionIdList($promotion->applicable_categories);
+
+        $hasProductScope = !empty($productIds);
+        $hasCategoryScope = !empty($categoryIds);
+
+        if (!$hasProductScope && !$hasCategoryScope) {
+            return true;
+        }
+
+        if ($hasProductScope && in_array((int) $product->id, $productIds, true)) {
+            return true;
+        }
+
+        return $hasCategoryScope
+            && $product->category_id !== null
+            && in_array((int) $product->category_id, $categoryIds, true);
+    }
+
+    private function normalizePromotionIdList($ids): array
+    {
+        if (!is_array($ids)) {
+            return [];
+        }
+
+        $normalized = [];
+
+        foreach ($ids as $id) {
+            if ($id === null || $id === '') {
+                continue;
+            }
+
+            if (is_numeric($id)) {
+                $normalized[] = (int) $id;
+            }
+        }
+
+        return array_values(array_unique($normalized));
     }
 
     /**

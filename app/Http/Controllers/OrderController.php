@@ -36,6 +36,7 @@ class OrderController extends Controller
         $query = Order::with([
             'customer',
             'store', // Nullable - E-commerce orders have no store until manually assigned
+            'salesman',
             'items.product',
             'items.batch',
             'serviceItems',
@@ -161,6 +162,7 @@ class OrderController extends Controller
         $order = Order::with([
             'customer',
             'store',
+            'salesman',
             'items.product.reservedProduct',
             'items.batch',
             'items.barcode',
@@ -639,6 +641,7 @@ class OrderController extends Controller
                 'data' => $this->formatOrderResponse($order->fresh([
                     'customer',
                     'store',
+                    'salesman',
                     'items.product',
                     'items.batch',
                     'payments.paymentMethod'
@@ -702,6 +705,7 @@ class OrderController extends Controller
             'shipping_address.state' => 'nullable|string',
             'shipping_address.postal_code' => 'nullable|string',
             'shipping_address.country' => 'required_with:shipping_address|string',
+            'salesman_id' => 'nullable|exists:employees,id',
             'discount_amount' => 'nullable|numeric|min:0',
             'shipping_amount' => 'nullable|numeric|min:0',
             'notes' => 'nullable|string',
@@ -742,6 +746,10 @@ class OrderController extends Controller
                     }
                     $customer->save();
                 }
+            }
+
+            if ($request->has('salesman_id')) {
+                $order->salesman_id = $request->filled('salesman_id') ? (int) $request->salesman_id : null;
             }
 
             // Update items if provided (Bulk Update)
@@ -876,7 +884,7 @@ class OrderController extends Controller
             return response()->json([
                 'success' => true,
                 'message' => 'Order updated successfully',
-                'data' => $order->load(['customer', 'items.product', 'payments'])
+                'data' => $order->load(['customer', 'salesman', 'items.product', 'payments'])
             ]);
 
         } catch (\Exception $e) {
@@ -1947,6 +1955,8 @@ class OrderController extends Controller
         });
         $grossMargin = (float)$order->total_amount - $totalCogs;
 
+        $salesman = $order->salesman ?: $order->createdBy;
+
         $response = [
             'id' => $order->id,
             'order_number' => $order->order_number,
@@ -1972,9 +1982,9 @@ class OrderController extends Controller
                 'address' => $order->store->address,
                 'phone' => $order->store->phone,
             ] : null,
-            'salesman' => $order->createdBy ? [
-                'id' => $order->createdBy->id,
-                'name' => $order->createdBy->name,
+            'salesman' => $salesman ? [
+                'id' => $salesman->id,
+                'name' => $salesman->name,
             ] : null,
             'subtotal' => number_format((float)$order->subtotal, 2),
             'tax_amount' => number_format((float)$order->tax_amount, 2),

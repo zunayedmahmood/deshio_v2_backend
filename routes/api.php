@@ -40,7 +40,6 @@ use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\BusinessAnalyticsController;
 use App\Http\Controllers\StockIntelligenceController;
 use App\Http\Controllers\ExchangeController;
-use App\Http\Controllers\SizeController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -1008,10 +1007,6 @@ Route::middleware('auth:api')->group(function () {
         Route::get('/', [ProductVariantController::class, 'getOptions']);
         Route::post('/', [ProductVariantController::class, 'storeOption']);
     });
-
-    // Sizes (alias for variant-options name=Size)
-    Route::get('/sizes', [SizeController::class, 'index']);
-    Route::post('/sizes', [SizeController::class, 'store']);
     
     // Product variants
     Route::prefix('products/{productId}/variants')->group(function () {
@@ -1127,9 +1122,6 @@ Route::middleware('auth:api')->group(function () {
 
         // Create order (all 3 channels)
         Route::post('/', [OrderController::class, 'create']);
-        
-        // POS Manual Entry with Automatic Relabelling
-        Route::post('/manual-relabel-sale', [\App\Http\Controllers\ManualSaleRelabelController::class, 'create']);
 
         // Intended Courier Management
         Route::patch('/{id}/set-courier', [OrderController::class, 'setIntendedCourier']);

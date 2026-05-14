@@ -700,14 +700,13 @@ class ProductBatchController extends Controller
     public function updateAllBatchPrices(Request $request, $productId)
     {
         $validator = Validator::make($request->all(), [
-            'sell_price' => 'required_without:cost_price|nullable|numeric|min:0',
-            'cost_price' => 'required_without:sell_price|nullable|numeric|min:0',
+            'sell_price' => 'required|numeric|min:0',
         ]);
 
         if ($validator->fails()) {
             return response()->json([
                 'success' => false,
-                'message' => 'Validation failed: provide at least one price (selling or cost) to update.',
+                'message' => 'Validation failed',
                 'errors' => $validator->errors()
             ], 422);
         }
@@ -723,7 +722,6 @@ class ProductBatchController extends Controller
             }
 
             $newSellPrice = $request->sell_price;
-            $newCostPrice = $request->cost_price;
 
             // Get all batches for this product
             $batches = ProductBatch::where('product_id', $productId)->with(['store', 'product'])->get();
@@ -741,23 +739,14 @@ class ProductBatchController extends Controller
             DB::beginTransaction();
             try {
                 foreach ($batches as $batch) {
-                    $oldSellPrice = $batch->sell_price;
-                    $oldCostPrice = $batch->cost_price;
-
-                    if ($request->has('sell_price')) {
-                        $batch->sell_price = $newSellPrice;
-                    }
-                    if ($request->has('cost_price')) {
-                        $batch->cost_price = $newCostPrice;
-                    }
+                    $oldPrice = $batch->sell_price;
+                    $batch->sell_price = $newSellPrice;
                     
                     \Illuminate\Support\Facades\Log::info('BATCH_PRICE_UPDATE_DIAGNOSTIC', [
                         'batch_id' => $batch->id,
                         'product_id' => $batch->product_id,
-                        'old_sell_price' => $oldSellPrice,
-                        'new_sell_price' => $batch->sell_price,
-                        'old_cost_price' => $oldCostPrice,
-                        'new_cost_price' => $batch->cost_price,
+                        'old_price' => $oldPrice,
+                        'new_price' => $newSellPrice,
                     ]);
                     
                     $batch->save();
@@ -767,10 +756,8 @@ class ProductBatchController extends Controller
                         'batch_number' => $batch->batch_number,
                         'product_name' => $batch->product->name ?? 'Unknown Product',
                         'store' => $batch->store->name ?? 'N/A',
-                        'old_price' => number_format((float)$oldSellPrice, 2),
-                        'new_price' => number_format((float)$batch->sell_price, 2),
-                        'old_cost_price' => number_format((float)$oldCostPrice, 2),
-                        'new_cost_price' => number_format((float)$batch->cost_price, 2),
+                        'old_price' => number_format((float)$oldPrice, 2),
+                        'new_price' => number_format((float)$newSellPrice, 2),
                     ];
                 }
 
@@ -778,13 +765,12 @@ class ProductBatchController extends Controller
 
                 return response()->json([
                     'success' => true,
-                    'message' => 'Successfully updated batch prices',
+                    'message' => 'Successfully updated selling price for all batches',
                     'data' => [
                         'product_id' => $product->id,
                         'product_name' => $product->name,
                         'product_sku' => $product->sku,
-                        'new_sell_price' => $request->has('sell_price') ? number_format((float)$newSellPrice, 2) : null,
-                        'new_cost_price' => $request->has('cost_price') ? number_format((float)$newCostPrice, 2) : null,
+                        'new_sell_price' => number_format((float)$newSellPrice, 2),
                         'batches_updated' => count($updates),
                         'updates' => $updates,
                     ],

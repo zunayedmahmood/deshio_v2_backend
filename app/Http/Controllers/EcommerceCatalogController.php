@@ -437,7 +437,7 @@ class EcommerceCatalogController extends Controller
     {
         try {
             // Find product by ID
-            $product = Product::with(['images', 'category', 'barcodes', 'batches.store', 'batches' => function ($q) {
+            $product = Product::with(['images', 'category', 'barcodes', 'batches' => function ($q) {
                     $q->orderBy('sell_price', 'asc');
                 }])
                 ->where('is_archived', false)

@@ -11,29 +11,24 @@ use App\Models\ProductBarcode;
 use App\Models\ProductMovement;
 use App\Models\Transaction;
 use App\Traits\DatabaseAgnosticSearch;
+use App\Services\FloatingBarcodeRelabelService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Auth;
-use App\Services\FloatingBarcodeRelabelService;
 
 class ProductReturnController extends Controller
 {
     use DatabaseAgnosticSearch;
 
-    protected FloatingBarcodeRelabelService $relabelService;
+    protected $relabelService;
 
     public function __construct(FloatingBarcodeRelabelService $relabelService)
     {
         $this->relabelService = $relabelService;
     }
 
-    private const BLOCKED_RETURN_EXCHANGE_STATUSES = [
-        'pending',
-        'assigned_to_store',
-        'pending_assignment',
-    ];
     /**
      * Get all product returns
      */
@@ -146,11 +141,6 @@ class ProductReturnController extends Controller
             'items' => 'required|array|min:1',
             'items.*.order_item_id' => 'required|exists:order_items,id',
             'items.*.quantity' => 'required|integer|min:1',
-            'items.*.unit_price' => 'nullable|numeric|min:0',
-            'items.*.total_price' => 'nullable|numeric|min:0',
-            'items.*.product_barcode_id' => 'nullable|exists:product_barcodes,id',
-            'items.*.barcode_id' => 'nullable|exists:product_barcodes,id',
-            'items.*.barcode' => 'nullable|string',
             'items.*.reason' => 'nullable|string',
             'customer_notes' => 'nullable|string',
         ]);
@@ -159,7 +149,13 @@ class ProductReturnController extends Controller
         try {
             // 1. Create the return (logic from store())
             $order = Order::with('items')->findOrFail($request->order_id);
-            $this->assertOrderCanReturnOrExchange($order, 'Return');
+            $existingReturn = ProductReturn::where('order_id', $order->id)
+                ->whereNotIn('status', ['rejected', 'cancelled'])
+                ->first();
+            
+            if ($existingReturn) {
+                throw new \Exception("A return request (#{$existingReturn->return_number}) already exists for this order.");
+            }
 
             $returnItems = [];
             $totalReturnValue = 0;
@@ -177,18 +173,12 @@ class ProductReturnController extends Controller
                     throw new \Exception("Cannot return {$item['quantity']} units. Only {$availableForReturn} available for return.");
                 }
 
-                if (empty($orderItem->product_batch_id)) {
-                    throw new \Exception("Item {$orderItem->id} has no batch tracking. Returns require batch-tracked items.");
-                }
-
-                $returnableBarcodes = $this->resolveReturnBarcodes($order, $orderItem, $item);
-                // If it was explicitly barcode-tracked during sale, mandate the exact barcode return
-                if (!empty($orderItem->product_barcode_id) && $returnableBarcodes->count() < (int) $item['quantity']) {
+                $returnableBarcodes = $this->getReturnableBarcodesForOrderItem($order, $orderItem, (int) $item['quantity']);
+                if ($returnableBarcodes->count() < (int) $item['quantity']) {
                     throw new \Exception("Unable to identify sold barcode units for {$orderItem->product_name}.");
                 }
 
-                $unitPrice = isset($item['unit_price']) ? (float) $item['unit_price'] : $orderItem->unit_price;
-                $itemReturnValue = isset($item['total_price']) ? (float) $item['total_price'] : ($item['quantity'] * $unitPrice);
+                $itemReturnValue = $item['quantity'] * $orderItem->unit_price;
                 $totalReturnValue += $itemReturnValue;
 
                 $returnItems[] = [
@@ -197,7 +187,7 @@ class ProductReturnController extends Controller
                     'product_batch_id' => $orderItem->product_batch_id,
                     'product_name' => $orderItem->product_name,
                     'quantity' => $item['quantity'],
-                    'unit_price' => $unitPrice,
+                    'unit_price' => $orderItem->unit_price,
                     'total_price' => $itemReturnValue,
                     'reason' => $item['reason'] ?? null,
                     'returned_barcode_ids' => $returnableBarcodes->pluck('id')->values()->all(),
@@ -205,23 +195,12 @@ class ProductReturnController extends Controller
                 ];
             }
 
-            // Resolve store_id: orders from e-commerce/social channels may have null store_id.
-            // Fall back to received_at_store_id, then the authenticated user's store.
-            $resolvedStoreId = $order->store_id
-                ?? $request->received_at_store_id
-                ?? auth()->user()?->store_id
-                ?? null;
-
-            if (!$resolvedStoreId) {
-                throw new \Exception('Cannot determine store for this return. The order has no store assigned and no receiving store was specified.');
-            }
-
             $return = ProductReturn::create([
                 'return_number' => $this->generateReturnNumber(),
                 'order_id' => $order->id,
                 'customer_id' => $order->customer_id,
-                'store_id' => $resolvedStoreId,
-                'received_at_store_id' => $request->received_at_store_id ?? $resolvedStoreId,
+                'store_id' => $order->store_id,
+                'received_at_store_id' => $request->received_at_store_id ?? $order->store_id,
                 'return_reason' => $request->return_reason,
                 'return_type' => $request->return_type,
                 'status' => 'pending',
@@ -284,11 +263,6 @@ class ProductReturnController extends Controller
             'items' => 'required|array|min:1',
             'items.*.order_item_id' => 'required|exists:order_items,id',
             'items.*.quantity' => 'required|integer|min:1',
-            'items.*.unit_price' => 'nullable|numeric|min:0',
-            'items.*.total_price' => 'nullable|numeric|min:0',
-            'items.*.product_barcode_id' => 'nullable|exists:product_barcodes,id',
-            'items.*.barcode_id' => 'nullable|exists:product_barcodes,id',
-            'items.*.barcode' => 'nullable|string',
             'items.*.reason' => 'nullable|string',
             'customer_notes' => 'nullable|string',
             'attachments' => 'nullable|array',
@@ -297,7 +271,15 @@ class ProductReturnController extends Controller
         DB::beginTransaction();
         try {
             $order = Order::with('items')->findOrFail($request->order_id);
-            $this->assertOrderCanReturnOrExchange($order, 'Return');
+
+            // Check for existing active returns for this order
+            $existingReturn = ProductReturn::where('order_id', $order->id)
+                ->whereNotIn('status', ['rejected', 'cancelled'])
+                ->first();
+            
+            if ($existingReturn) {
+                throw new \Exception("A return request (#{$existingReturn->return_number}) already exists for this order. Cannot create duplicate returns.");
+            }
 
             // Validate return items
             $returnItems = [];
@@ -319,19 +301,17 @@ class ProductReturnController extends Controller
                     throw new \Exception("Cannot return {$item['quantity']} units. Only {$availableForReturn} available for return.");
                 }
 
-                // Only items with a batch can be returned (pre-orders without batches cannot be physically returned)
-                if (empty($orderItem->product_batch_id)) {
-                    throw new \Exception("Item {$orderItem->id} has no batch tracking. Returns require batch-tracked items.");
+                // Requirement: only barcode-tracked sold items are returnable.
+                if (empty($orderItem->product_barcode_id) && empty($orderItem->product_batch_id)) {
+                    throw new \Exception("Item {$orderItem->id} is not barcode-trackable. Returns require barcode-tracked items.");
                 }
 
-                $returnableBarcodes = $this->resolveReturnBarcodes($order, $orderItem, $item);
-                // If it was explicitly barcode-tracked during sale, mandate the exact barcode return
-                if (!empty($orderItem->product_barcode_id) && $returnableBarcodes->count() < (int) $item['quantity']) {
+                $returnableBarcodes = $this->getReturnableBarcodesForOrderItem($order, $orderItem, (int) $item['quantity']);
+                if ($returnableBarcodes->count() < (int) $item['quantity']) {
                     throw new \Exception("Unable to identify {$item['quantity']} sold barcode unit(s) for {$orderItem->product_name}. Return requires sold barcode tracking.");
                 }
 
-                $unitPrice = isset($item['unit_price']) ? (float) $item['unit_price'] : $orderItem->unit_price;
-                $itemReturnValue = isset($item['total_price']) ? (float) $item['total_price'] : ($item['quantity'] * $unitPrice);
+                $itemReturnValue = $item['quantity'] * $orderItem->unit_price;
                 $totalReturnValue += $itemReturnValue;
 
                 $returnItems[] = [
@@ -340,7 +320,7 @@ class ProductReturnController extends Controller
                     'product_batch_id' => $orderItem->product_batch_id,
                     'product_name' => $orderItem->product_name,
                     'quantity' => $item['quantity'],
-                    'unit_price' => $unitPrice,
+                    'unit_price' => $orderItem->unit_price,
                     'total_price' => $itemReturnValue,
                     'reason' => $item['reason'] ?? null,
                     'returned_barcode_ids' => $returnableBarcodes->pluck('id')->values()->all(),
@@ -354,24 +334,13 @@ class ProductReturnController extends Controller
             // Calculate refund amount (default to full value minus fee)
             $totalRefundAmount = max(0, $totalReturnValue - $processingFee);
 
-            // Resolve store_id: orders from e-commerce/social channels may have null store_id.
-            // Fall back to received_at_store_id, then the authenticated user's store.
-            $resolvedStoreId = $order->store_id
-                ?? $request->received_at_store_id
-                ?? auth()->user()?->store_id
-                ?? null;
-
-            if (!$resolvedStoreId) {
-                throw new \Exception('Cannot determine store for this return. The order has no store assigned and no receiving store was specified.');
-            }
-
             // Create return
             $return = ProductReturn::create([
                 'return_number' => $this->generateReturnNumber(),
                 'order_id' => $order->id,
                 'customer_id' => $order->customer_id,
-                'store_id' => $resolvedStoreId,
-                'received_at_store_id' => $request->received_at_store_id ?? $resolvedStoreId,
+                'store_id' => $order->store_id,
+                'received_at_store_id' => $request->received_at_store_id ?? $order->store_id,
                 'return_reason' => $request->return_reason,
                 'return_type' => $request->return_type,
                 'status' => 'pending',
@@ -821,81 +790,11 @@ class ProductReturnController extends Controller
         }
     }
 
-
-    private function assertOrderCanReturnOrExchange(Order $order, string $action): void
-    {
-        $status = str_replace([' ', '-'], '_', strtolower(trim((string) $order->status)));
-
-        if (!$status || in_array($status, self::BLOCKED_RETURN_EXCHANGE_STATUSES, true)) {
-            throw new \Exception("{$action} is not available while order status is '{$order->status}'. Eligible statuses are any status except pending, assigned_to_store and pending_assignment.");
-        }
-    }
-
-    private function resolveReturnBarcodes(Order $order, OrderItem $orderItem, array $item)
-    {
-        $quantity = (int) ($item['quantity'] ?? 1);
-        $barcodeId = $item['product_barcode_id'] ?? $item['barcode_id'] ?? null;
-        $barcodeString = $item['barcode'] ?? null;
-
-        if (!$barcodeId && !$barcodeString) {
-            return $this->getReturnableBarcodesForOrderItem($order, $orderItem, $quantity);
-        }
-
-        if ($quantity > 1 && !empty($orderItem->product_barcode_id)) {
-            throw new \Exception("Scan each returned barcode separately for {$orderItem->product_name}; one explicit barcode cannot represent multiple tracked units.");
-        }
-
-        $barcode = null;
-        if ($barcodeId) {
-            $barcode = ProductBarcode::query()->lockForUpdate()->where('id', $barcodeId)->first();
-        } elseif ($barcodeString) {
-            $barcode = ProductBarcode::query()->lockForUpdate()->where('barcode', $barcodeString)->first();
-        }
-
-        // Lookup may send SKU as the visible barcode if the order payload did not include
-        // product_barcode_id. For a tracked order item, trust the stored sold barcode id.
-        if (!$barcode && !empty($orderItem->product_barcode_id)) {
-            $barcode = ProductBarcode::query()->lockForUpdate()->find($orderItem->product_barcode_id);
-        }
-
-        if (!$barcode) {
-            if (empty($orderItem->product_barcode_id)) {
-                return collect();
-            }
-            throw new \Exception('Returned barcode was not found. Please refresh the Lookup order and select the barcode again.');
-        }
-
-        if ((int) $barcode->product_id !== (int) $orderItem->product_id) {
-            throw new \Exception("Returned barcode {$barcode->barcode} does not match {$orderItem->product_name}.");
-        }
-
-        if (!empty($orderItem->product_barcode_id) && (int) $barcode->id !== (int) $orderItem->product_barcode_id) {
-            throw new \Exception("Returned barcode {$barcode->barcode} does not match the barcode sold on this order item.");
-        }
-
-        $metadata = $barcode->location_metadata ?? [];
-        $metadataOrderId = $metadata['order_id'] ?? null;
-        $metadataOrderNumber = $metadata['order_number'] ?? null;
-        $belongsToOrder = ((int) $metadataOrderId === (int) $order->id)
-            || ((string) $metadataOrderNumber === (string) $order->order_number)
-            || (!empty($orderItem->product_barcode_id) && (int) $barcode->id === (int) $orderItem->product_barcode_id);
-
-        if (!$belongsToOrder) {
-            throw new \Exception("Returned barcode {$barcode->barcode} was not sold under order {$order->order_number}.");
-        }
-
-        if (!in_array($barcode->current_status, ['with_customer', 'sold', 'in_shipment'], true)) {
-            throw new \Exception("Returned barcode {$barcode->barcode} is not currently marked as sold/with customer.");
-        }
-
-        return collect([$barcode]);
-    }
-
     private function getReturnableBarcodesForOrderItem(Order $order, OrderItem $orderItem, int $requiredQty)
     {
         $query = ProductBarcode::where('product_id', $orderItem->product_id)
             ->where('batch_id', $orderItem->product_batch_id)
-            ->whereIn('current_status', ['with_customer', 'sold', 'in_shipment'])
+            ->whereIn('current_status', ['with_customer', 'sold'])
             ->where('is_defective', false)
             ->orderByDesc('location_updated_at')
             ->orderByDesc('id');
@@ -922,6 +821,10 @@ class ProductReturnController extends Controller
             throw new \Exception('Quality check must be performed before inventory restoration.');
         }
 
+        if ($return->quality_check_passed === false) {
+            throw new \Exception('Cannot restore inventory because return failed quality check.');
+        }
+
         $returnStore = $return->received_at_store_id ?? $return->store_id;
 
         foreach ($return->return_items ?? [] as $item) {
@@ -929,48 +832,65 @@ class ProductReturnController extends Controller
                 continue;
             }
 
-            $originalBatch = ProductBatch::where('id', $item['product_batch_id'])->lockForUpdate()->first();
+            $originalBatch = ProductBatch::find($item['product_batch_id']);
             if (!$originalBatch) {
                 throw new \Exception("Original batch not found for returned item (batch_id={$item['product_batch_id']}).");
             }
 
-            $shouldRestock = $this->shouldRestockReturnedItem($return, $item);
-            $targetBatch = $this->resolveReturnTargetBatch($originalBatch, (int) $item['product_id'], (int) $returnStore, $return);
-
-            if ($shouldRestock) {
-                $targetBatch->increment('quantity', (int) $item['quantity']);
-                $targetStatus = 'in_warehouse';
-                $isActive = true;
-                $isDefective = false;
+            if ((int) $originalBatch->store_id === (int) $returnStore) {
+                $targetBatch = $originalBatch;
+                $isNewBatch = false;
             } else {
-                $targetStatus = 'defective';
-                $isActive = false;
-                $isDefective = true;
+                // Determine POid (Purchase Order ID) for naming
+                $poId = \App\Models\PurchaseOrderItem::where('product_batch_id', $originalBatch->id)
+                    ->value('purchase_order_id') ?? '0';
+                
+                $newBatchNumber = $poId . '-RTN-' . $return->id;
+
+                $targetBatch = ProductBatch::firstOrCreate([
+                    'product_id' => $item['product_id'],
+                    'store_id' => $returnStore,
+                    'batch_number' => $newBatchNumber,
+                ], [
+                    'quantity' => 0,
+                    'cost_price' => $originalBatch->cost_price,
+                    'sell_price' => $originalBatch->sell_price,
+                    'tax_percentage' => $originalBatch->tax_percentage,
+                    'manufactured_date' => $originalBatch->manufactured_date,
+                    'expiry_date' => $originalBatch->expiry_date,
+                    'availability' => true,
+                    'is_active' => true,
+                    'notes' => "Cross-store return batch created from original batch: {$originalBatch->batch_number}",
+                ]);
+                $isNewBatch = $targetBatch->wasRecentlyCreated;
             }
+
+            $targetBatch->quantity += (int) $item['quantity'];
+            $targetBatch->save();
 
             $barcodeIds = collect($item['returned_barcode_ids'] ?? [])->filter()->values();
             if ($barcodeIds->isEmpty()) {
                 $barcodes = ProductBarcode::where('product_id', $item['product_id'])
                     ->where('batch_id', $item['product_batch_id'])
-                    ->whereIn('current_status', ['with_customer', 'sold', 'in_shipment'])
-                    ->lockForUpdate()
+                    ->whereIn('current_status', ['with_customer', 'sold'])
                     ->limit((int) $item['quantity'])
                     ->get();
             } else {
-                $barcodes = ProductBarcode::whereIn('id', $barcodeIds)->lockForUpdate()->get();
+                $barcodes = ProductBarcode::whereIn('id', $barcodeIds)->get();
             }
 
             foreach ($barcodes as $barcode) {
-                if ($shouldRestock && $barcode->is_replacement) {
+                // Handle replacement barcode logic (mark as open again)
+                if ($barcode->is_replacement) {
                     $this->relabelService->returnBarcodeFromSold($barcode, $return->order);
                 }
 
                 $barcode->updateLocation(
                     $returnStore,
-                    $targetStatus,
+                    'in_warehouse',
                     [
                         'return_id' => $return->id,
-                        'return_reason' => $item['reason'] ?? $return->return_reason,
+                        'return_reason' => $return->return_reason,
                         'returned_at' => now()->toISOString(),
                         'cross_store_return' => (int) $originalBatch->store_id !== (int) $returnStore,
                         'original_store_id' => $originalBatch->store_id,
@@ -978,9 +898,10 @@ class ProductReturnController extends Controller
                     false
                 );
 
-                $barcode->batch_id = $targetBatch->id;
-                $barcode->is_active = $isActive;
-                $barcode->is_defective = $isDefective;
+                $barcode->is_active = true;
+                if ((int) $originalBatch->store_id !== (int) $returnStore) {
+                    $barcode->batch_id = $targetBatch->id;
+                }
                 $barcode->save();
 
                 ProductMovement::create([
@@ -991,83 +912,17 @@ class ProductReturnController extends Controller
                     'to_store_id' => $returnStore,
                     'movement_type' => 'return',
                     'quantity' => 1,
-                    'unit_cost' => $originalBatch->cost_price ?? 0,
-                    'unit_price' => $item['unit_price'] ?? 0,
-                    'total_cost' => $originalBatch->cost_price ?? 0,
-                    'total_value' => $item['unit_price'] ?? 0,
+                    'unit_cost' => $item['unit_price'] ?? 0,
+                    'total_cost' => $item['unit_price'] ?? 0,
                     'reference_type' => 'return',
                     'reference_id' => $return->id,
-                    'notes' => $shouldRestock
-                        ? "Product return restocked: {$return->return_number}"
-                        : "Product return marked defective/non-sellable: {$return->return_number}",
-                    'performed_by' => $employee->id,
-                ]);
-            }
-
-            if ($barcodes->isEmpty()) {
-                ProductMovement::create([
-                    'product_id' => $item['product_id'],
-                    'product_batch_id' => $targetBatch->id,
-                    'product_barcode_id' => null,
-                    'from_store_id' => (int) $originalBatch->store_id !== (int) $returnStore ? $originalBatch->store_id : null,
-                    'to_store_id' => $returnStore,
-                    'movement_type' => 'return',
-                    'quantity' => $item['quantity'],
-                    'unit_cost' => $originalBatch->cost_price ?? 0,
-                    'unit_price' => $item['unit_price'] ?? 0,
-                    'total_cost' => ($originalBatch->cost_price ?? 0) * $item['quantity'],
-                    'total_value' => ($item['unit_price'] ?? 0) * $item['quantity'],
-                    'reference_type' => 'return',
-                    'reference_id' => $return->id,
-                    'notes' => $shouldRestock
-                        ? "Product return restocked without barcode movement: {$return->return_number}"
-                        : "Product return received as non-sellable without barcode movement: {$return->return_number}",
+                    'notes' => (int) $originalBatch->store_id !== (int) $returnStore
+                        ? "Cross-store return: {$return->return_number}" . ($isNewBatch ? ' (New batch created)' : '')
+                        : "Product return: {$return->return_number}",
                     'performed_by' => $employee->id,
                 ]);
             }
         }
-    }
-
-    private function resolveReturnTargetBatch(ProductBatch $originalBatch, int $productId, int $returnStore, ProductReturn $return): ProductBatch
-    {
-        if ((int) $originalBatch->store_id === $returnStore) {
-            return $originalBatch;
-        }
-
-        $baseBatchNumber = $originalBatch->batch_number . '-RTN-S' . $returnStore;
-        $batchNumber = $baseBatchNumber;
-        $counter = 1;
-
-        while (ProductBatch::where('batch_number', $batchNumber)->exists()) {
-            $existing = ProductBatch::where('batch_number', $batchNumber)->first();
-            if ($existing && (int) $existing->product_id === $productId && (int) $existing->store_id === $returnStore) {
-                return $existing;
-            }
-            $batchNumber = $baseBatchNumber . '-' . $counter++;
-        }
-
-        return ProductBatch::create([
-            'product_id' => $productId,
-            'store_id' => $returnStore,
-            'batch_number' => $batchNumber,
-            'quantity' => 0,
-            'cost_price' => $originalBatch->cost_price,
-            'sell_price' => $originalBatch->sell_price,
-            'tax_percentage' => $originalBatch->tax_percentage,
-            'manufactured_date' => $originalBatch->manufactured_date,
-            'expiry_date' => $originalBatch->expiry_date,
-            'availability' => true,
-            'is_active' => true,
-            'notes' => "Cross-store return batch created from original batch {$originalBatch->batch_number} for return {$return->return_number}",
-        ]);
-    }
-
-    private function shouldRestockReturnedItem(ProductReturn $return, array $item): bool
-    {
-        $defectiveReasons = ['defective_product', 'quality_issue', 'not_as_described', 'wrong_item'];
-        $reason = $item['reason'] ?? $item['return_reason'] ?? $return->return_reason;
-
-        return $return->quality_check_passed !== false && !in_array($reason, $defectiveReasons, true);
     }
 
     private function isInventoryRestored(ProductReturn $return): bool
@@ -1120,7 +975,7 @@ class ProductReturnController extends Controller
                 'pending' => (clone $query)->where('status', 'pending')->count(),
                 'approved' => (clone $query)->where('status', 'approved')->count(),
                 'rejected' => (clone $query)->where('status', 'rejected')->count(),
-                'processing' => (clone $query)->where('status', 'processing')->count(),
+                'processed' => (clone $query)->where('status', 'processed')->count(),
                 'completed' => (clone $query)->where('status', 'completed')->count(),
                 'refunded' => (clone $query)->where('status', 'refunded')->count(),
                 'total_return_value' => $query->sum('total_return_value'),
@@ -1182,7 +1037,7 @@ class ProductReturnController extends Controller
      */
     private function getReturnedQuantity($orderItemId): int
     {
-        $returns = ProductReturn::whereIn('status', ['pending', 'approved', 'processing', 'completed', 'refunded'])->get();
+        $returns = ProductReturn::whereIn('status', ['approved', 'processed', 'completed', 'refunded'])->get();
         
         $totalReturned = 0;
         foreach ($returns as $return) {

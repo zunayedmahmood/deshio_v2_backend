@@ -7,6 +7,7 @@ use App\Models\OrderItem;
 use App\Models\Customer;
 use App\Models\Product;
 use App\Models\ProductBatch;
+use App\Models\ProductBarcode;
 use App\Models\Store;
 use App\Models\Employee;
 use App\Models\PaymentMethod;
@@ -682,7 +683,7 @@ class OrderController extends Controller
         }
 
         // Only allow updates for pending/confirmed orders
-        if (!in_array($order->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking'])) {
+        if (!in_array($order->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking', 'ready_for_shipment'])) {
             return response()->json([
                 'success' => false,
                 'message' => 'Cannot update order in current status: ' . $order->status
@@ -752,6 +753,17 @@ class OrderController extends Controller
                     $unitPrice = $itemData['unit_price'] ?? $item->unit_price;
                     $quantity = $itemData['quantity'] ?? $item->quantity;
                     $discount = $itemData['discount_amount'] ?? $item->discount_amount;
+
+                    if ($quantity != $item->quantity && $item->product_barcode_id) {
+                        DB::rollBack();
+                        if ($quantity < $item->quantity) {
+                            return $this->barcodeSelectionRequiredResponse($order, $item);
+                        }
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'Cannot increase quantity on a scanned barcode row. Add the product as a new item so the new unit can be scanned separately.'
+                        ], 422);
+                    }
 
                     // Recalculate tax for this item
                     $batch = $item->batch;
@@ -911,7 +923,7 @@ class OrderController extends Controller
         }
 
         // Can only add items to pending orders
-        if (!in_array($order->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking'])) {
+        if (!in_array($order->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking', 'ready_for_shipment'])) {
             return response()->json([
                 'success' => false,
                 'message' => 'Cannot add items to ' . $order->status . ' orders'
@@ -1084,6 +1096,8 @@ class OrderController extends Controller
                 $existingItem = OrderItem::where('order_id', $order->id)
                     ->where('product_id', $product->id)
                     ->where('product_batch_id', $batch ? $batch->id : null)
+                    ->whereNull('product_barcode_id')
+                    ->where('is_inventory_deducted', false)
                     ->first();
                 
                 if ($existingItem) {
@@ -1174,7 +1188,7 @@ class OrderController extends Controller
             ], 404);
         }
 
-        if (!in_array($order->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking'])) {
+        if (!in_array($order->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking', 'ready_for_shipment'])) {
             return response()->json([
                 'success' => false,
                 'message' => 'Cannot update items in ' . $order->status . ' orders'
@@ -1212,6 +1226,17 @@ class OrderController extends Controller
 
             if ($request->filled('quantity')) {
                 $diff = $newQuantity - $item->quantity;
+
+                if ($diff != 0 && $item->product_barcode_id) {
+                    DB::rollBack();
+                    if ($diff < 0) {
+                        return $this->barcodeSelectionRequiredResponse($order, $item);
+                    }
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Cannot increase quantity on a scanned barcode row. Add the product as a new item so the new unit can be scanned separately.'
+                    ], 422);
+                }
 
                 // For increases, validate global available inventory
                 if ($diff > 0) {
@@ -1319,7 +1344,7 @@ class OrderController extends Controller
             ], 404);
         }
 
-        if (!in_array($order->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking'])) {
+        if (!in_array($order->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking', 'ready_for_shipment'])) {
             return response()->json([
                 'success' => false,
                 'message' => 'Cannot remove items from ' . $order->status . ' orders'
@@ -1333,6 +1358,10 @@ class OrderController extends Controller
                 'success' => false,
                 'message' => 'Item not found'
             ], 404);
+        }
+
+        if ($item->product_barcode_id) {
+            return $this->barcodeSelectionRequiredResponse($order, $item);
         }
 
         DB::beginTransaction();
@@ -1374,6 +1403,203 @@ class OrderController extends Controller
                 ]
             ]);
 
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage()
+            ], 422);
+        }
+    }
+
+
+    private function scannedBarcodeRowsForItem(Order $order, OrderItem $item)
+    {
+        return OrderItem::where('order_id', $order->id)
+            ->where('product_id', $item->product_id)
+            ->whereNotNull('product_barcode_id')
+            ->with(['barcode', 'batch'])
+            ->get()
+            ->map(function (OrderItem $scannedItem) {
+                return [
+                    'order_item_id' => $scannedItem->id,
+                    'barcode_id' => $scannedItem->product_barcode_id,
+                    'barcode' => $scannedItem->barcode?->barcode,
+                    'product_name' => $scannedItem->product_name,
+                    'batch_id' => $scannedItem->product_batch_id,
+                    'batch_number' => $scannedItem->batch?->batch_number,
+                    'quantity' => $scannedItem->quantity,
+                    'is_inventory_deducted' => (bool) $scannedItem->is_inventory_deducted,
+                ];
+            })
+            ->values();
+    }
+
+    private function barcodeSelectionRequiredResponse(Order $order, OrderItem $item)
+    {
+        return response()->json([
+            'success' => false,
+            'message' => 'This item already has scanned barcodes. Select the barcode(s) to remove from the order instead of reducing quantity by counter.',
+            'code' => 'requires_barcode_selection',
+            'data' => [
+                'order_id' => $order->id,
+                'item_id' => $item->id,
+                'product_id' => $item->product_id,
+                'product_name' => $item->product_name,
+                'barcodes' => $this->scannedBarcodeRowsForItem($order, $item),
+            ],
+        ], 409);
+    }
+
+    /**
+     * List scanned barcode rows for a product line in an editable order.
+     * Used by the orders page when reducing/removing scanned quantities.
+     */
+    public function scannedBarcodesForItem($orderId, $itemId)
+    {
+        $order = Order::find($orderId);
+
+        if (!$order) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Order not found'
+            ], 404);
+        }
+
+        if (!in_array($order->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking', 'ready_for_shipment'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot update items in ' . $order->status . ' orders'
+            ], 422);
+        }
+
+        $item = OrderItem::where('order_id', $orderId)->find($itemId);
+
+        if (!$item) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Item not found'
+            ], 404);
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'barcodes' => $this->scannedBarcodeRowsForItem($order, $item),
+            ],
+        ]);
+    }
+
+    /**
+     * Remove one selected scanned barcode/unit from an editable order.
+     * If the item was already completed, stock and barcode status are restored.
+     */
+    public function releaseScannedBarcode(Request $request, $orderId, $itemId)
+    {
+        $validator = Validator::make($request->all(), [
+            'barcode_id' => 'required|integer|exists:product_barcodes,id',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        $order = Order::find($orderId);
+
+        if (!$order) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Order not found'
+            ], 404);
+        }
+
+        if (!in_array($order->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking', 'ready_for_shipment'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot update items in ' . $order->status . ' orders'
+            ], 422);
+        }
+
+        $referenceItem = OrderItem::where('order_id', $orderId)->find($itemId);
+
+        if (!$referenceItem) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Item not found'
+            ], 404);
+        }
+
+        DB::beginTransaction();
+        try {
+            $scannedItem = OrderItem::where('order_id', $order->id)
+                ->where('product_id', $referenceItem->product_id)
+                ->where('product_barcode_id', $request->barcode_id)
+                ->with(['barcode', 'batch'])
+                ->lockForUpdate()
+                ->first();
+
+            if (!$scannedItem) {
+                throw new \Exception('Selected barcode is not attached to this order item.');
+            }
+
+            $barcode = ProductBarcode::where('id', $request->barcode_id)->lockForUpdate()->first();
+
+            if ($scannedItem->is_inventory_deducted) {
+                if ($scannedItem->batch) {
+                    $scannedItem->batch->addStock(1);
+                }
+
+                if ($barcode && in_array($barcode->current_status, ['sold', 'with_customer'], true)) {
+                    app(FloatingBarcodeRelabelService::class)->returnBarcodeFromSold($barcode, $order);
+                }
+            }
+
+            if ($scannedItem->quantity > 1) {
+                $oldQuantity = $scannedItem->quantity;
+                $newQuantity = $oldQuantity - 1;
+                $discountPerUnit = $oldQuantity > 0 ? ((float) $scannedItem->discount_amount / $oldQuantity) : 0;
+                $taxPerUnit = $oldQuantity > 0 ? ((float) $scannedItem->tax_amount / $oldQuantity) : 0;
+                $cogsPerUnit = $oldQuantity > 0 ? ((float) ($scannedItem->cogs ?? 0) / $oldQuantity) : 0;
+
+                $scannedItem->update([
+                    'quantity' => $newQuantity,
+                    'product_barcode_id' => null,
+                    'discount_amount' => round($discountPerUnit * $newQuantity, 2),
+                    'tax_amount' => round($taxPerUnit * $newQuantity, 2),
+                    'cogs' => round($cogsPerUnit * $newQuantity, 2),
+                    'total_amount' => round(((float) $scannedItem->unit_price * $newQuantity) - ($discountPerUnit * $newQuantity) + ($taxPerUnit * $newQuantity), 2),
+                ]);
+            } else {
+                $scannedItem->delete();
+            }
+
+            if ($order->needsFulfillment() && $order->items()->whereNull('product_barcode_id')->exists()) {
+                $order->fulfillment_status = 'pending_fulfillment';
+            }
+
+            $order->load(['items', 'serviceItems']);
+            $order->calculateTotals();
+            $order->save();
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Scanned barcode removed from order successfully',
+                'data' => $this->formatOrderResponse($order->fresh([
+                    'customer',
+                    'store',
+                    'items.product.reservedProduct',
+                    'items.batch',
+                    'items.barcode',
+                    'payments.paymentMethod',
+                    'serviceItems.service',
+                ]), true),
+            ]);
         } catch (\Exception $e) {
             DB::rollBack();
             return response()->json([

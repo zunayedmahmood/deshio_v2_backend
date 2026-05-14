@@ -61,10 +61,10 @@ class StoreFulfillmentController extends Controller
 
             // Add fulfillment progress for each order
             foreach ($orders as $order) {
-                $totalItems = $order->items->count();
-                $fulfilledItems = $order->items->filter(function($item) {
-                    return !is_null($item->product_barcode_id);
-                })->count();
+                $totalItems = $order->items->sum('quantity');
+                $fulfilledItems = $order->items->sum(function($item) {
+                    return !is_null($item->product_barcode_id) ? 1 : 0;
+                });
 
                 $order->fulfillment_progress = [
                     'total_items' => $totalItems,
@@ -149,8 +149,8 @@ class StoreFulfillmentController extends Controller
                 $item->available_count = $item->product->barcodes->count();
             });
 
-            $totalItems = $order->items->count();
-            $fulfilledItems = $order->items->filter(fn($item) => !is_null($item->product_barcode_id))->count();
+            $totalItems = $order->items->sum('quantity');
+            $fulfilledItems = $order->items->sum(fn($item) => !is_null($item->product_barcode_id) ? 1 : 0);
 
             return response()->json([
                 'success' => true,
@@ -199,7 +199,7 @@ class StoreFulfillmentController extends Controller
 
             $order = Order::where('id', $orderId)
                 ->where('store_id', $employee->store_id)
-                ->whereIn('status', ['assigned_to_store', 'picking', 'confirmed'])
+                ->whereIn('status', ['assigned_to_store', 'picking', 'ready_for_shipment', 'confirmed'])
 
                 ->firstOrFail();
 
@@ -264,23 +264,61 @@ class StoreFulfillmentController extends Controller
                     'barcode' => $barcode->barcode,
                 ]);
 
-                // 5. Update order item with scanned barcode and its batch
-                $orderItem->update([
-                    'product_barcode_id' => $barcode->id,
-                    'product_batch_id' => $barcode->batch_id, // Sync with the actual physical batch
-                ]);
+                // 5. Attach exactly one scanned barcode to exactly one order-item row.
+                // If the line quantity is greater than 1, split off one scanned unit and
+                // keep the remaining quantity pending for the next barcode scan.
+                if ($orderItem->quantity > 1) {
+                    $originalQuantity = $orderItem->quantity;
+                    $remainingQuantity = $originalQuantity - 1;
+                    $discountPerUnit = $originalQuantity > 0 ? ((float) $orderItem->discount_amount / $originalQuantity) : 0;
+                    $taxPerUnit = $originalQuantity > 0 ? ((float) $orderItem->tax_amount / $originalQuantity) : 0;
+                    $cogsPerUnit = $originalQuantity > 0 ? ((float) ($orderItem->cogs ?? 0) / $originalQuantity) : 0;
 
-                // Update order status to picking if this is first scan
-                if (in_array($order->status, ['assigned_to_store', 'confirmed'])) {
+                    $orderItem->update([
+                        'quantity' => $remainingQuantity,
+                        'discount_amount' => round($discountPerUnit * $remainingQuantity, 2),
+                        'tax_amount' => round($taxPerUnit * $remainingQuantity, 2),
+                        'cogs' => round($cogsPerUnit * $remainingQuantity, 2),
+                        'total_amount' => round(((float) $orderItem->unit_price * $remainingQuantity) - ($discountPerUnit * $remainingQuantity) + ($taxPerUnit * $remainingQuantity), 2),
+                    ]);
+
+                    $scannedOrderItem = OrderItem::create([
+                        'order_id' => $order->id,
+                        'product_id' => $orderItem->product_id,
+                        'product_batch_id' => $barcode->batch_id,
+                        'product_barcode_id' => $barcode->id,
+                        'store_id' => $orderItem->store_id,
+                        'product_name' => $orderItem->product_name,
+                        'product_sku' => $orderItem->product_sku,
+                        'quantity' => 1,
+                        'unit_price' => $orderItem->unit_price,
+                        'discount_amount' => round($discountPerUnit, 2),
+                        'tax_amount' => round($taxPerUnit, 2),
+                        'cogs' => round($cogsPerUnit, 2),
+                        'total_amount' => round((float) $orderItem->unit_price - $discountPerUnit + $taxPerUnit, 2),
+                        'product_options' => $orderItem->product_options,
+                        'notes' => $orderItem->notes,
+                    ]);
+                } else {
+                    $orderItem->update([
+                        'product_barcode_id' => $barcode->id,
+                        'product_batch_id' => $barcode->batch_id, // Sync with the actual physical batch
+                    ]);
+                    $scannedOrderItem = $orderItem;
+                }
+
+                // Update order status to picking if this is first scan or if a ready order is edited/re-scanned
+                if (in_array($order->status, ['assigned_to_store', 'confirmed', 'ready_for_shipment'])) {
                     $order->update(['status' => 'picking']);
                 }
 
-                // Check if all items are scanned
+                // Check if all quantity units are scanned
                 $allItemsScanned = $order->items()->whereNull('product_barcode_id')->count() === 0;
                 
                 if ($allItemsScanned) {
                     $order->update([
                         'status' => 'ready_for_shipment',
+                        'fulfillment_status' => 'fulfilled',
                         'fulfilled_at' => now(),
                         'fulfilled_by' => $employeeId,
                     ]);
@@ -289,23 +327,23 @@ class StoreFulfillmentController extends Controller
                 DB::commit();
 
                 // Reload relationships
-                $orderItem->load('barcode', 'batch');
+                $scannedOrderItem->load('barcode', 'batch');
                 $order->load('items');
 
-                $fulfilledItems = $order->items->filter(fn($item) => !is_null($item->product_barcode_id))->count();
-                $totalItems = $order->items->count();
+                $fulfilledItems = $order->items->sum(fn($item) => !is_null($item->product_barcode_id) ? 1 : 0);
+                $totalItems = $order->items->sum('quantity');
 
                 return response()->json([
                     'success' => true,
                     'message' => 'Barcode scanned successfully',
                     'data' => [
-                        'order_item' => $orderItem,
+                        'order_item' => $scannedOrderItem,
                         'scanned_barcode' => $barcode,
                         'order_status' => $order->status,
                         'fulfillment_progress' => [
                             'fulfilled_items' => $fulfilledItems,
                             'total_items' => $totalItems,
-                            'percentage' => round(($fulfilledItems / $totalItems) * 100, 2),
+                            'percentage' => $totalItems > 0 ? round(($fulfilledItems / $totalItems) * 100, 2) : 0,
                             'is_complete' => $fulfilledItems === $totalItems,
                         ],
                     ],

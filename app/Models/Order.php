@@ -20,6 +20,7 @@ class Order extends Model
         'picking',
         'processing',
         'ready_for_pickup',
+        'ready_for_shipment',
         'shipped'
     ];
 
@@ -845,7 +846,7 @@ class Order extends Model
 
     public function canBeEdited(): bool
     {
-        return in_array($this->status, ['pending', 'confirmed']);
+        return in_array($this->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking', 'ready_for_shipment']);
     }
 
     public function canBeCancelled(): bool

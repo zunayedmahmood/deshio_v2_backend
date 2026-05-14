@@ -144,6 +144,10 @@ class ProductController extends Controller
                 ->whereColumn('product_batches.product_id', 'products.id')
                 ->where('product_batches.is_active', true)
                 ->where('stores.is_online', false),
+            'reserved_stock_quantity' => \DB::table('reserved_products')
+                ->select('reserved_inventory')
+                ->whereColumn('product_id', 'products.id')
+                ->limit(1),
             'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
                 ->whereColumn('product_id', 'products.id')
                 ->where('is_active', true)
@@ -203,6 +207,10 @@ class ProductController extends Controller
                     ->whereColumn('product_batches.product_id', 'products.id')
                     ->where('product_batches.is_active', true)
                     ->where('stores.is_online', false),
+                'reserved_stock_quantity' => \DB::table('reserved_products')
+                    ->select('reserved_inventory')
+                    ->whereColumn('product_id', 'products.id')
+                    ->limit(1),
                 'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
                     ->whereColumn('product_id', 'products.id')
                     ->where('is_active', true)
@@ -240,6 +248,10 @@ class ProductController extends Controller
                     ->whereColumn('product_batches.product_id', 'products.id')
                     ->where('product_batches.is_active', true)
                     ->where('stores.is_online', false),
+                'reserved_stock_quantity' => \DB::table('reserved_products')
+                    ->select('reserved_inventory')
+                    ->whereColumn('product_id', 'products.id')
+                    ->limit(1),
                 'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
                     ->whereColumn('product_id', 'products.id')
                     ->where('is_active', true)

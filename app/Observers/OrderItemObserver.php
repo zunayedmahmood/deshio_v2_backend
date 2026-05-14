@@ -15,10 +15,7 @@ class OrderItemObserver
     public function created(OrderItem $orderItem): void
     {
         $order = $orderItem->order;
-        if ($order && $order->isReservedStatus() && !$orderItem->is_inventory_deducted) {
-            if ($order->order_type === 'preorder') {
-                return;
-            }
+        if ($order && $this->itemShouldAffectReservation($order, $orderItem)) {
             $this->incrementReservation($orderItem->product_id, $orderItem->quantity);
         }
     }
@@ -29,45 +26,43 @@ class OrderItemObserver
     public function updated(OrderItem $orderItem): void
     {
         $order = $orderItem->order;
-        if ($order && $order->isReservedStatus()) {
-            if ($order->order_type === 'preorder') {
-                return;
-            }
+        if (!$order || $order->order_type === 'preorder' || !$this->orderCanHoldReservations($order)) {
+            return;
+        }
 
-            // If item is already deducted, it shouldn't have an active reservation.
-            // If it just became deducted, we should remove the reservation.
-            if ($orderItem->isDirty('is_inventory_deducted') && $orderItem->is_inventory_deducted) {
-                $oldQty = $orderItem->getOriginal('quantity');
-                $this->decrementReservation($orderItem->product_id, $oldQty);
-                return;
-            }
+        // If item is already deducted, it should no longer have an active reservation.
+        // This also handles edited confirmed orders where a newly added line is later completed.
+        if ($orderItem->isDirty('is_inventory_deducted') && $orderItem->is_inventory_deducted) {
+            $oldQty = $orderItem->getOriginal('quantity');
+            $this->decrementReservation($orderItem->product_id, $oldQty);
+            return;
+        }
 
-            // If it's already deducted, skip any other updates (no reservation to change)
-            if ($orderItem->is_inventory_deducted) {
-                return;
-            }
+        // If it's already deducted, skip any other updates (no reservation to change).
+        if ($orderItem->is_inventory_deducted) {
+            return;
+        }
 
-            // Handle product swap
-            if ($orderItem->isDirty('product_id')) {
-                $oldProductId = $orderItem->getOriginal('product_id');
-                $oldQty = $orderItem->getOriginal('quantity');
-                $newProductId = $orderItem->product_id;
-                $newQty = $orderItem->quantity;
+        // Handle product swap.
+        if ($orderItem->isDirty('product_id')) {
+            $oldProductId = $orderItem->getOriginal('product_id');
+            $oldQty = $orderItem->getOriginal('quantity');
+            $newProductId = $orderItem->product_id;
+            $newQty = $orderItem->quantity;
 
-                $this->decrementReservation($oldProductId, $oldQty);
-                $this->incrementReservation($newProductId, $newQty);
-            } 
-            // Handle quantity change for the same product
-            else if ($orderItem->isDirty('quantity')) {
-                $oldQty = $orderItem->getOriginal('quantity');
-                $newQty = $orderItem->quantity;
-                $diff = $newQty - $oldQty;
-                
-                if ($diff > 0) {
-                    $this->incrementReservation($orderItem->product_id, $diff);
-                } else if ($diff < 0) {
-                    $this->decrementReservation($orderItem->product_id, abs($diff));
-                }
+            $this->decrementReservation($oldProductId, $oldQty);
+            $this->incrementReservation($newProductId, $newQty);
+        }
+        // Handle quantity change for the same product.
+        else if ($orderItem->isDirty('quantity')) {
+            $oldQty = $orderItem->getOriginal('quantity');
+            $newQty = $orderItem->quantity;
+            $diff = $newQty - $oldQty;
+
+            if ($diff > 0) {
+                $this->incrementReservation($orderItem->product_id, $diff);
+            } else if ($diff < 0) {
+                $this->decrementReservation($orderItem->product_id, abs($diff));
             }
         }
     }
@@ -78,18 +73,31 @@ class OrderItemObserver
     public function deleted(OrderItem $orderItem): void
     {
         $order = $orderItem->order;
-        if ($order && $order->isReservedStatus() && !$orderItem->is_inventory_deducted) {
-            if ($order->order_type === 'preorder') {
-                return;
-            }
+        if ($order && $this->itemShouldAffectReservation($order, $orderItem)) {
             $this->decrementReservation($orderItem->product_id, $orderItem->quantity);
         }
+    }
+
+    private function itemShouldAffectReservation(Order $order, OrderItem $orderItem): bool
+    {
+        if ($order->order_type === 'preorder' || $orderItem->is_inventory_deducted) {
+            return false;
+        }
+
+        return $this->orderCanHoldReservations($order);
+    }
+
+    private function orderCanHoldReservations(Order $order): bool
+    {
+        // Confirmed orders normally have deducted inventory, but edited confirmed
+        // orders can contain newly added, not-yet-deducted lines that must stay reserved.
+        return $order->isReservedStatus() || $order->status === 'confirmed';
     }
 
     private function incrementReservation($productId, $quantity): void
     {
         $reservedRecord = ReservedProduct::where('product_id', $productId)->lockForUpdate()->first();
-        
+
         if ($reservedRecord) {
             $reservedRecord->increment('reserved_inventory', $quantity);
             $reservedRecord->decrement('available_inventory', $quantity);
@@ -108,10 +116,20 @@ class OrderItemObserver
     private function decrementReservation($productId, $quantity): void
     {
         $reservedRecord = ReservedProduct::where('product_id', $productId)->lockForUpdate()->first();
-        if ($reservedRecord) {
-            $reservedRecord->decrement('reserved_inventory', $quantity);
-            $reservedRecord->increment('available_inventory', $quantity);
-            Log::info("Decremented reservation for product {$productId} by {$quantity}");
+        if (!$reservedRecord) {
+            return;
         }
+
+        $currentReserved = (int) $reservedRecord->reserved_inventory;
+        $releaseQty = min($currentReserved, (int) $quantity);
+
+        if ($releaseQty <= 0) {
+            Log::warning("Skipped reservation decrement for product {$productId}; no active reservation found");
+            return;
+        }
+
+        $reservedRecord->decrement('reserved_inventory', $releaseQty);
+        $reservedRecord->increment('available_inventory', $releaseQty);
+        Log::info("Decremented reservation for product {$productId} by {$releaseQty}");
     }
 }

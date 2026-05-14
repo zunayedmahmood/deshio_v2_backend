@@ -1141,6 +1141,8 @@ Route::middleware('auth:api')->group(function () {
             
             // Item management (before completion)
             Route::post('/items', [OrderController::class, 'addItem']);
+            Route::get('/items/{itemId}/scanned-barcodes', [OrderController::class, 'scannedBarcodesForItem']);
+            Route::delete('/items/{itemId}/scanned-barcodes', [OrderController::class, 'releaseScannedBarcode']);
             Route::put('/items/{itemId}', [OrderController::class, 'updateItem']);
             Route::delete('/items/{itemId}', [OrderController::class, 'removeItem']);
             

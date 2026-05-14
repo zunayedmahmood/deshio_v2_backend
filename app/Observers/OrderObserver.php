@@ -84,8 +84,11 @@ class OrderObserver
         foreach ($order->items as $item) {
             $reserved = ReservedProduct::where('product_id', $item->product_id)->lockForUpdate()->first();
             if ($reserved) {
-                $reserved->decrement('reserved_inventory', $item->quantity);
-                $reserved->increment('available_inventory', $item->quantity);
+                $releaseQty = min((int) $reserved->reserved_inventory, (int) $item->quantity);
+                if ($releaseQty > 0) {
+                    $reserved->decrement('reserved_inventory', $releaseQty);
+                    $reserved->increment('available_inventory', $releaseQty);
+                }
             }
         }
     }

@@ -267,22 +267,35 @@ class ProductController extends Controller
                 $allVariants->where('is_archived', false);
             }
 
-            $allVariants = $allVariants->get()->groupBy('sku');
+            $allVariants = $allVariants->orderBy('stock_quantity', 'desc')->get()->groupBy('sku');
 
+            $finalProducts = collect();
             foreach ($products as $product) {
-                $product->variants = $allVariants->get($product->sku, collect());
-                $product->has_variants = $product->variants->isNotEmpty();
-                $product->variants_count = $product->variants->count() + 1;
-                $product->custom_fields = $this->formatCustomFields($product);
+                $groupVariants = $allVariants->get($product->sku, collect());
                 
-                foreach ($product->variants as $variant) {
+                // Combine and sort by stock_quantity descending
+                // This ensures the variant with the most stock is the representative
+                $sortedGroup = collect([$product])
+                    ->concat($groupVariants)
+                    ->sortByDesc('stock_quantity')
+                    ->values();
+                
+                $main = $sortedGroup->first();
+                $main->variants = $sortedGroup->slice(1)->values();
+                $main->has_variants = $main->variants->isNotEmpty();
+                $main->variants_count = $sortedGroup->count();
+                $main->custom_fields = $this->formatCustomFields($main);
+                
+                foreach ($main->variants as $variant) {
                     $variant->custom_fields = $this->formatCustomFields($variant);
                 }
+                
+                $finalProducts->push($main);
             }
-
+            
             return response()->json([
                 'success' => true,
-                'data' => $pagedGroups->setCollection($products)
+                'data' => $pagedGroups->setCollection($finalProducts)
             ]);
         }
 

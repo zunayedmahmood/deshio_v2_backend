@@ -159,7 +159,7 @@ class ProductBarcodeController extends Controller
     public function createRelabel(Request $request, FloatingBarcodeRelabelService $service)
     {
         $validator = Validator::make($request->all(), [
-            'batch_id' => 'required|exists:product_batches,id',
+            'batch_number' => 'required|exists:product_batches,batch_number',
             'product_id' => 'nullable|exists:products,id',
             'store_id' => 'nullable|exists:stores,id',
             'barcode' => 'nullable|string|max:80|unique:product_barcodes,barcode',
@@ -178,8 +178,12 @@ class ProductBarcodeController extends Controller
         }
 
         try {
+            $validated = $validator->validated();
+            $batch = ProductBatch::where('batch_number', $validated['batch_number'])->first();
+            $validated['batch_id'] = $batch->id;
+
             $relabel = $service->createReplacement(
-                $validator->validated(),
+                $validated,
                 auth('api')->id() ?: auth()->id()
             );
 

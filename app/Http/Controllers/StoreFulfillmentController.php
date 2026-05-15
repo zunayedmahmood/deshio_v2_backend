@@ -63,7 +63,7 @@ class StoreFulfillmentController extends Controller
             foreach ($orders as $order) {
                 $totalItems = $order->items->sum('quantity');
                 $fulfilledItems = $order->items->sum(function($item) {
-                    return !is_null($item->product_barcode_id) ? 1 : 0;
+                    return !is_null($item->product_barcode_id) ? (int) $item->quantity : 0;
                 });
 
                 $order->fulfillment_progress = [
@@ -150,7 +150,7 @@ class StoreFulfillmentController extends Controller
             });
 
             $totalItems = $order->items->sum('quantity');
-            $fulfilledItems = $order->items->sum(fn($item) => !is_null($item->product_barcode_id) ? 1 : 0);
+            $fulfilledItems = $order->items->sum(fn($item) => !is_null($item->product_barcode_id) ? (int) $item->quantity : 0);
 
             return response()->json([
                 'success' => true,
@@ -330,7 +330,7 @@ class StoreFulfillmentController extends Controller
                 $scannedOrderItem->load('barcode', 'batch');
                 $order->load('items');
 
-                $fulfilledItems = $order->items->sum(fn($item) => !is_null($item->product_barcode_id) ? 1 : 0);
+                $fulfilledItems = $order->items->sum(fn($item) => !is_null($item->product_barcode_id) ? (int) $item->quantity : 0);
                 $totalItems = $order->items->sum('quantity');
 
                 return response()->json([

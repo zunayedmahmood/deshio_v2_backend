@@ -761,23 +761,34 @@ class OrderController extends Controller
 
             // Update items if provided (Bulk Update)
             if ($request->filled('items')) {
+                $affectedProductIds = collect();
+                $hasPendingFulfillmentChange = false;
+
                 foreach ($request->items as $itemData) {
                     $item = OrderItem::where('order_id', $order->id)->find($itemData['id']);
                     if (!$item) continue;
 
                     $unitPrice = $itemData['unit_price'] ?? $item->unit_price;
-                    $quantity = $itemData['quantity'] ?? $item->quantity;
+                    $quantity = (int) ($itemData['quantity'] ?? $item->quantity);
                     $discount = $itemData['discount_amount'] ?? $item->discount_amount;
+                    $originalQuantity = (int) $item->quantity;
 
-                    if ($quantity != $item->quantity && $item->product_barcode_id) {
-                        if ($quantity < $item->quantity) {
+                    if ($quantity != $originalQuantity) {
+                        $affectedProductIds->push((int) $item->product_id);
+                    }
+
+                    if ($quantity != $originalQuantity && $item->product_barcode_id) {
+                        if ($quantity < $originalQuantity) {
                             DB::rollBack();
                             return $this->barcodeSelectionRequiredResponse($order, $item);
                         }
 
-                        $increaseBy = $quantity - $item->quantity;
+                        $increaseBy = $quantity - $originalQuantity;
                         $this->addPendingQuantityForScannedItem($order, $item, $increaseBy, (float) $unitPrice);
-                        $quantity = $item->quantity;
+                        $hasPendingFulfillmentChange = true;
+                        $quantity = $originalQuantity;
+                    } else if ($quantity > $originalQuantity && $order->needsFulfillment()) {
+                        $hasPendingFulfillmentChange = true;
                     }
 
                     // Recalculate tax for this item
@@ -794,7 +805,7 @@ class OrderController extends Controller
                     
                     // Reconcile stock if confirmed and already deducted
                     if ($order->isConfirmed() && $item->is_inventory_deducted) {
-                        $qtyDiff = $quantity - $item->quantity;
+                        $qtyDiff = $quantity - $originalQuantity;
                         if ($qtyDiff > 0) {
                             $batch = $item->batch;
                             if ($batch && $batch->quantity >= $qtyDiff) {
@@ -821,12 +832,15 @@ class OrderController extends Controller
                 // Smart status management
                 if (!in_array($order->status, ['confirmed', 'ready_for_shipment', 'shipped', 'delivered', 'completed'])) {
                     $order->status = 'pending';
-                } else if ($request->filled('items')) {
-                    // Check if any item quantity increased or new items might have been added (though addItem is usually separate)
-                    // For now, if items were touched, we might want to re-fulfill if it's a tracked order.
-                    if ($order->needsFulfillment()) {
-                        $order->fulfillment_status = 'pending_fulfillment';
-                    }
+                } else if ($hasPendingFulfillmentChange && $order->needsFulfillment()) {
+                    $order->status = 'pending';
+                    $order->fulfillment_status = 'pending_fulfillment';
+                    $order->fulfilled_at = null;
+                    $order->fulfilled_by = null;
+                }
+
+                foreach ($affectedProductIds->unique()->filter()->values() as $productId) {
+                    app(InventoryReservationService::class)->syncProduct((int) $productId);
                 }
             }
 
@@ -1247,11 +1261,13 @@ class OrderController extends Controller
         DB::beginTransaction();
         try {
             $unitPrice = $request->input('unit_price', $item->unit_price);
-            $newQuantity = $request->input('quantity', $item->quantity);
+            $newQuantity = (int) $request->input('quantity', $item->quantity);
             $discountAmount = $request->input('discount_amount', $item->discount_amount);
+            $originalQuantity = (int) $item->quantity;
+            $quantityIncreasedForFulfillment = false;
 
             if ($request->filled('quantity')) {
-                $diff = $newQuantity - $item->quantity;
+                $diff = $newQuantity - $originalQuantity;
 
                 if ($diff != 0 && $item->product_barcode_id) {
                     if ($diff < 0) {
@@ -1260,7 +1276,8 @@ class OrderController extends Controller
                     }
 
                     $this->addPendingQuantityForScannedItem($order, $item, $diff, (float) $unitPrice);
-                    $newQuantity = $item->quantity;
+                    $quantityIncreasedForFulfillment = true;
+                    $newQuantity = $originalQuantity;
                     $diff = 0;
                 }
 
@@ -1271,6 +1288,10 @@ class OrderController extends Controller
                     
                     if ($available < $diff) {
                         throw new \Exception("Insufficient global stock to increase quantity for '{$item->product_name}'. Available: {$available}, needed: {$diff}");
+                    }
+
+                    if ($order->needsFulfillment()) {
+                        $quantityIncreasedForFulfillment = true;
                     }
                 }
             }
@@ -1292,7 +1313,7 @@ class OrderController extends Controller
             // If the order is already confirmed and inventory was already deducted, 
             // we must reconcile the batch stock immediately for the difference.
             if ($order->isConfirmed() && $item->is_inventory_deducted) {
-                $qtyDiff = $newQuantity - $item->quantity;
+                $qtyDiff = $newQuantity - $originalQuantity;
                 if ($qtyDiff > 0) {
                     // Deduct more
                     $batch = $item->batch;
@@ -1317,12 +1338,16 @@ class OrderController extends Controller
             // Actually, if it's already deducted from batch, we assume it's physical. 
             // But if it needs barcode tracking, this might be tricky without a scan.
             // For now, we allow it but log a warning.
-            if ($order->isConfirmed() && $newQuantity > $item->getOriginal('quantity')) {
+            if ($order->isConfirmed() && $newQuantity > $originalQuantity) {
                 Log::warning("Quantity increased for item {$item->id} on confirmed order {$order->id}. Manual inventory reconciliation performed.");
-                // Mark as pending fulfillment if it's a barcode-tracked order so they scan the additional units.
-                if ($order->needsFulfillment()) {
-                    $order->fulfillment_status = 'pending_fulfillment';
-                }
+            }
+
+            if ($quantityIncreasedForFulfillment && $order->needsFulfillment()) {
+                $order->status = 'pending';
+                $order->fulfillment_status = 'pending_fulfillment';
+                $order->fulfilled_at = null;
+                $order->fulfilled_by = null;
+                $order->save();
             }
 
             $order->calculateTotals();

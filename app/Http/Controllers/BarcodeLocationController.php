@@ -901,13 +901,19 @@ class BarcodeLocationController extends Controller
 
         $barcodes = $query->get();
 
-        // Summary
+        // Summary: physical stock comes from product_batches.quantity. Barcode identities can be higher
+        // when floating relabels exist, so expose both numbers explicitly.
+        $saleableBarcodeCount = $barcodes->filter(fn($b) => $b->isAvailableForSale())->count();
         $summary = [
-            'total_units' => $barcodes->count(),
+            'total_units' => (int)$batch->quantity,
+            'physical_stock_quantity' => (int)$batch->quantity,
+            'barcode_identities' => $barcodes->count(),
             'active' => $barcodes->where('is_active', true)->count(),
-            'available_for_sale' => $barcodes->filter(fn($b) => $b->isAvailableForSale())->count(),
+            'available_for_sale' => min((int)$batch->quantity, $saleableBarcodeCount),
+            'saleable_barcode_identities' => $saleableBarcodeCount,
             'sold' => $barcodes->where('current_status', 'with_customer')->count(),
             'defective' => $barcodes->where('is_defective', true)->count(),
+            'open_replacement_barcodes' => $barcodes->filter(fn($b) => $b->is_replacement && $b->replacement_status === 'open')->count(),
         ];
 
         // Status breakdown
@@ -964,6 +970,9 @@ class BarcodeLocationController extends Controller
                         'is_active' => $barcode->is_active,
                         'is_defective' => $barcode->is_defective,
                         'is_available_for_sale' => $barcode->isAvailableForSale(),
+                        'is_replacement' => $barcode->is_replacement,
+                        'replacement_status' => $barcode->replacement_status,
+                        'relabel_reason' => $barcode->relabel_reason,
                         'location_updated_at' => $barcode->location_updated_at,
                     ];
                 })

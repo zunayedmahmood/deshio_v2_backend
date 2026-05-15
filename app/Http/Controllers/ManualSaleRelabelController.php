@@ -93,7 +93,7 @@ class ManualSaleRelabelController extends Controller
             ]);
 
             // 3. Process items with automatic relabelling
-            foreach ($request->items as $itemData) {
+            foreach ($request->input('items', []) as $itemData) {
                 $product = Product::findOrFail($itemData['product_id']);
                 $batch = ProductBatch::findOrFail($itemData['batch_id']);
                 $quantity = (int)$itemData['quantity'];
@@ -117,6 +117,10 @@ class ManualSaleRelabelController extends Controller
 
                 // Determine if we need to relabel
                 if (!empty($itemData['barcode'])) {
+                    if ($quantity !== 1) {
+                        throw new \Exception("A scanned barcode can only represent one unit for {$product->name}.");
+                    }
+
                     $barcode = ProductBarcode::where('barcode', $itemData['barcode'])
                         ->where('product_id', $product->id)
                         ->where('batch_id', $batch->id)
@@ -128,7 +132,7 @@ class ManualSaleRelabelController extends Controller
 
                     $this->relabelService->validateBarcodeCanBeSold($barcode, $order);
 
-                    $taxCalculation = $this->calculateTax($unitPrice, $quantity, $taxPercentage);
+                    $taxCalculation = $this->calculateTax($unitPrice, 1, $taxPercentage);
                     $tax = $taxCalculation['total_tax'];
 
                     OrderItem::create([
@@ -138,12 +142,12 @@ class ManualSaleRelabelController extends Controller
                         'product_barcode_id' => $barcode->id,
                         'product_name' => $product->name,
                         'product_sku' => $product->sku,
-                        'quantity' => $quantity,
+                        'quantity' => 1,
                         'unit_price' => $unitPrice,
                         'discount_amount' => $itemData['discount_amount'] ?? 0,
                         'tax_amount' => $tax,
-                        'cogs' => round(($batch->cost_price ?? 0) * $quantity, 2),
-                        'total_amount' => ($unitPrice * $quantity) - ($itemData['discount_amount'] ?? 0),
+                        'cogs' => round(($batch->cost_price ?? 0), 2),
+                        'total_amount' => $unitPrice - ($itemData['discount_amount'] ?? 0),
                     ]);
                 } else {
                     // Split into individual units for relabelling
@@ -184,7 +188,7 @@ class ManualSaleRelabelController extends Controller
 
             // 4. Process services
             if ($request->filled('services')) {
-                foreach ($request->services as $serviceData) {
+                foreach ($request->input('services', []) as $serviceData) {
                     $service = Service::findOrFail($serviceData['service_id']);
                     
                     $qty = $serviceData['quantity'];
@@ -254,13 +258,13 @@ class ManualSaleRelabelController extends Controller
             },
             'status' => $order->status,
             'payment_status' => $order->payment_status,
-            'customer' => [
+            'customer' => $order->customer ? [
                 'id' => $order->customer->id,
                 'name' => $order->customer->name,
                 'phone' => $order->customer->phone,
                 'email' => $order->customer->email,
                 'customer_code' => $order->customer->customer_code,
-            ],
+            ] : null,
             'store' => $order->store ? [
                 'id' => $order->store->id,
                 'name' => $order->store->name,

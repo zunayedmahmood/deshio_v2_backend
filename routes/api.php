@@ -40,6 +40,7 @@ use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\BusinessAnalyticsController;
 use App\Http\Controllers\StockIntelligenceController;
 use App\Http\Controllers\ExchangeController;
+use App\Http\Controllers\ManualSaleRelabelController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -1399,6 +1400,9 @@ Route::middleware('auth:api')->group(function () {
     Route::get('/vendors/analytics', [VendorController::class, 'getAllVendorsAnalytics']);
     Route::get('/vendors/{id}/purchase-history', [VendorController::class, 'getPurchaseHistory']);
     Route::get('/vendors/{id}/payment-history', [VendorController::class, 'getPaymentHistory']);
+
+    // Manual POS sale with automatic relabelling
+    Route::post('/manual-relabel-sale', [ManualSaleRelabelController::class, 'create']);
 
     // Product Batch Management Routes
     Route::prefix('batches')->group(function () {

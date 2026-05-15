@@ -42,6 +42,7 @@ use App\Http\Controllers\StockIntelligenceController;
 use App\Http\Controllers\ExchangeController;
 use App\Http\Controllers\ManualSaleRelabelController;
 use App\Http\Controllers\HomepageSectionController;
+use App\Http\Controllers\SettingController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -158,6 +159,7 @@ Route::prefix('promotions')->group(function () {
 // ============================================
 
 Route::prefix('catalog')->group(function () {
+    Route::get('/homepage-settings', [SettingController::class, 'getHomepageSettings']);
     Route::get('/products', [\App\Http\Controllers\EcommerceCatalogController::class, 'getProducts']);
     Route::get('/products/{identifier}', [\App\Http\Controllers\EcommerceCatalogController::class, 'getProduct']);
     Route::get('/categories', [\App\Http\Controllers\EcommerceCatalogController::class, 'getCategories']);
@@ -283,6 +285,11 @@ Route::get('/payment-methods/all', [PaymentController::class, 'getAllPaymentMeth
 
 // Auth routes (protected)
 Route::middleware('auth:api')->group(function () {
+    Route::prefix('settings')->group(function () {
+        Route::get('/homepage', [SettingController::class, 'getAdminHomepageSettings']);
+        Route::post('/homepage', [SettingController::class, 'updateHomepageSettings']);
+    });
+
     Route::post('/logout', [AuthController::class, 'logout']);
     Route::post('/refresh', [AuthController::class, 'refresh']);
     Route::get('/me', [AuthController::class, 'me']);

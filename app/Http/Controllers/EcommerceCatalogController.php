@@ -662,7 +662,9 @@ class EcommerceCatalogController extends Controller
                 'name' => $category->title,
                 'slug' => $category->slug,
                 'description' => $category->description,
-                'image_url' => $category->image_url,
+                'image_url' => $category->thumbnail_url ?: $category->image_url,
+                'thumbnail_url' => $category->thumbnail_url,
+                'banner_url' => $category->banner_url,
                 'product_count' => $category->products()->count(),
             ];
 

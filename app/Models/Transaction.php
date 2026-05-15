@@ -678,8 +678,22 @@ class Transaction extends Model
                 'status' => $status,
             ]);
         } elseif ($netDifference < 0) {
-            // Scenario C: New item less expensive, store refunds the difference
+            // Scenario C: New item less expensive, store refunds or issues store credit for the difference.
             $refundDiff = abs($netDifference);
+            $exchangeRefunds = Refund::query()
+                ->where('return_id', $productReturn->id)
+                ->where('refund_type', 'exchange_refund')
+                ->get();
+            $cashRefundAmount = (float) $exchangeRefunds
+                ->where('refund_method', '!=', 'store_credit')
+                ->sum('refund_amount');
+            $storeCreditAmount = (float) $exchangeRefunds
+                ->where('refund_method', 'store_credit')
+                ->sum('refund_amount');
+
+            if ($cashRefundAmount <= 0 && $storeCreditAmount <= 0) {
+                $cashRefundAmount = $refundDiff;
+            }
 
             // Debit Sales Revenue (revenue reduced)
             static::create([
@@ -692,24 +706,44 @@ class Transaction extends Model
                 'description' => "Exchange Revenue Reduction (Price Downgrade) - {$productReturn->return_number}",
                 'store_id' => $storeId,
                 'created_by' => auth()->id(),
-                'metadata' => $metadata,
+                'metadata' => array_merge($metadata, [
+                    'cash_refund_amount' => $cashRefundAmount,
+                    'store_credit_amount' => $storeCreditAmount,
+                ]),
                 'status' => $status,
             ]);
 
-            // Credit Cash (money out - store owes customer the difference)
-            static::create([
-                'transaction_date' => $transactionDate,
-                'amount' => $refundDiff,
-                'type' => 'credit',
-                'account_id' => $cashAccountId,
-                'reference_type' => \App\Models\ProductReturn::class,
-                'reference_id' => $productReturn->id,
-                'description' => "Exchange Refund (Cash Out) - {$productReturn->return_number}",
-                'store_id' => $storeId,
-                'created_by' => auth()->id(),
-                'metadata' => $metadata,
-                'status' => $status,
-            ]);
+            if ($cashRefundAmount > 0) {
+                static::create([
+                    'transaction_date' => $transactionDate,
+                    'amount' => $cashRefundAmount,
+                    'type' => 'credit',
+                    'account_id' => $cashAccountId,
+                    'reference_type' => \App\Models\ProductReturn::class,
+                    'reference_id' => $productReturn->id,
+                    'description' => "Exchange Refund (Cash Out) - {$productReturn->return_number}",
+                    'store_id' => $storeId,
+                    'created_by' => auth()->id(),
+                    'metadata' => $metadata,
+                    'status' => $status,
+                ]);
+            }
+
+            if ($storeCreditAmount > 0) {
+                static::create([
+                    'transaction_date' => $transactionDate,
+                    'amount' => $storeCreditAmount,
+                    'type' => 'credit',
+                    'account_id' => static::getStoreCreditLiabilityAccountId(),
+                    'reference_type' => \App\Models\ProductReturn::class,
+                    'reference_id' => $productReturn->id,
+                    'description' => "Exchange Store Credit Issued - {$productReturn->return_number}",
+                    'store_id' => $storeId,
+                    'created_by' => auth()->id(),
+                    'metadata' => $metadata,
+                    'status' => $status,
+                ]);
+            }
         }
         // Scenario A (even): No cash/revenue entries needed
     }
@@ -1083,6 +1117,32 @@ class Transaction extends Model
             ]);
         }
         
+        return $account->id;
+    }
+
+    public static function getStoreCreditLiabilityAccountId(): ?int
+    {
+        $account = Account::where('type', 'liability')
+            ->where(function ($q) {
+                $instance = new static;
+                $instance->whereLike($q, 'name', 'Store Credit');
+                $instance->orWhereLike($q, 'name', 'Customer Credit');
+                $q->orWhere('account_code', '2003');
+            })
+            ->where('is_active', true)
+            ->first();
+
+        if (!$account) {
+            $account = Account::create([
+                'account_code' => '2003',
+                'name' => 'Store Credit Payable',
+                'type' => 'liability',
+                'sub_type' => 'current_liability',
+                'description' => 'Store credits owed to customers',
+                'is_active' => true,
+            ]);
+        }
+
         return $account->id;
     }
 

@@ -15,6 +15,8 @@ class Category extends Model
         'title',
         'description',
         'image',
+        'thumbnail_image',
+        'banner_image',
         'color',
         'icon',
         'slug',
@@ -33,6 +35,8 @@ class Category extends Model
 
     protected $appends = [
         'image_url',
+        'thumbnail_url',
+        'banner_url',
     ];
 
     // Boot method to auto-update level and path
@@ -190,8 +194,24 @@ class Category extends Model
     public function getImageUrlAttribute()
     {
         if ($this->image) {
+            if (filter_var($this->image, FILTER_VALIDATE_URL)) return $this->image;
             return asset('storage/' . $this->image);
         }
         return null;
+    }
+
+    public function getThumbnailUrlAttribute()
+    {
+        $path = $this->thumbnail_image ?: $this->image;
+        if (!$path) return null;
+        if (filter_var($path, FILTER_VALIDATE_URL)) return $path;
+        return asset('storage/' . $path);
+    }
+
+    public function getBannerUrlAttribute()
+    {
+        if (!$this->banner_image) return null;
+        if (filter_var($this->banner_image, FILTER_VALIDATE_URL)) return $this->banner_image;
+        return asset('storage/' . $this->banner_image);
     }
 }

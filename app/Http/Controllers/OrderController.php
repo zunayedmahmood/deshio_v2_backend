@@ -240,7 +240,7 @@ class OrderController extends Controller
             'customer.address' => 'nullable|string',
             'store_id' => 'nullable|exists:stores,id',  // Required for counter, optional for social_commerce/ecommerce
             'salesman_id' => 'nullable|exists:employees,id',  // Manual salesman entry for POS
-            'items' => 'required|array|min:1',
+            'items' => 'nullable|array',
             'items.*.product_id' => 'required|exists:products,id',
             'items.*.batch_id' => 'nullable|exists:product_batches,id',  // Optional for pre-orders
             'items.*.barcode' => 'nullable|string|exists:product_barcodes,barcode',  // Optional barcode for tracking
@@ -265,6 +265,12 @@ class OrderController extends Controller
             'installment_plan.installment_amount' => 'required_with:installment_plan|numeric|min:0.01',
             'installment_plan.start_date' => 'nullable|date',
         ]);
+
+        $validator->after(function ($validator) use ($request) {
+            if (count((array) $request->input('items', [])) === 0 && count((array) $request->input('services', [])) === 0) {
+                $validator->errors()->add('items', 'At least one product or service is required.');
+            }
+        });
 
         if ($validator->fails()) {
             return response()->json([
@@ -373,20 +379,22 @@ class OrderController extends Controller
 
             $actorId = (int) Auth::id();
 
+            $hasProductItems = count((array) $request->input('items', [])) > 0;
+            $hasServiceItems = count((array) $request->input('services', [])) > 0;
+            $isServiceOnlySocialOrder = $request->order_type === 'social_commerce' && !$hasProductItems && $hasServiceItems;
+
             // Determine fulfillment status based on order type
             // Counter orders: immediate fulfillment (barcode scanned at POS)
-            // Social/Ecommerce: deferred fulfillment (warehouse scans barcodes later)
+            // Social/Ecommerce product orders: deferred fulfillment (warehouse scans barcodes later)
+            // Service-only social orders do not need package scanning.
             $fulfillmentStatus = null;
-            if (in_array($request->order_type, ['social_commerce', 'ecommerce'])) {
+            if (in_array($request->order_type, ['social_commerce', 'ecommerce']) && !$isServiceOnlySocialOrder) {
                 $fulfillmentStatus = 'pending_fulfillment';
             }
 
-            // Determine initial order status
-            // Business rule: every newly placed order must appear as Pending.
-            // Store assignment / fulfillment progress is tracked separately through
-            // store_id and fulfillment_status. After packing/completion, complete()
-            // changes this to Confirmed.
-            $initialStatus = 'pending';
+            // Product orders start Pending. Service-only social orders get their own status
+            // so they can be filtered separately and do not appear in package workflows.
+            $initialStatus = $isServiceOnlySocialOrder ? 'service_only' : 'pending';
 
             // Create order
             $order = Order::create([
@@ -448,7 +456,7 @@ class OrderController extends Controller
             $totalItemDiscount = 0;
             $hasPreOrderItems = false;  // Track if any items don't have batches
 
-            foreach ($request->items as $itemData) {
+            foreach ((array) $request->input('items', []) as $itemData) {
                 $product = Product::findOrFail($itemData['product_id']);
                 
                 // Batch is optional for pre-orders
@@ -576,8 +584,8 @@ class OrderController extends Controller
             }
 
             // Add services
-            if ($request->filled('services')) {
-                foreach ($request->services as $serviceData) {
+            if (count((array) $request->input('services', [])) > 0) {
+                foreach ((array) $request->input('services', []) as $serviceData) {
                     $service = Service::findOrFail($serviceData['service_id']);
                     
                     $qty = $serviceData['quantity'];
@@ -651,6 +659,7 @@ class OrderController extends Controller
                     'salesman',
                     'items.product',
                     'items.batch',
+                    'serviceItems.service',
                     'payments.paymentMethod'
                 ]), true)
             ], 201);
@@ -693,7 +702,7 @@ class OrderController extends Controller
         }
 
         // Only allow updates for pending/confirmed orders
-        if (!in_array($order->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking', 'ready_for_shipment'])) {
+        if (!in_array($order->status, ['pending', 'pending_assignment', 'confirmed', 'assigned_to_store', 'picking', 'ready_for_shipment', 'service_only'])) {
             return response()->json([
                 'success' => false,
                 'message' => 'Cannot update order in current status: ' . $order->status
@@ -896,6 +905,11 @@ class OrderController extends Controller
                 }
                 
                 $order->calculateTotals();
+            }
+
+            if ($order->order_type === 'social_commerce' && $order->items()->count() === 0 && $order->serviceItems()->count() > 0) {
+                $order->status = 'service_only';
+                $order->fulfillment_status = null;
             }
 
             $order->save();
@@ -2127,6 +2141,7 @@ class OrderController extends Controller
             'is_installment' => $order->is_installment_payment,
             'order_date' => $order->order_date->format('Y-m-d H:i:s'),
             'created_at' => $order->created_at->format('Y-m-d H:i:s'),
+            'updated_at' => $order->updated_at->format('Y-m-d H:i:s'),
         ];
 
         if ($detailed) {

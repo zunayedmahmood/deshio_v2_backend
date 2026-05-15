@@ -329,69 +329,78 @@ class ExchangeController extends Controller
 
 
             // --- 3. FINANCIAL SETTLEMENT ---
-            $exchangeBalanceUsed = min($totalReturnValue, $totalAmount);
-            
-            // 3a. Use "Exchange Balance" payment method
-            $exchangeMethod = PaymentMethod::where('code', 'exchange_balance')->first();
-            if (!$exchangeMethod) {
-                // Fallback or dynamic creation if needed, but per GEMINI.md, system should have it.
-                // For now, let's assume it exists or use 'other'
-                $exchangeMethod = PaymentMethod::where('code', 'other')->first();
-            }
+            $exchangeBalanceUsed = round(min($totalReturnValue, $totalAmount), 2);
+            $surplusDue = round(max(0, $totalAmount - $totalReturnValue), 2);
+            $refundDue = round(max(0, $totalReturnValue - $totalAmount), 2);
+            $settlementAmount = round((float) ($request->paymentRefund['amount'] ?? 0), 2);
+            $settlementMethodCode = $request->paymentRefund['method'] ?? 'cash';
 
             if ($exchangeBalanceUsed > 0) {
+                $exchangeMethod = $this->getOrCreatePaymentMethod('exchange_balance', 'Exchange Balance', 'other');
                 $payment = OrderPayment::createPayment(
                     $replacementOrder,
                     $exchangeMethod,
                     $exchangeBalanceUsed,
                     [
                         'notes' => "Exchange Credit from Return #{$returnNumber}",
-                        'payment_type' => 'exchange_balance' // Handled by observer exclusion
+                        'payment_type' => 'exchange_balance'
                     ],
                     $employee
                 );
                 $payment->complete('EXC-' . $returnNumber, 'INTERNAL');
             }
 
-            // 3b. Handle Surplus (Customer pays extra)
-            if ($request->paymentRefund['type'] === 'surplus' && $request->paymentRefund['amount'] > 0) {
-                $surplusMethodCode = $request->paymentRefund['method'] ?? 'cash';
-                $surplusMethod = PaymentMethod::where('code', $surplusMethodCode)->first();
-                if (!$surplusMethod) $surplusMethod = PaymentMethod::where('code', 'cash')->first();
+            // 3b. Handle surplus: replacement is more expensive, customer pays only the difference.
+            if ($surplusDue > 0) {
+                if ($settlementAmount < $surplusDue) {
+                    throw new \Exception("Exchange surplus payment is short by ৳" . number_format($surplusDue - $settlementAmount, 2));
+                }
 
-                $payment = OrderPayment::createPayment(
-                    $replacementOrder,
-                    $surplusMethod,
-                    (float)$request->paymentRefund['amount'],
-                    [
-                        'notes' => "Surplus payment for exchange",
-                        'payment_type' => 'exchange_surplus' // Silences OrderPaymentObserver for ledger
-                    ],
-                    $employee
-                );
-                $payment->complete('EXC-SUR-' . $returnNumber, 'EXTERNAL');
+                $surplusPaid = round(min($settlementAmount, $surplusDue), 2);
+                if ($surplusPaid > 0) {
+                    $surplusMethod = $this->findPaymentMethodForExchange($settlementMethodCode);
+                    $payment = OrderPayment::createPayment(
+                        $replacementOrder,
+                        $surplusMethod,
+                        $surplusPaid,
+                        [
+                            'notes' => "Surplus payment for exchange",
+                            'payment_type' => 'exchange_surplus'
+                        ],
+                        $employee
+                    );
+                    $payment->complete('EXC-SUR-' . $returnNumber, 'EXTERNAL');
+                }
             }
 
-            // 3c. Handle Refund (Store pays back)
-            if ($request->paymentRefund['type'] === 'refund' && $request->paymentRefund['amount'] > 0) {
-                $refundMethodCode = $request->paymentRefund['method'] ?? 'cash';
-                
-                $refund = Refund::create([
-                    'refund_number' => 'REF-EXC-' . date('Ymd') . '-' . Str::random(4),
-                    'return_id' => $productReturn->id,
-                    'order_id' => null, // This refund is from the return value difference
-                    'customer_id' => $customer_id,
-                    'refund_type' => 'exchange_refund', // Silences RefundObserver for ledger
-                    'original_amount' => $totalReturnValue,
-                    'refund_amount' => (float)$request->paymentRefund['amount'],
-                    'refund_method' => $refundMethodCode,
-                    'status' => 'completed', // In-person exchange typically means immediate refund
-                    'processed_by' => $employee->id,
-                    'approved_by' => $employee->id,
-                    'completed_at' => now(),
-                ]);
+            // 3c. Handle refund/credit: replacement is less expensive, store owes the difference.
+            if ($refundDue > 0) {
+                $immediateRefund = round(min($settlementAmount, $refundDue), 2);
+                $storeCreditAmount = round($refundDue - $immediateRefund, 2);
 
-                // Note: Ledger entry for refund is handled by Transaction::createFromExchange below
+                if ($immediateRefund > 0) {
+                    $this->createExchangeRefund(
+                        $productReturn,
+                        $originalOrder ?: $replacementOrder,
+                        $customer_id,
+                        $totalReturnValue,
+                        $immediateRefund,
+                        $this->normalizeRefundMethod($settlementMethodCode),
+                        $employee
+                    );
+                }
+
+                if ($storeCreditAmount > 0) {
+                    $this->createExchangeRefund(
+                        $productReturn,
+                        $originalOrder ?: $replacementOrder,
+                        $customer_id,
+                        $totalReturnValue,
+                        $storeCreditAmount,
+                        'store_credit',
+                        $employee
+                    );
+                }
             }
 
             // Final Order Update
@@ -421,7 +430,7 @@ class ExchangeController extends Controller
                 'success' => true,
                 'message' => 'Exchange processed successfully.',
                 'data' => [
-                    'return' => $productReturn->load('customer'),
+                    'return' => $productReturn->load(['customer', 'refunds']),
                     'order' => $replacementOrder->load('items'),
                 ]
             ]);
@@ -438,6 +447,96 @@ class ExchangeController extends Controller
                 'message' => 'Exchange failed: ' . $e->getMessage()
             ], 500);
         }
+    }
+
+    private function getOrCreatePaymentMethod(string $code, string $name, string $type = 'other'): PaymentMethod
+    {
+        return PaymentMethod::firstOrCreate(
+            ['code' => $code],
+            [
+                'name' => $name,
+                'description' => $name . ' for exchange settlement',
+                'type' => $type,
+                'allowed_customer_types' => ['counter', 'social_commerce', 'ecommerce'],
+                'is_active' => true,
+                'requires_reference' => false,
+                'supports_partial' => true,
+                'fixed_fee' => 0,
+                'percentage_fee' => 0,
+                'sort_order' => 90,
+            ]
+        );
+    }
+
+    private function findPaymentMethodForExchange(?string $methodCode): PaymentMethod
+    {
+        $methodCode = strtolower(trim((string) $methodCode));
+        $mappedCode = match ($methodCode) {
+            'bkash', 'bikash', 'nagad', 'rocket', 'mobile', 'mobile_banking' => 'mobile_banking',
+            'card', 'cash', 'bank_transfer', 'online_banking', 'digital_wallet' => $methodCode,
+            default => 'cash',
+        };
+
+        $method = PaymentMethod::where('code', $mappedCode)->first();
+        if ($method) {
+            return $method;
+        }
+
+        if ($mappedCode === 'cash') {
+            return $this->getOrCreatePaymentMethod('cash', 'Cash', 'cash');
+        }
+
+        $fallback = PaymentMethod::where('code', 'cash')->first();
+        return $fallback ?: $this->getOrCreatePaymentMethod('cash', 'Cash', 'cash');
+    }
+
+    private function normalizeRefundMethod(?string $methodCode): string
+    {
+        return match (strtolower(trim((string) $methodCode))) {
+            'cash' => 'cash',
+            'card', 'card_refund' => 'card_refund',
+            'bank_transfer' => 'bank_transfer',
+            'bkash', 'bikash', 'nagad', 'rocket', 'mobile_banking', 'digital_wallet' => 'digital_wallet',
+            'store_credit' => 'store_credit',
+            default => 'cash',
+        };
+    }
+
+    private function createExchangeRefund(
+        ProductReturn $productReturn,
+        Order $order,
+        int $customerId,
+        float $originalAmount,
+        float $refundAmount,
+        string $refundMethod,
+        $employee
+    ): Refund {
+        $refund = Refund::create([
+            'refund_number' => 'REF-EXC-' . date('Ymd') . '-' . Str::random(4),
+            'return_id' => $productReturn->id,
+            'order_id' => $order->id,
+            'customer_id' => $customerId,
+            'refund_type' => 'exchange_refund',
+            'original_amount' => $originalAmount,
+            'refund_amount' => $refundAmount,
+            'refund_method' => $refundMethod,
+            'status' => 'completed',
+            'processed_by' => $employee->id,
+            'approved_by' => $employee->id,
+            'completed_at' => now(),
+            'store_credit_expires_at' => $refundMethod === 'store_credit' ? now()->addYear() : null,
+            'internal_notes' => $refundMethod === 'store_credit'
+                ? 'Store credit generated from exchange price difference.'
+                : 'Immediate refund generated from exchange price difference.',
+        ]);
+
+        if ($refundMethod === 'store_credit') {
+            $refund->store_credit_code = $refund->generateStoreCreditCode();
+            $refund->save();
+            $this->getOrCreatePaymentMethod('store_credit', 'Store Credit', 'other');
+        }
+
+        return $refund;
     }
 
     private function generateReturnNumber(): string

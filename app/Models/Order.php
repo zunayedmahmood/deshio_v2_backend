@@ -577,7 +577,7 @@ class Order extends Model
 
     public function needsFulfillment(): bool
     {
-        return in_array($this->order_type, ['social_commerce', 'ecommerce']);
+        return in_array($this->order_type, ['social_commerce', 'ecommerce']) && $this->status !== 'service_only';
     }
 
     public function isPaid(): bool

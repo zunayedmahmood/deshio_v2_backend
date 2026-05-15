@@ -7,17 +7,47 @@ use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Validation\Rule;
 
 class CategoriesController extends Controller
 {
     use DatabaseAgnosticSearch;
+    private function storeCategoryImage(Request $request, string $field, string $folder, string $title): ?string
+    {
+        if ($request->hasFile($field)) {
+            $image = $request->file($field);
+            $imageName = time() . '_' . $field . '_' . Str::slug($title) . '.' . $image->getClientOriginalExtension();
+            return $image->storeAs($folder, $imageName, 'public');
+        }
+
+        $value = $request->input($field);
+        if (is_string($value) && trim($value) !== '') {
+            return trim($value);
+        }
+
+        return null;
+    }
+
+    private function deleteStoredCategoryImage(?string $path): void
+    {
+        if (!$path || filter_var($path, FILTER_VALIDATE_URL)) return;
+        Storage::disk('public')->delete($path);
+    }
+
+    private function clearCategoryCache(): void
+    {
+        Cache::forget('ecommerce_categories_tree');
+    }
+
     public function createCategory(Request $request)
     {
         $validated = $request->validate([
             'title' => 'required|string|max:255',
             'description' => 'nullable|string',
-            'image' => 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:2048', // max 2MB
+            'image' => $request->hasFile('image') ? 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:2048' : 'nullable|string|max:2048',
+            'thumbnail_image' => $request->hasFile('thumbnail_image') ? 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:2048' : 'nullable|string|max:2048',
+            'banner_image' => $request->hasFile('banner_image') ? 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:5120' : 'nullable|string|max:2048',
             'color' => 'nullable|string|max:7', // hex color
             'icon' => 'nullable|string|max:100',
             'order' => 'nullable|integer|min:0',
@@ -35,12 +65,15 @@ class CategoriesController extends Controller
             }
         }
 
-        // Handle image upload
-        if ($request->hasFile('image')) {
-            $image = $request->file('image');
-            $imageName = time() . '_' . Str::slug($validated['title']) . '.' . $image->getClientOriginalExtension();
-            $imagePath = $image->storeAs('categories', $imageName, 'public');
+        // Handle image uploads / URL fields
+        if ($imagePath = $this->storeCategoryImage($request, 'image', 'categories', $validated['title'])) {
             $validated['image'] = $imagePath;
+        }
+        if ($thumbnailPath = $this->storeCategoryImage($request, 'thumbnail_image', 'categories/thumbnails', $validated['title'])) {
+            $validated['thumbnail_image'] = $thumbnailPath;
+        }
+        if ($bannerPath = $this->storeCategoryImage($request, 'banner_image', 'categories/banners', $validated['title'])) {
+            $validated['banner_image'] = $bannerPath;
         }
 
         // Generate slug from title if not provided
@@ -57,6 +90,7 @@ class CategoriesController extends Controller
         }
 
         $category = Category::create($validated);
+        $this->clearCategoryCache();
 
         // Load relationships
         $category->load('parent', 'children');
@@ -75,8 +109,12 @@ class CategoriesController extends Controller
         $validated = $request->validate([
             'title' => 'sometimes|required|string|max:255',
             'description' => 'nullable|string',
-            'image' => 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:2048', // max 2MB
+            'image' => $request->hasFile('image') ? 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:2048' : 'nullable|string|max:2048',
+            'thumbnail_image' => $request->hasFile('thumbnail_image') ? 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:2048' : 'nullable|string|max:2048',
+            'banner_image' => $request->hasFile('banner_image') ? 'nullable|image|mimes:jpeg,png,jpg,gif,webp|max:5120' : 'nullable|string|max:2048',
             'remove_image' => 'nullable|boolean', // flag to remove existing image
+            'remove_thumbnail' => 'nullable|boolean',
+            'remove_banner' => 'nullable|boolean',
             'color' => 'nullable|string|max:7',
             'icon' => 'nullable|string|max:100',
             'order' => 'nullable|integer|min:0',
@@ -103,24 +141,32 @@ class CategoriesController extends Controller
         }
 
         // Handle image removal
-        if ($request->has('remove_image') && $request->remove_image == true) {
-            if ($category->image) {
-                \Storage::disk('public')->delete($category->image);
-                $validated['image'] = null;
-            }
+        if ($request->boolean('remove_image')) {
+            $this->deleteStoredCategoryImage($category->image);
+            $validated['image'] = null;
+        }
+        if ($request->boolean('remove_thumbnail')) {
+            $this->deleteStoredCategoryImage($category->thumbnail_image);
+            $validated['thumbnail_image'] = null;
+        }
+        if ($request->boolean('remove_banner')) {
+            $this->deleteStoredCategoryImage($category->banner_image);
+            $validated['banner_image'] = null;
         }
 
-        // Handle new image upload
-        if ($request->hasFile('image')) {
-            // Delete old image if exists
-            if ($category->image) {
-                \Storage::disk('public')->delete($category->image);
-            }
-            
-            $image = $request->file('image');
-            $imageName = time() . '_' . Str::slug($validated['title'] ?? $category->title) . '.' . $image->getClientOriginalExtension();
-            $imagePath = $image->storeAs('categories', $imageName, 'public');
-            $validated['image'] = $imagePath;
+        // Handle new image uploads / URL fields
+        $imageTitle = $validated['title'] ?? $category->title;
+        if ($request->hasFile('image') || (is_string($request->input('image')) && trim($request->input('image')) !== '')) {
+            $this->deleteStoredCategoryImage($category->image);
+            $validated['image'] = $this->storeCategoryImage($request, 'image', 'categories', $imageTitle);
+        }
+        if ($request->hasFile('thumbnail_image') || (is_string($request->input('thumbnail_image')) && trim($request->input('thumbnail_image')) !== '')) {
+            $this->deleteStoredCategoryImage($category->thumbnail_image);
+            $validated['thumbnail_image'] = $this->storeCategoryImage($request, 'thumbnail_image', 'categories/thumbnails', $imageTitle);
+        }
+        if ($request->hasFile('banner_image') || (is_string($request->input('banner_image')) && trim($request->input('banner_image')) !== '')) {
+            $this->deleteStoredCategoryImage($category->banner_image);
+            $validated['banner_image'] = $this->storeCategoryImage($request, 'banner_image', 'categories/banners', $imageTitle);
         }
 
         // Update slug if title changed
@@ -136,6 +182,7 @@ class CategoriesController extends Controller
         }
 
         $category->update($validated);
+        $this->clearCategoryCache();
 
         // Load relationships
         $category->load('parent', 'children');
@@ -169,6 +216,7 @@ class CategoriesController extends Controller
 
         // Soft delete by setting is_active to false
         $category->update(['is_active' => false]);
+        $this->clearCategoryCache();
 
         return response()->json([
             'success' => true,
@@ -181,6 +229,7 @@ class CategoriesController extends Controller
         $category = Category::findOrFail($id);
 
         $category->update(['is_active' => true]);
+        $this->clearCategoryCache();
 
         return response()->json([
             'success' => true,
@@ -202,6 +251,7 @@ class CategoriesController extends Controller
         }
 
         $category->update(['is_active' => false]);
+        $this->clearCategoryCache();
 
         return response()->json([
             'success' => true,
@@ -338,6 +388,7 @@ class CategoriesController extends Controller
 
         $count = Category::whereIn('id', $validated['category_ids'])
             ->update(['is_active' => $validated['is_active']]);
+        $this->clearCategoryCache();
 
         return response()->json([
             'success' => true,
@@ -357,6 +408,7 @@ class CategoriesController extends Controller
             Category::where('id', $categoryData['id'])
                 ->update(['order' => $categoryData['order']]);
         }
+        $this->clearCategoryCache();
 
         return response()->json([
             'success' => true,
@@ -448,6 +500,7 @@ class CategoriesController extends Controller
         }
 
         $category->update(['parent_id' => $validated['new_parent_id']]);
+        $this->clearCategoryCache();
         $category->load('parent', 'children');
 
         return response()->json([
@@ -514,14 +567,15 @@ class CategoriesController extends Controller
             ], 400);
         }
 
-        // Delete image if exists
-        if ($category->image && Storage::disk('public')->exists($category->image)) {
-            Storage::disk('public')->delete($category->image);
-        }
+        // Delete images if exist
+        $this->deleteStoredCategoryImage($category->image);
+        $this->deleteStoredCategoryImage($category->thumbnail_image);
+        $this->deleteStoredCategoryImage($category->banner_image);
 
         // Permanently delete the category
         $categoryTitle = $category->title;
         $category->forceDelete();
+        $this->clearCategoryCache();
 
         return response()->json([
             'success' => true,

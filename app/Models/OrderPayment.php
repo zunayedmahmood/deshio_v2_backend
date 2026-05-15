@@ -501,6 +501,9 @@ class OrderPayment extends Model
         $fee = $paymentMethod->calculateFee($amount);
         $netAmount = $amount - $fee;
 
+        $paymentType = $paymentData['payment_type'] ?? null;
+        unset($paymentData['payment_type']);
+
         return static::create([
             'order_id' => $order->id,
             'payment_method_id' => $paymentMethod->id,
@@ -510,7 +513,9 @@ class OrderPayment extends Model
             'amount' => $amount,
             'fee_amount' => $fee,
             'net_amount' => $netAmount,
+            'payment_type' => $paymentType ?: 'full',
             'payment_data' => $paymentData,
+            'notes' => $paymentData['notes'] ?? null,
             'status' => 'pending',
         ]);
     }

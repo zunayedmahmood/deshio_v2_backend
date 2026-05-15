@@ -41,6 +41,7 @@ use App\Http\Controllers\BusinessAnalyticsController;
 use App\Http\Controllers\StockIntelligenceController;
 use App\Http\Controllers\ExchangeController;
 use App\Http\Controllers\ManualSaleRelabelController;
+use App\Http\Controllers\HomepageSectionController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -167,6 +168,7 @@ Route::prefix('catalog')->group(function () {
     Route::get('/price-range', [\App\Http\Controllers\EcommerceCatalogController::class, 'getPriceRange']);
     Route::get('/find-stock/{barcode}', [\App\Http\Controllers\EcommerceCatalogController::class, 'findStockByBarcode']);
     Route::get('/collections/{slug}', [\App\Http\Controllers\EcommerceCatalogController::class, 'getCollection']);
+    Route::get('/homepage-sections', [HomepageSectionController::class, 'publicIndex']);
 
     // Global inventory overview across all stores (Public)
     Route::prefix('inventory')->group(function () {
@@ -288,6 +290,14 @@ Route::middleware('auth:api')->group(function () {
 
 // Protected routes
 Route::middleware('auth:api')->group(function () {
+    Route::prefix('homepage-sections')->group(function () {
+        Route::get('/', [HomepageSectionController::class, 'index']);
+        Route::post('/', [HomepageSectionController::class, 'store']);
+        Route::put('/{id}', [HomepageSectionController::class, 'update']);
+        Route::post('/{id}', [HomepageSectionController::class, 'update']);
+        Route::delete('/{id}', [HomepageSectionController::class, 'destroy']);
+    });
+
     // ============================================
     // PRE-ORDER MANAGEMENT ROUTES (ERP)
     // Manage orders with out-of-stock items

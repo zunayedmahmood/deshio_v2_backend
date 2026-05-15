@@ -92,12 +92,15 @@ class OrderController extends Controller
         }
 
         // Filter by date range
+        // User Request: "Order Placed" -> created_at, "Last Updated" -> updated_at
+        $dateColumn = ($request->input("date_filter_type") === "updated_at") ? "updated_at" : "created_at";
+
         if ($request->filled('date_from')) {
-            $query->where('order_date', '>=', $request->date_from);
+            $query->where($dateColumn, '>=', $request->date_from);
         }
 
-        if ($request->filled('date_to')) {
-            $query->where('order_date', '<=', $request->date_to);
+        if ($request->filled('date_to')) { $dateTo = $request->date_to; if (strlen($dateTo) === 10) $dateTo .= " 23:59:59";
+            $query->where($dateColumn, '<=', $dateTo);
         }
 
         // Search by order number or customer name
@@ -122,8 +125,11 @@ class OrderController extends Controller
         }
 
         // Sort
-        $sortBy = $request->input('sort_by', 'created_at');
-        $sortOrder = $request->input('sort_order', 'desc');
+        $sortBy = $request->input("sort_by");
+        if (!$sortBy || $sortBy === "order_date") {
+            $sortBy = $dateColumn;
+        }
+        $sortOrder = $request->input("sort_order", "desc");
         $query->orderBy($sortBy, $sortOrder);
 
         $orders = $query->paginate($request->input('per_page', 20));
@@ -1877,11 +1883,11 @@ class OrderController extends Controller
 
         // Filter by date range
         if ($request->filled('date_from')) {
-            $query->where('order_date', '>=', $request->date_from);
+            $query->where($dateColumn, '>=', $request->date_from);
         }
 
-        if ($request->filled('date_to')) {
-            $query->where('order_date', '<=', $request->date_to);
+        if ($request->filled('date_to')) { $dateTo = $request->date_to; if (strlen($dateTo) === 10) $dateTo .= " 23:59:59";
+            $query->where($dateColumn, '<=', $request->date_to);
         }
 
         // Filter by store
@@ -2401,11 +2407,11 @@ class OrderController extends Controller
         }
 
         if ($request->filled('date_from')) {
-            $query->where('order_date', '>=', $request->date_from);
+            $query->where($dateColumn, '>=', $request->date_from);
         }
 
-        if ($request->filled('date_to')) {
-            $query->where('order_date', '<=', $request->date_to);
+        if ($request->filled('date_to')) { $dateTo = $request->date_to; if (strlen($dateTo) === 10) $dateTo .= " 23:59:59";
+            $query->where($dateColumn, '<=', $request->date_to);
         }
 
         // Search

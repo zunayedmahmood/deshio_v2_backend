@@ -3,7 +3,7 @@
 namespace App\Observers;
 
 use App\Models\OrderItem;
-use App\Models\ReservedProduct;
+use App\Services\InventoryReservationService;
 use App\Models\Order;
 use Illuminate\Support\Facades\Log;
 
@@ -96,40 +96,13 @@ class OrderItemObserver
 
     private function incrementReservation($productId, $quantity): void
     {
-        $reservedRecord = ReservedProduct::where('product_id', $productId)->lockForUpdate()->first();
-
-        if ($reservedRecord) {
-            $reservedRecord->increment('reserved_inventory', $quantity);
-            $reservedRecord->decrement('available_inventory', $quantity);
-            Log::info("Incremented reservation for product {$productId} by {$quantity}");
-        } else {
-            ReservedProduct::create([
-                'product_id' => $productId,
-                'total_inventory' => 0,
-                'reserved_inventory' => $quantity,
-                'available_inventory' => -$quantity,
-            ]);
-            Log::info("Created new reservation record for product {$productId} with {$quantity} reserved");
-        }
+        app(InventoryReservationService::class)->reserve((int) $productId, (int) $quantity);
+        Log::info("Incremented reservation for product {$productId} by {$quantity}");
     }
 
     private function decrementReservation($productId, $quantity): void
     {
-        $reservedRecord = ReservedProduct::where('product_id', $productId)->lockForUpdate()->first();
-        if (!$reservedRecord) {
-            return;
-        }
-
-        $currentReserved = (int) $reservedRecord->reserved_inventory;
-        $releaseQty = min($currentReserved, (int) $quantity);
-
-        if ($releaseQty <= 0) {
-            Log::warning("Skipped reservation decrement for product {$productId}; no active reservation found");
-            return;
-        }
-
-        $reservedRecord->decrement('reserved_inventory', $releaseQty);
-        $reservedRecord->increment('available_inventory', $releaseQty);
-        Log::info("Decremented reservation for product {$productId} by {$releaseQty}");
+        app(InventoryReservationService::class)->release((int) $productId, (int) $quantity);
+        Log::info("Released reservation for product {$productId} by up to {$quantity}");
     }
 }

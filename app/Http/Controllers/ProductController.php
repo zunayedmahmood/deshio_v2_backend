@@ -32,6 +32,79 @@ class ProductController extends Controller
         return str_starts_with($suffix, '-') ? $suffix : '- ' . $suffix;
     }
 
+
+
+    /**
+     * Computed columns used by the product list.
+     *
+     * Important rules:
+     * - stock_quantity, online_stock_quantity and offline_stock_quantity must use
+     *   the exact same physical-stock base filter, otherwise Stock will not equal
+     *   Online + Offline.
+     * - batches without a store, a deleted/missing store, or stores where is_online
+     *   is NULL are counted as offline physical stock.
+     * - reserved_stock_quantity is calculated from live not-yet-deducted order
+     *   lines instead of trusting a possibly drifted reserved_products row.
+     */
+    private function productListComputedSelects(): array
+    {
+        $reservationStatuses = array_values(array_unique(array_merge(
+            \App\Models\Order::RESERVATION_STATUSES,
+            ['confirmed']
+        )));
+
+        $liveReservedSubquery = \DB::table('order_items')
+            ->join('orders', 'orders.id', '=', 'order_items.order_id')
+            ->selectRaw('COALESCE(SUM(order_items.quantity), 0)')
+            ->whereColumn('order_items.product_id', 'products.id')
+            ->whereNull('orders.deleted_at')
+            ->whereIn('orders.status', $reservationStatuses)
+            ->where(function ($q) {
+                $q->whereNull('orders.order_type')
+                  ->orWhere('orders.order_type', '!=', 'preorder');
+            })
+            ->where(function ($q) {
+                $q->whereNull('order_items.is_inventory_deducted')
+                  ->orWhere('order_items.is_inventory_deducted', false);
+            });
+
+        return [
+            'selling_price' => \App\Models\ProductBatch::select('sell_price')
+                ->whereColumn('product_id', 'products.id')
+                ->where('is_active', true)
+                ->where('availability', true)
+                ->orderBy('sell_price', 'asc')
+                ->limit(1),
+
+            'stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
+                ->whereColumn('product_batches.product_id', 'products.id')
+                ->where('product_batches.is_active', true),
+
+            'online_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
+                ->join('stores', 'stores.id', '=', 'product_batches.store_id')
+                ->whereColumn('product_batches.product_id', 'products.id')
+                ->where('product_batches.is_active', true)
+                ->where('stores.is_online', true),
+
+            'offline_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
+                ->leftJoin('stores', 'stores.id', '=', 'product_batches.store_id')
+                ->whereColumn('product_batches.product_id', 'products.id')
+                ->where('product_batches.is_active', true)
+                ->where(function ($q) {
+                    $q->where('stores.is_online', false)
+                      ->orWhereNull('stores.is_online')
+                      ->orWhereNull('stores.id');
+                }),
+
+            'reserved_stock_quantity' => $liveReservedSubquery,
+
+            'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
+                ->whereColumn('product_id', 'products.id')
+                ->where('is_active', true)
+                ->where('availability', true),
+        ];
+    }
+
     /**
      * Get all products with filters and custom fields
      */
@@ -139,35 +212,7 @@ class ProductController extends Controller
         $selectColumns = ['products.*'];
 
         // Add subqueries for price and stock stats to improve performance (avoid N+1)
-        $query->addSelect([
-            'selling_price' => \App\Models\ProductBatch::select('sell_price')
-                ->whereColumn('product_id', 'products.id')
-                ->where('is_active', true)
-                ->where('availability', true)
-                ->orderBy('sell_price', 'asc')
-                ->limit(1),
-            'stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(quantity), 0)')
-                ->whereColumn('product_id', 'products.id')
-                ->where('is_active', true),
-            'online_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
-                ->join('stores', 'stores.id', '=', 'product_batches.store_id')
-                ->whereColumn('product_batches.product_id', 'products.id')
-                ->where('product_batches.is_active', true)
-                ->where('stores.is_online', true),
-            'offline_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
-                ->join('stores', 'stores.id', '=', 'product_batches.store_id')
-                ->whereColumn('product_batches.product_id', 'products.id')
-                ->where('product_batches.is_active', true)
-                ->where('stores.is_online', false),
-            'reserved_stock_quantity' => \DB::table('reserved_products')
-                ->select('reserved_inventory')
-                ->whereColumn('product_id', 'products.id')
-                ->limit(1),
-            'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
-                ->whereColumn('product_id', 'products.id')
-                ->where('is_active', true)
-                ->where('availability', true)
-        ]);
+        $query->addSelect($this->productListComputedSelects());
 
         if ($request->boolean('group_by_sku', true)) {
             // Step 1: Get the list of SKUs that match the filters
@@ -202,35 +247,7 @@ class ProductController extends Controller
             $products = Product::with(['category', 'vendor', 'productFields.field', 'images' => function($q) {
                 $q->where('is_active', true)->orderBy('is_primary', 'desc')->orderBy('sort_order');
             }])
-            ->addSelect([
-                'selling_price' => \App\Models\ProductBatch::select('sell_price')
-                    ->whereColumn('product_id', 'products.id')
-                    ->where('is_active', true)
-                    ->where('availability', true)
-                    ->orderBy('sell_price', 'asc')
-                    ->limit(1),
-                'stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(quantity), 0)')
-                    ->whereColumn('product_id', 'products.id')
-                    ->where('is_active', true),
-                'online_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
-                    ->join('stores', 'stores.id', '=', 'product_batches.store_id')
-                    ->whereColumn('product_batches.product_id', 'products.id')
-                    ->where('product_batches.is_active', true)
-                    ->where('stores.is_online', true),
-                'offline_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
-                    ->join('stores', 'stores.id', '=', 'product_batches.store_id')
-                    ->whereColumn('product_batches.product_id', 'products.id')
-                    ->where('product_batches.is_active', true)
-                    ->where('stores.is_online', false),
-                'reserved_stock_quantity' => \DB::table('reserved_products')
-                    ->select('reserved_inventory')
-                    ->whereColumn('product_id', 'products.id')
-                    ->limit(1),
-                'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
-                    ->whereColumn('product_id', 'products.id')
-                    ->where('is_active', true)
-                    ->where('availability', true)
-            ])
+            ->addSelect($this->productListComputedSelects())
             ->whereIn('id', $representativeIds)
             ->get();
 
@@ -243,35 +260,7 @@ class ProductController extends Controller
             $allVariants = Product::with(['productFields.field', 'images' => function($q) {
                 $q->where('is_active', true)->orderBy('is_primary', 'desc')->orderBy('sort_order');
             }])
-            ->addSelect([
-                'selling_price' => \App\Models\ProductBatch::select('sell_price')
-                    ->whereColumn('product_id', 'products.id')
-                    ->where('is_active', true)
-                    ->where('availability', true)
-                    ->orderBy('sell_price', 'asc')
-                    ->limit(1),
-                'stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(quantity), 0)')
-                    ->whereColumn('product_id', 'products.id')
-                    ->where('is_active', true),
-                'online_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
-                    ->join('stores', 'stores.id', '=', 'product_batches.store_id')
-                    ->whereColumn('product_batches.product_id', 'products.id')
-                    ->where('product_batches.is_active', true)
-                    ->where('stores.is_online', true),
-                'offline_stock_quantity' => \App\Models\ProductBatch::selectRaw('COALESCE(SUM(product_batches.quantity), 0)')
-                    ->join('stores', 'stores.id', '=', 'product_batches.store_id')
-                    ->whereColumn('product_batches.product_id', 'products.id')
-                    ->where('product_batches.is_active', true)
-                    ->where('stores.is_online', false),
-                'reserved_stock_quantity' => \DB::table('reserved_products')
-                    ->select('reserved_inventory')
-                    ->whereColumn('product_id', 'products.id')
-                    ->limit(1),
-                'in_stock' => \App\Models\ProductBatch::selectRaw('CASE WHEN COALESCE(SUM(quantity), 0) > 0 THEN 1 ELSE 0 END')
-                    ->whereColumn('product_id', 'products.id')
-                    ->where('is_active', true)
-                    ->where('availability', true)
-            ])
+            ->addSelect($this->productListComputedSelects())
             ->whereIn('sku', $skus)
             ->whereNotIn('id', $representativeIds);
 

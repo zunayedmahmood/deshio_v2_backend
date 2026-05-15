@@ -7,10 +7,13 @@ use App\Models\ProductBarcode;
 use App\Models\ProductBatch;
 use App\Models\ProductMovement;
 use App\Models\ProductBarcodeRelabel;
+use App\Models\ProductDispatchItemBarcode;
+use App\Models\Store;
 use App\Services\FloatingBarcodeRelabelService;
 use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\DB;
 
 class ProductBarcodeController extends Controller
 {
@@ -247,6 +250,188 @@ class ProductBarcodeController extends Controller
             'message' => $result['reconciled'] ? 'Relabel pool reconciled.' : 'No reconciliation was needed.',
             'data' => $result,
         ]);
+    }
+
+
+    /**
+     * Manually revive a stuck dispatch barcode back to a store.
+     *
+     * This is used by the frontend revive-barcodes page.
+     * POST /api/barcodes/transfer-to-store
+     * Body: {
+     *   "barcode": "1234567890",
+     *   "store_id": 1,
+     *   "status": "available" // optional
+     * }
+     */
+    public function transferToStore(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'barcode' => 'required|string',
+            'store_id' => 'required|integer|exists:stores,id',
+            'status' => 'nullable|string|in:available,in_warehouse,in_shop,on_display',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        try {
+            return DB::transaction(function () use ($request) {
+                $barcode = ProductBarcode::with(['product', 'batch', 'currentStore'])
+                    ->where('barcode', trim($request->barcode))
+                    ->lockForUpdate()
+                    ->first();
+
+                if (!$barcode) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Barcode not found in system',
+                    ], 404);
+                }
+
+                if ($barcode->is_defective) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'This barcode is marked as defective and cannot be revived to sellable stock.',
+                    ], 422);
+                }
+
+                $blockedStatuses = ['with_customer', 'sold', 'defective', 'disposed', 'vendor_return'];
+                if (in_array((string) $barcode->current_status, $blockedStatuses, true)) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => "Barcode cannot be revived from status: {$barcode->current_status}",
+                    ], 422);
+                }
+
+                $targetStore = Store::findOrFail((int) $request->store_id);
+                $targetStatus = $request->input('status', 'available');
+                $oldStoreId = $barcode->current_store_id;
+                $oldStore = $barcode->currentStore;
+                $oldStatus = $barcode->current_status;
+                $performedBy = auth('api')->id() ?: auth()->id();
+
+                $metadata = is_array($barcode->location_metadata) ? $barcode->location_metadata : [];
+                $dispatchId = $metadata['dispatch_id'] ?? null;
+                $dispatchNumber = $metadata['dispatch_number'] ?? null;
+
+                // If the barcode was stuck because a dispatch was cancelled, release only that cancelled dispatch link.
+                $releasedDispatchLinks = ProductDispatchItemBarcode::where('product_barcode_id', $barcode->id)
+                    ->whereHas('dispatchItem.dispatch', function ($q) {
+                        $q->where('status', 'cancelled');
+                    })
+                    ->delete();
+
+                $reviveMetadata = [
+                    'revived_at' => now()->toISOString(),
+                    'revived_by' => $performedBy,
+                    'revived_from_store_id' => $oldStoreId,
+                    'revived_from_status' => $oldStatus,
+                    'released_cancelled_dispatch_links' => $releasedDispatchLinks,
+                    'reference_type' => 'barcode_revive',
+                    'reference_id' => $dispatchId,
+                    'dispatch_number' => $dispatchNumber,
+                    'notes' => "Barcode manually revived to {$targetStore->name}",
+                ];
+
+                // updateLocation creates the movement record, but some older DBs can fail movement logging.
+                // In that case, do not block revive; update the barcode directly and try a simple movement log.
+                try {
+                    $barcode->updateLocation(
+                        $targetStore->id,
+                        $targetStatus,
+                        $reviveMetadata,
+                        true,
+                        $performedBy
+                    );
+                } catch (\Throwable $movementError) {
+                    $barcode->update([
+                        'is_active' => true,
+                        'current_store_id' => $targetStore->id,
+                        'current_status' => $targetStatus,
+                        'location_updated_at' => now(),
+                        'location_metadata' => array_merge($metadata, $reviveMetadata, [
+                            'movement_logging_error' => $movementError->getMessage(),
+                        ]),
+                    ]);
+
+                    if ($barcode->batch_id) {
+                        try {
+                            ProductMovement::create([
+                                'product_batch_id' => $barcode->batch_id,
+                                'product_barcode_id' => $barcode->id,
+                                'from_store_id' => $oldStoreId,
+                                'to_store_id' => $targetStore->id,
+                                'movement_type' => 'adjustment',
+                                'quantity' => 1,
+                                'unit_cost' => $barcode->batch?->cost_price ?? 0,
+                                'unit_price' => $barcode->batch?->sell_price ?? 0,
+                                'total_cost' => $barcode->batch?->cost_price ?? 0,
+                                'total_value' => $barcode->batch?->sell_price ?? 0,
+                                'movement_date' => now(),
+                                'reference_type' => 'barcode_revive',
+                                'reference_id' => $dispatchId,
+                                'status_before' => $oldStatus,
+                                'status_after' => $targetStatus,
+                                'notes' => "Barcode manually revived to {$targetStore->name}",
+                                'performed_by' => $performedBy,
+                            ]);
+                        } catch (\Throwable $ignored) {
+                            // Barcode revive must still succeed even if the audit movement table has old constraints.
+                        }
+                    }
+                }
+
+                // Make sure revived dispatch barcodes become active again unless they are defective/sold (blocked above).
+                if (!$barcode->is_active) {
+                    $barcode->update(['is_active' => true]);
+                }
+
+                $barcode->refresh()->load(['product', 'batch', 'currentStore']);
+
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Barcode revived successfully',
+                    'data' => [
+                        'barcode' => $barcode->barcode,
+                        'product' => $barcode->product ? [
+                            'id' => $barcode->product->id,
+                            'name' => $barcode->product->name,
+                            'sku' => $barcode->product->sku,
+                        ] : null,
+                        'from_store' => $oldStore ? [
+                            'id' => $oldStore->id,
+                            'name' => $oldStore->name,
+                        ] : ($oldStoreId ? ['id' => $oldStoreId, 'name' => 'Previous store'] : null),
+                        'to_store' => [
+                            'id' => $targetStore->id,
+                            'name' => $targetStore->name,
+                        ],
+                        'batch' => $barcode->batch ? [
+                            'id' => $barcode->batch->id,
+                            'batch_number' => $barcode->batch->batch_number,
+                            'quantity' => $barcode->batch->quantity,
+                            'sell_price' => $barcode->batch->sell_price,
+                        ] : null,
+                        'from_status' => $oldStatus,
+                        'current_status' => $barcode->current_status,
+                        'released_cancelled_dispatch_links' => $releasedDispatchLinks,
+                        'transferred_at' => now()->toISOString(),
+                    ],
+                ]);
+            });
+        } catch (\Throwable $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to revive barcode',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
     }
 
     /**

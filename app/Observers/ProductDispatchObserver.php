@@ -3,7 +3,7 @@
 namespace App\Observers;
 
 use App\Models\ProductDispatch;
-use App\Models\ReservedProduct;
+use App\Services\InventoryReservationService;
 use Illuminate\Support\Facades\Log;
 
 class ProductDispatchObserver
@@ -53,12 +53,7 @@ class ProductDispatchObserver
      */
     protected function decrementReservation($productId, $quantity)
     {
-        $reserved = ReservedProduct::where('product_id', $productId)->first();
-        if ($reserved) {
-            $reserved->decrement('reserved_inventory', $quantity);
-            $reserved->increment('available_inventory', $quantity);
-            
-            Log::info("Reservation released for product {$productId}: {$quantity} units");
-        }
+        app(InventoryReservationService::class)->release((int) $productId, (int) $quantity);
+        Log::info("Reservation released for product {$productId}: up to {$quantity} units");
     }
 }

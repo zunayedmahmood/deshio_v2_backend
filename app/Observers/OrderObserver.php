@@ -3,7 +3,7 @@
 namespace App\Observers;
 
 use App\Models\Order;
-use App\Models\ReservedProduct;
+use App\Services\InventoryReservationService;
 use App\Services\SalesTargetAggregationService;
 use Illuminate\Support\Facades\Log;
 
@@ -82,14 +82,11 @@ class OrderObserver
     {
         Log::info("Releasing reservations for order #{$order->order_number} due to status change or deletion.");
         foreach ($order->items as $item) {
-            $reserved = ReservedProduct::where('product_id', $item->product_id)->lockForUpdate()->first();
-            if ($reserved) {
-                $releaseQty = min((int) $reserved->reserved_inventory, (int) $item->quantity);
-                if ($releaseQty > 0) {
-                    $reserved->decrement('reserved_inventory', $releaseQty);
-                    $reserved->increment('available_inventory', $releaseQty);
-                }
+            if ($item->is_inventory_deducted) {
+                continue;
             }
+
+            app(InventoryReservationService::class)->release((int) $item->product_id, (int) $item->quantity);
         }
     }
 
@@ -100,18 +97,11 @@ class OrderObserver
     {
         Log::info("Creating reservations for order #{$order->order_number} due to status change or restoration.");
         foreach ($order->items as $item) {
-            $reserved = ReservedProduct::where('product_id', $item->product_id)->lockForUpdate()->first();
-            if ($reserved) {
-                $reserved->increment('reserved_inventory', $item->quantity);
-                $reserved->decrement('available_inventory', $item->quantity);
-            } else {
-                ReservedProduct::create([
-                    'product_id' => $item->product_id,
-                    'total_inventory' => 0,
-                    'reserved_inventory' => $item->quantity,
-                    'available_inventory' => -$item->quantity,
-                ]);
+            if ($item->is_inventory_deducted) {
+                continue;
             }
+
+            app(InventoryReservationService::class)->reserve((int) $item->product_id, (int) $item->quantity);
         }
     }
 }

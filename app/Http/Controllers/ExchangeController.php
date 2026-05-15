@@ -257,10 +257,8 @@ class ExchangeController extends Controller
                 // Stock deduction (Realtime for Counter sales)
                 $batch->removeStock($quantity);
                 if ($reservedRecord) {
-                    $reservedRecord->decrement('reserved_inventory', $quantity);
-                    $reservedRecord->refresh();
-                    $reservedRecord->available_inventory = $reservedRecord->total_inventory - $reservedRecord->reserved_inventory;
-                    $reservedRecord->save();
+                    app(\App\Services\InventoryReservationService::class)
+                        ->release((int) $product->id, (int) $quantity);
                 }
 
                 // Update barcode status

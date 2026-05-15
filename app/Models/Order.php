@@ -110,8 +110,6 @@ class Order extends Model
     protected static function boot()
     {
         parent::boot();
-        self::observe(\App\Observers\OrderObserver::class);
-
         static::creating(function ($order) {
             if (empty($order->order_number)) {
                 $order->order_number = static::generateOrderNumber($order->order_type);

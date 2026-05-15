@@ -141,6 +141,8 @@ class ProductReturnController extends Controller
             'items' => 'required|array|min:1',
             'items.*.order_item_id' => 'required|exists:order_items,id',
             'items.*.quantity' => 'required|integer|min:1',
+            'items.*.product_barcode_id' => 'nullable|exists:product_barcodes,id',
+            'items.*.barcode_id' => 'nullable|exists:product_barcodes,id',
             'items.*.reason' => 'nullable|string',
             'customer_notes' => 'nullable|string',
         ]);
@@ -173,7 +175,10 @@ class ProductReturnController extends Controller
                     throw new \Exception("Cannot return {$item['quantity']} units. Only {$availableForReturn} available for return.");
                 }
 
-                $returnableBarcodes = $this->getReturnableBarcodesForOrderItem($order, $orderItem, (int) $item['quantity']);
+                $selectedBarcodeId = $item['product_barcode_id'] ?? $item['barcode_id'] ?? null;
+                $returnableBarcodes = $selectedBarcodeId
+                    ? collect([$this->getExactReturnableBarcodeForOrderItem($order, $orderItem, (int) $selectedBarcodeId, (int) $item['quantity'])])
+                    : $this->getReturnableBarcodesForOrderItem($order, $orderItem, (int) $item['quantity']);
                 if ($returnableBarcodes->count() < (int) $item['quantity']) {
                     throw new \Exception("Unable to identify sold barcode units for {$orderItem->product_name}.");
                 }
@@ -263,6 +268,8 @@ class ProductReturnController extends Controller
             'items' => 'required|array|min:1',
             'items.*.order_item_id' => 'required|exists:order_items,id',
             'items.*.quantity' => 'required|integer|min:1',
+            'items.*.product_barcode_id' => 'nullable|exists:product_barcodes,id',
+            'items.*.barcode_id' => 'nullable|exists:product_barcodes,id',
             'items.*.reason' => 'nullable|string',
             'customer_notes' => 'nullable|string',
             'attachments' => 'nullable|array',
@@ -306,7 +313,10 @@ class ProductReturnController extends Controller
                     throw new \Exception("Item {$orderItem->id} is not barcode-trackable. Returns require barcode-tracked items.");
                 }
 
-                $returnableBarcodes = $this->getReturnableBarcodesForOrderItem($order, $orderItem, (int) $item['quantity']);
+                $selectedBarcodeId = $item['product_barcode_id'] ?? $item['barcode_id'] ?? null;
+                $returnableBarcodes = $selectedBarcodeId
+                    ? collect([$this->getExactReturnableBarcodeForOrderItem($order, $orderItem, (int) $selectedBarcodeId, (int) $item['quantity'])])
+                    : $this->getReturnableBarcodesForOrderItem($order, $orderItem, (int) $item['quantity']);
                 if ($returnableBarcodes->count() < (int) $item['quantity']) {
                     throw new \Exception("Unable to identify {$item['quantity']} sold barcode unit(s) for {$orderItem->product_name}. Return requires sold barcode tracking.");
                 }
@@ -788,6 +798,42 @@ class ProductReturnController extends Controller
                 'message' => 'Failed to link exchange: ' . $e->getMessage(),
             ], 500);
         }
+    }
+
+    private function getExactReturnableBarcodeForOrderItem(Order $order, OrderItem $orderItem, int $barcodeId, int $quantity): ProductBarcode
+    {
+        if ($quantity !== 1) {
+            throw new \Exception('Exact barcode returns must be submitted one unit at a time.');
+        }
+
+        $barcode = ProductBarcode::whereKey($barcodeId)->lockForUpdate()->firstOrFail();
+
+        if ((int) $barcode->product_id !== (int) $orderItem->product_id) {
+            throw new \Exception("Barcode {$barcode->barcode} does not match {$orderItem->product_name}.");
+        }
+
+        if (!empty($orderItem->product_batch_id) && (int) $barcode->batch_id !== (int) $orderItem->product_batch_id) {
+            throw new \Exception("Barcode {$barcode->barcode} does not match the sold batch for {$orderItem->product_name}.");
+        }
+
+        if (!in_array($barcode->current_status, ['with_customer', 'sold'], true)) {
+            throw new \Exception("Barcode {$barcode->barcode} is not currently with the customer.");
+        }
+
+        if ($barcode->is_defective) {
+            throw new \Exception("Barcode {$barcode->barcode} is already marked defective.");
+        }
+
+        $metadata = $barcode->location_metadata ?? [];
+        $belongsToOrder = (int) ($orderItem->product_barcode_id ?? 0) === (int) $barcode->id
+            || (int) ($metadata['order_id'] ?? 0) === (int) $order->id
+            || (string) ($metadata['order_number'] ?? '') === (string) $order->order_number;
+
+        if (!$belongsToOrder) {
+            throw new \Exception("Barcode {$barcode->barcode} was not sold in order {$order->order_number}.");
+        }
+
+        return $barcode;
     }
 
     private function getReturnableBarcodesForOrderItem(Order $order, OrderItem $orderItem, int $requiredQty)

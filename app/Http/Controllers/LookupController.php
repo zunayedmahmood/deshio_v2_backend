@@ -75,6 +75,10 @@ class LookupController extends Controller
 
         // 2. Barcode Information
         $barcodeInfo = [
+            'id' => $barcodeRecord->id,
+            'product_id' => $barcodeRecord->product_id,
+            'batch_id' => $barcodeRecord->batch_id,
+            'current_store_id' => $barcodeRecord->current_store_id,
             'barcode' => $barcodeRecord->barcode,
             'type' => $barcodeRecord->type,
             'is_primary' => $barcodeRecord->is_primary,
@@ -511,6 +515,11 @@ class LookupController extends Controller
                     'name' => $item->product_name,
                     'brand' => $item->product->brand,
                 ],
+                'product_batch_id' => $item->product_batch_id,
+                'product_barcode_id' => $item->product_barcode_id,
+                'batch_id' => $item->product_batch_id,
+                'barcode_id' => $item->product_barcode_id,
+                'barcode_number' => $item->barcode?->barcode,
                 'batch' => $item->batch ? [
                     'id' => $item->batch->id,
                     'batch_number' => $item->batch->batch_number,
@@ -518,6 +527,7 @@ class LookupController extends Controller
                     'sell_price' => $item->batch->sell_price,
                 ] : null,
                 'barcode' => $item->barcode ? [
+                    'id' => $item->barcode->id,
                     'barcode' => $item->barcode->barcode,
                     'type' => $item->barcode->type,
                     'is_active' => $item->barcode->is_active,

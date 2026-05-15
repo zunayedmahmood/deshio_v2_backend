@@ -17,6 +17,7 @@ use App\Models\Service;
 use App\Models\ServiceOrderItem;
 use App\Traits\DatabaseAgnosticSearch;
 use App\Services\FloatingBarcodeRelabelService;
+use App\Services\InventoryReservationService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
@@ -769,14 +770,14 @@ class OrderController extends Controller
                     $discount = $itemData['discount_amount'] ?? $item->discount_amount;
 
                     if ($quantity != $item->quantity && $item->product_barcode_id) {
-                        DB::rollBack();
                         if ($quantity < $item->quantity) {
+                            DB::rollBack();
                             return $this->barcodeSelectionRequiredResponse($order, $item);
                         }
-                        return response()->json([
-                            'success' => false,
-                            'message' => 'Cannot increase quantity on a scanned barcode row. Add the product as a new item so the new unit can be scanned separately.'
-                        ], 422);
+
+                        $increaseBy = $quantity - $item->quantity;
+                        $this->addPendingQuantityForScannedItem($order, $item, $increaseBy, (float) $unitPrice);
+                        $quantity = $item->quantity;
                     }
 
                     // Recalculate tax for this item
@@ -1058,7 +1059,7 @@ class OrderController extends Controller
                 $quantity = $request->quantity;
                 
                 // 1. ALWAYS verify global available inventory first
-                $reserved = \App\Models\ReservedProduct::where('product_id', $product->id)->first();
+                $reserved = \App\Models\ReservedProduct::where('product_id', $product->id)->lockForUpdate()->first();
                 $availableGlobal = $reserved ? $reserved->available_inventory : 0;
                 
                 if ($availableGlobal < $quantity) {
@@ -1093,7 +1094,7 @@ class OrderController extends Controller
                 }
 
                 if ($batch) {
-                    Log::info("Auto-selected batch {$batch->id} for added item in order {$order->id}");
+                    Log::info("Using batch {$batch->id} only for added item price/tax in order {$order->id}; physical batch will be assigned when barcode is scanned.");
                 } else {
                     Log::info("Adding item to order {$order->id} without pre-assigned batch (will be assigned at fulfillment)");
                 }
@@ -1102,41 +1103,44 @@ class OrderController extends Controller
                 $unitPrice = $request->unit_price ?? ($batch ? $batch->sell_price : $product->base_price ?? 0);
                 $discount = $request->discount_amount ?? 0;
                 
-                // Calculate tax using the helper method (respects TAX_MODE)
+                // New online-order quantities are intentionally left without a batch/barcode.
+                // The package page will attach the exact physical barcode and batch later.
                 $taxPercentage = $batch ? ($batch->tax_percentage ?? 0) : 0;
                 $taxCalculation = $this->calculateTax($unitPrice, $quantity, $taxPercentage);
                 
-                // Check if this product already exists in the order
+                // Check if this product already exists as an unscanned editable line in the order
                 $existingItem = OrderItem::where('order_id', $order->id)
                     ->where('product_id', $product->id)
-                    ->where('product_batch_id', $batch ? $batch->id : null)
+                    ->whereNull('product_batch_id')
                     ->whereNull('product_barcode_id')
                     ->where('is_inventory_deducted', false)
+                    ->where('unit_price', $unitPrice)
+                    ->where('discount_amount', $discount)
                     ->first();
                 
                 if ($existingItem) {
-                    // Update existing item quantity
+                    // Update existing unscanned item quantity
                     $existingItem->quantity += $quantity;
                     $existingItem->tax_amount = $this->calculateTax($existingItem->unit_price, $existingItem->quantity, $taxPercentage)['total_tax'];
                     $existingItem->total_amount = ($existingItem->unit_price * $existingItem->quantity) - $existingItem->discount_amount + $existingItem->tax_amount;
-                    $existingItem->cogs = $batch ? round(($batch->cost_price ?? 0) * $existingItem->quantity, 2) : 0;
+                    $existingItem->cogs = 0;
                     $existingItem->save();
                     
                     $orderItem = $existingItem;
                 } else {
-                    // Create new order item (without barcode - will be assigned during fulfillment)
+                    // Create new unscanned order item; barcode/batch will be assigned during fulfillment.
                     $orderItem = OrderItem::create([
                         'order_id' => $order->id,
                         'product_id' => $product->id,
-                        'product_batch_id' => $batch ? $batch->id : null,
-                        'product_barcode_id' => null,  // No barcode yet - assigned during fulfillment
+                        'product_batch_id' => null,
+                        'product_barcode_id' => null,
                         'product_name' => $product->name,
                         'product_sku' => $product->sku,
                         'quantity' => $quantity,
                         'unit_price' => $unitPrice,
                         'discount_amount' => $discount,
                         'tax_amount' => $taxCalculation['total_tax'],
-                        'cogs' => $batch ? round(($batch->cost_price ?? 0) * $quantity, 2) : 0,
+                        'cogs' => 0,
                         'total_amount' => ($unitPrice * $quantity) - $discount + $taxCalculation['total_tax'],
                     ]);
                 }
@@ -1144,17 +1148,25 @@ class OrderController extends Controller
                 $addedItems[] = $orderItem;
             }
 
-            // If order was already confirmed, it stays confirmed but needs re-fulfillment for new items.
-            // If it's not confirmed, we keep it as pending/pending_assignment to ensure regular workflow.
-            if (!in_array($order->status, ['confirmed', 'ready_for_shipment', 'shipped', 'delivered', 'completed'])) {
+            if ($hasProduct && $order->needsFulfillment()) {
                 $order->status = 'pending';
-            } else {
-                // For confirmed orders, we must mark as pending fulfillment so the new items can be scanned.
                 $order->fulfillment_status = 'pending_fulfillment';
+            } else if (!in_array($order->status, ['confirmed', 'ready_for_shipment', 'shipped', 'delivered', 'completed'])) {
+                $order->status = 'pending';
             }
 
-            // Recalculate order totals
+            // Recalculate order totals and rebuild reservation truth for edited product(s)
             $order->calculateTotals();
+            $affectedProductIds = $order->items()
+                ->where(function ($q) {
+                    $q->whereNull('is_inventory_deducted')->orWhere('is_inventory_deducted', false);
+                })
+                ->pluck('product_id')
+                ->merge(collect($addedItems)->pluck('product_id'))
+                ->unique();
+            foreach ($affectedProductIds as $productId) {
+                app(InventoryReservationService::class)->syncProduct((int) $productId);
+            }
 
             DB::commit();
 
@@ -1242,14 +1254,14 @@ class OrderController extends Controller
                 $diff = $newQuantity - $item->quantity;
 
                 if ($diff != 0 && $item->product_barcode_id) {
-                    DB::rollBack();
                     if ($diff < 0) {
+                        DB::rollBack();
                         return $this->barcodeSelectionRequiredResponse($order, $item);
                     }
-                    return response()->json([
-                        'success' => false,
-                        'message' => 'Cannot increase quantity on a scanned barcode row. Add the product as a new item so the new unit can be scanned separately.'
-                    ], 422);
+
+                    $this->addPendingQuantityForScannedItem($order, $item, $diff, (float) $unitPrice);
+                    $newQuantity = $item->quantity;
+                    $diff = 0;
                 }
 
                 // For increases, validate global available inventory
@@ -1314,6 +1326,7 @@ class OrderController extends Controller
             }
 
             $order->calculateTotals();
+            app(InventoryReservationService::class)->syncProduct((int) $item->product_id);
 
             DB::commit();
 
@@ -1426,6 +1439,74 @@ class OrderController extends Controller
         }
     }
 
+
+    private function addPendingQuantityForScannedItem(Order $order, OrderItem $sourceItem, int $quantity, float $unitPrice): OrderItem
+    {
+        if ($quantity < 1) {
+            return $sourceItem;
+        }
+
+        $reserved = ReservedProduct::where('product_id', $sourceItem->product_id)->lockForUpdate()->first();
+        $available = $reserved ? (int) $reserved->available_inventory : 0;
+
+        if ($available < $quantity) {
+            throw new \Exception("Insufficient global stock to increase quantity for '{$sourceItem->product_name}'. Available: {$available}, needed: {$quantity}");
+        }
+
+        $pendingItem = OrderItem::where('order_id', $order->id)
+            ->where('product_id', $sourceItem->product_id)
+            ->whereNull('product_batch_id')
+            ->whereNull('product_barcode_id')
+            ->where('is_inventory_deducted', false)
+            ->where('unit_price', $unitPrice)
+            ->where('discount_amount', 0)
+            ->lockForUpdate()
+            ->first();
+
+        if ($pendingItem) {
+            $pendingItem->updateQuantity($pendingItem->quantity + $quantity);
+        } else {
+            $pendingItem = OrderItem::create([
+                'order_id' => $order->id,
+                'product_id' => $sourceItem->product_id,
+                'product_batch_id' => null,
+                'product_barcode_id' => null,
+                'store_id' => $sourceItem->store_id,
+                'product_name' => $sourceItem->product_name,
+                'product_sku' => $sourceItem->product_sku,
+                'quantity' => $quantity,
+                'unit_price' => $unitPrice,
+                'discount_amount' => 0,
+                'tax_amount' => 0,
+                'cogs' => 0,
+                'total_amount' => $unitPrice * $quantity,
+                'product_options' => $sourceItem->product_options,
+                'notes' => $sourceItem->notes,
+            ]);
+        }
+
+        if ($order->needsFulfillment()) {
+            $order->status = 'pending';
+            $order->fulfillment_status = 'pending_fulfillment';
+            $order->fulfilled_at = null;
+            $order->fulfilled_by = null;
+            $order->save();
+        }
+
+        $affectedProductIds = $order->items()
+            ->where(function ($q) {
+                $q->whereNull('is_inventory_deducted')->orWhere('is_inventory_deducted', false);
+            })
+            ->pluck('product_id')
+            ->push($sourceItem->product_id)
+            ->unique();
+
+        foreach ($affectedProductIds as $productId) {
+            app(InventoryReservationService::class)->syncProduct((int) $productId);
+        }
+
+        return $pendingItem;
+    }
 
     private function scannedBarcodeRowsForItem(Order $order, OrderItem $item)
     {
@@ -1570,6 +1651,18 @@ class OrderController extends Controller
                 if ($barcode && in_array($barcode->current_status, ['sold', 'with_customer'], true)) {
                     app(FloatingBarcodeRelabelService::class)->returnBarcodeFromSold($barcode, $order);
                 }
+            } else if ($barcode && !in_array($barcode->current_status, FloatingBarcodeRelabelService::SELLABLE_STATUSES, true)) {
+                $barcode->update([
+                    'current_status' => $barcode->current_store_id ? 'in_shop' : 'available',
+                    'location_updated_at' => now(),
+                    'location_metadata' => array_merge($barcode->location_metadata ?? [], [
+                        'released_from_order_edit' => true,
+                        'order_id' => $order->id,
+                        'order_number' => $order->order_number,
+                        'released_at' => now()->toISOString(),
+                        'released_by' => auth()->id(),
+                    ]),
+                ]);
             }
 
             if ($scannedItem->quantity > 1) {
@@ -1598,6 +1691,7 @@ class OrderController extends Controller
             $order->load(['items', 'serviceItems']);
             $order->calculateTotals();
             $order->save();
+            app(InventoryReservationService::class)->syncProduct((int) $referenceItem->product_id);
 
             DB::commit();
 
@@ -1974,6 +2068,7 @@ class OrderController extends Controller
                 default => $order->order_type,
             },
             'status' => $order->status,
+            'fulfillment_status' => $order->fulfillment_status,
             'payment_status' => $order->payment_status,
             'customer' => [
                 'id' => $order->customer->id,

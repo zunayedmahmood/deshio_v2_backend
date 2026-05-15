@@ -1008,6 +1008,12 @@ Route::middleware('auth:api')->group(function () {
         Route::get('/', [ProductVariantController::class, 'getOptions']);
         Route::post('/', [ProductVariantController::class, 'storeOption']);
     });
+
+    // Dedicated Size Management used by product/add manual size creation.
+    Route::prefix('sizes')->group(function () {
+        Route::get('/', [\App\Http\Controllers\SizeController::class, 'index']);
+        Route::post('/', [\App\Http\Controllers\SizeController::class, 'store']);
+    });
     
     // Product variants
     Route::prefix('products/{productId}/variants')->group(function () {

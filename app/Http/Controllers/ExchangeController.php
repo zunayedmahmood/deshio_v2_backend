@@ -64,6 +64,7 @@ class ExchangeController extends Controller
             'removedProducts.*.total_price' => 'required|numeric|min:0',
             'removedProducts.*.order_item_id' => 'nullable|exists:order_items,id',
             'removedProducts.*.barcode_id' => 'nullable|exists:product_barcodes,id',
+            'removedProducts.*.product_barcode_id' => 'nullable|exists:product_barcodes,id',
             'removedProducts.*.return_reason' => 'required|string',
             'removedProducts.*.quality_check_passed' => 'required|boolean',
             
@@ -99,6 +100,7 @@ class ExchangeController extends Controller
                 throw new \Exception('Employee authentication required');
             }
 
+            $originalOrder = null;
             if ($request->order_id) {
                 $originalOrder = Order::findOrFail($request->order_id);
                 $this->assertOrderCanReturnOrExchange($originalOrder);
@@ -122,10 +124,36 @@ class ExchangeController extends Controller
             $returnItems = [];
 
             foreach ($request->removedProducts as $item) {
+                $orderItem = null;
                 $batchId = $item['product_batch_id'] ?? null;
-                if (!$batchId && !empty($item['order_item_id'])) {
-                    $orderItem = OrderItem::find($item['order_item_id']);
-                    $batchId = $orderItem->product_batch_id;
+
+                if (!empty($item['order_item_id'])) {
+                    $orderItem = OrderItem::findOrFail($item['order_item_id']);
+                    if ($originalOrder && (int) $orderItem->order_id !== (int) $originalOrder->id) {
+                        throw new \Exception("Removed item {$item['order_item_id']} does not belong to order {$originalOrder->order_number}.");
+                    }
+                    $batchId = $batchId ?: $orderItem->product_batch_id;
+                }
+
+                $barcodeId = $item['barcode_id'] ?? $item['product_barcode_id'] ?? null;
+                $returnedBarcodeIds = [];
+                $returnedBarcodes = [];
+                if ($barcodeId && $orderItem && $originalOrder) {
+                    $barcode = $this->getExactReturnableBarcodeForOrderItem($originalOrder, $orderItem, (int) $barcodeId, (int) $item['quantity']);
+                    $batchId = $barcode->batch_id;
+                    $returnedBarcodeIds = [$barcode->id];
+                    $returnedBarcodes = [$barcode->barcode];
+                } elseif ($barcodeId) {
+                    $barcode = ProductBarcode::whereKey($barcodeId)->lockForUpdate()->firstOrFail();
+                    if ((int) $barcode->product_id !== (int) $item['product_id']) {
+                        throw new \Exception("Barcode {$barcode->barcode} does not match removed product.");
+                    }
+                    if (!in_array($barcode->current_status, ['with_customer', 'sold'], true)) {
+                        throw new \Exception("Barcode {$barcode->barcode} is not currently with the customer.");
+                    }
+                    $batchId = $batchId ?: $barcode->batch_id;
+                    $returnedBarcodeIds = [$barcode->id];
+                    $returnedBarcodes = [$barcode->barcode];
                 }
 
                 if (!$batchId) {
@@ -143,7 +171,8 @@ class ExchangeController extends Controller
                     'refundable_amount' => $item['total_price'],
                     'return_reason' => $item['return_reason'],
                     'quality_check_passed' => $item['quality_check_passed'],
-                    'returned_barcode_ids' => isset($item['barcode_id']) ? [$item['barcode_id']] : [],
+                    'returned_barcode_ids' => $returnedBarcodeIds,
+                    'returned_barcodes' => $returnedBarcodes,
                 ];
             }
 
@@ -432,6 +461,42 @@ class ExchangeController extends Controller
         }
         
         return ['total_tax' => round($taxAmount, 2)];
+    }
+
+    private function getExactReturnableBarcodeForOrderItem(Order $order, OrderItem $orderItem, int $barcodeId, int $quantity): ProductBarcode
+    {
+        if ($quantity !== 1) {
+            throw new \Exception('Exact barcode exchanges must be submitted one unit at a time.');
+        }
+
+        $barcode = ProductBarcode::whereKey($barcodeId)->lockForUpdate()->firstOrFail();
+
+        if ((int) $barcode->product_id !== (int) $orderItem->product_id) {
+            throw new \Exception("Barcode {$barcode->barcode} does not match {$orderItem->product_name}.");
+        }
+
+        if (!empty($orderItem->product_batch_id) && (int) $barcode->batch_id !== (int) $orderItem->product_batch_id) {
+            throw new \Exception("Barcode {$barcode->barcode} does not match the sold batch for {$orderItem->product_name}.");
+        }
+
+        if (!in_array($barcode->current_status, ['with_customer', 'sold'], true)) {
+            throw new \Exception("Barcode {$barcode->barcode} is not currently with the customer.");
+        }
+
+        if ($barcode->is_defective) {
+            throw new \Exception("Barcode {$barcode->barcode} is already marked defective.");
+        }
+
+        $metadata = $barcode->location_metadata ?? [];
+        $belongsToOrder = (int) ($orderItem->product_barcode_id ?? 0) === (int) $barcode->id
+            || (int) ($metadata['order_id'] ?? 0) === (int) $order->id
+            || (string) ($metadata['order_number'] ?? '') === (string) $order->order_number;
+
+        if (!$belongsToOrder) {
+            throw new \Exception("Barcode {$barcode->barcode} was not sold in order {$order->order_number}.");
+        }
+
+        return $barcode;
     }
 
     private function restoreInventoryForReturn(ProductReturn $return, Employee $employee): void

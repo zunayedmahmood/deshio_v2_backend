@@ -27,6 +27,32 @@ use Illuminate\Support\Facades\Validator;
 class OrderController extends Controller
 {
     use DatabaseAgnosticSearch;
+    private function getOrderDateColumn(Request $request): string
+    {
+        return $request->input('date_filter_type') === 'updated_at' ? 'updated_at' : 'order_date';
+    }
+
+    private function applyOrderDateFilters($query, Request $request): void
+    {
+        $dateColumn = $this->getOrderDateColumn($request);
+
+        if ($request->filled('date_from')) {
+            $dateFrom = $request->date_from;
+            if (is_string($dateFrom) && strlen($dateFrom) === 10) {
+                $dateFrom .= ' 00:00:00';
+            }
+            $query->where($dateColumn, '>=', $dateFrom);
+        }
+
+        if ($request->filled('date_to')) {
+            $dateTo = $request->date_to;
+            if (is_string($dateTo) && strlen($dateTo) === 10) {
+                $dateTo .= ' 23:59:59';
+            }
+            $query->where($dateColumn, '<=', $dateTo);
+        }
+    }
+
     /**
      * List all orders with filters
      * 
@@ -93,16 +119,9 @@ class OrderController extends Controller
         }
 
         // Filter by date range
-        // User Request: "Order Placed" -> created_at, "Last Updated" -> updated_at
-        $dateColumn = ($request->input("date_filter_type") === "updated_at") ? "updated_at" : "created_at";
-
-        if ($request->filled('date_from')) {
-            $query->where($dateColumn, '>=', $request->date_from);
-        }
-
-        if ($request->filled('date_to')) { $dateTo = $request->date_to; if (strlen($dateTo) === 10) $dateTo .= " 23:59:59";
-            $query->where($dateColumn, '<=', $dateTo);
-        }
+        // "Order Placed" uses the business order_date. "Last Updated" uses updated_at.
+        $dateColumn = $this->getOrderDateColumn($request);
+        $this->applyOrderDateFilters($query, $request);
 
         // Search by order number or customer name
         if ($request->filled('search')) {
@@ -2015,13 +2034,7 @@ class OrderController extends Controller
         $query = Order::query();
 
         // Filter by date range
-        if ($request->filled('date_from')) {
-            $query->where($dateColumn, '>=', $request->date_from);
-        }
-
-        if ($request->filled('date_to')) { $dateTo = $request->date_to; if (strlen($dateTo) === 10) $dateTo .= " 23:59:59";
-            $query->where($dateColumn, '<=', $request->date_to);
-        }
+        $this->applyOrderDateFilters($query, $request);
 
         // Filter by store
         if ($request->filled('store_id')) {
@@ -2541,13 +2554,7 @@ class OrderController extends Controller
             $query->where('store_id', $request->store_id);
         }
 
-        if ($request->filled('date_from')) {
-            $query->where($dateColumn, '>=', $request->date_from);
-        }
-
-        if ($request->filled('date_to')) { $dateTo = $request->date_to; if (strlen($dateTo) === 10) $dateTo .= " 23:59:59";
-            $query->where($dateColumn, '<=', $request->date_to);
-        }
+        $this->applyOrderDateFilters($query, $request);
 
         // Search
         if ($request->filled('search')) {
@@ -2561,7 +2568,11 @@ class OrderController extends Controller
         }
 
         // Sort
-        $sortBy = $request->input('sort_by', 'created_at');
+        $dateColumn = $this->getOrderDateColumn($request);
+        $sortBy = $request->input('sort_by', $dateColumn);
+        if (!$sortBy || $sortBy === 'order_date') {
+            $sortBy = $dateColumn;
+        }
         $sortOrder = $request->input('sort_order', 'desc');
         $query->orderBy($sortBy, $sortOrder);
 

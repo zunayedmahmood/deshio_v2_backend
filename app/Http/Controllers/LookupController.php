@@ -6,6 +6,7 @@ use App\Models\ProductBarcode;
 use App\Models\Order;
 use App\Models\ProductBatch;
 use App\Models\PurchaseOrderItem;
+use App\Models\ProductReturn;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\DB;
@@ -177,7 +178,8 @@ class LookupController extends Controller
                     'quantity_ordered' => $poItem->quantity_ordered,
                     'quantity_received' => $poItem->quantity_received,
                     'unit_cost' => $poItem->unit_cost,
-                    'unit_sell_price' => $poItem->unit_sell_price,
+                    'unit_sell_price' => $barcodeRecord->batch?->sell_price ?? $poItem->unit_sell_price,
+                    'purchase_order_unit_sell_price' => $poItem->unit_sell_price,
                     'total_cost' => $poItem->total_cost,
                     'receive_status' => $poItem->receive_status,
                 ],
@@ -458,6 +460,22 @@ class LookupController extends Controller
             ], 404);
         }
 
+        $activeReturns = ProductReturn::where('order_id', $order->id)
+            ->whereNotIn('status', ['rejected', 'cancelled'])
+            ->orderByDesc('created_at')
+            ->get();
+
+        $activeReturn = $activeReturns->first();
+        $activeReturnInfo = $activeReturn ? [
+            'id' => $activeReturn->id,
+            'return_number' => $activeReturn->return_number,
+            'status' => $activeReturn->status,
+            'return_reason' => $activeReturn->return_reason,
+            'return_date' => $activeReturn->return_date?->format('Y-m-d H:i:s'),
+            'total_return_value' => $activeReturn->total_return_value,
+            'total_refund_amount' => $activeReturn->total_refund_amount,
+        ] : null;
+
         // 1. Order Information
         $orderInfo = [
             'id' => $order->id,
@@ -479,6 +497,8 @@ class LookupController extends Controller
             'total_amount' => $order->total_amount,
             'paid_amount' => $order->paid_amount,
             'outstanding_amount' => $order->outstanding_amount,
+            'has_active_return' => $activeReturnInfo !== null,
+            'active_return' => $activeReturnInfo,
         ];
 
         // 2. Customer Information
@@ -507,6 +527,10 @@ class LookupController extends Controller
 
         // 4. Order Items with Barcodes
         $orderItems = collect($order->items)->map(function ($item) {
+            $soldAtUnitPrice = $item->quantity > 0
+                ? round((float) $item->total_amount / (int) $item->quantity, 2)
+                : (float) $item->unit_price;
+
             return [
                 'item_id' => $item->id,
                 'product' => [
@@ -535,6 +559,8 @@ class LookupController extends Controller
                 ] : null,
                 'quantity' => $item->quantity,
                 'unit_price' => $item->unit_price,
+                'listed_unit_price' => $item->unit_price,
+                'sold_at_unit_price' => $soldAtUnitPrice,
                 'discount_amount' => $item->discount_amount,
                 'tax_amount' => $item->tax_amount,
                 'total_amount' => $item->total_amount,
@@ -640,6 +666,16 @@ class LookupController extends Controller
                 'shipments' => $shipmentRecords,
                 'created_by' => $createdBy,
                 'fulfilled_by' => $fulfilledBy,
+                'active_return' => $activeReturnInfo,
+                'active_returns' => $activeReturns->map(function ($return) {
+                    return [
+                        'id' => $return->id,
+                        'return_number' => $return->return_number,
+                        'status' => $return->status,
+                        'return_reason' => $return->return_reason,
+                        'return_date' => $return->return_date?->format('Y-m-d H:i:s'),
+                    ];
+                })->values(),
                 'activity_history' => $activityHistory,
                 'summary' => [
                     'total_items' => count($order->items),

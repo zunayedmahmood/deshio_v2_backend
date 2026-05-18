@@ -370,6 +370,9 @@ class ProductBarcode extends Model
                 'id' => $this->batch->id,
                 'batch_number' => $this->batch->batch_number,
                 'quantity' => $this->batch->quantity,
+                'cost_price' => $this->batch->cost_price,
+                'sell_price' => $this->batch->sell_price,
+                'selling_price' => $this->batch->sell_price,
             ] : null,
         ];
     }

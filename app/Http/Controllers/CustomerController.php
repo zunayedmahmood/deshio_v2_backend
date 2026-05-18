@@ -273,7 +273,7 @@ class CustomerController extends Controller
     {
         $customer = Customer::findOrFail($id);
 
-        $query = $customer->orders()->with(['items.product.images', 'payments']);
+        $query = $customer->orders()->with(['items.product.images', 'payments', 'returns']);
 
         // Filter by status
         if ($request->has('status')) {

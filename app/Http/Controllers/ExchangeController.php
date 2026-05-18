@@ -104,6 +104,13 @@ class ExchangeController extends Controller
             if ($request->order_id) {
                 $originalOrder = Order::findOrFail($request->order_id);
                 $this->assertOrderCanReturnOrExchange($originalOrder);
+
+                $existingReturn = ProductReturn::where('order_id', $originalOrder->id)
+                    ->whereNotIn('status', ['rejected', 'cancelled'])
+                    ->first();
+                if ($existingReturn) {
+                    throw new \Exception("A return request (#{$existingReturn->return_number}) already exists for this order.");
+                }
             }
 
             $storeId = $request->exchangeAtStoreId;
@@ -160,15 +167,18 @@ class ExchangeController extends Controller
                     throw new \Exception("Product batch ID is missing for removed product: " . $item['product_id']);
                 }
 
-                $totalReturnValue += (float) $item['total_price'];
+                $manualUnitPrice = round((float) $item['unit_price'], 2);
+                $itemReturnValue = round($manualUnitPrice * (int) $item['quantity'], 2);
+                $totalReturnValue += $itemReturnValue;
                 $returnItems[] = [
                     'product_id' => $item['product_id'],
                     'product_batch_id' => $batchId,
                     'order_item_id' => $item['order_item_id'] ?? null,
                     'quantity' => $item['quantity'],
-                    'unit_price' => $item['unit_price'],
-                    'total_price' => $item['total_price'],
-                    'refundable_amount' => $item['total_price'],
+                    'unit_price' => $manualUnitPrice,
+                    'manual_sold_at_price' => $manualUnitPrice,
+                    'total_price' => $itemReturnValue,
+                    'refundable_amount' => $itemReturnValue,
                     'return_reason' => $item['return_reason'],
                     'quality_check_passed' => $item['quality_check_passed'],
                     'returned_barcode_ids' => $returnedBarcodeIds,
@@ -645,13 +655,14 @@ class ExchangeController extends Controller
                     $barcode->batch_id = $targetBatch->id; // Update batch if it changed store
                     $barcode->product_id = $targetBatch->product_id; // ✅ Sync product_id
                     $barcode->is_active = true;
+                    $barcode->is_defective = false;
 
                     // Handle replacement barcode logic (mark as open again)
                     if ($barcode->is_replacement) {
                         $this->relabelService->returnBarcodeFromSold($barcode, $return->order);
                     }
 
-                    $barcode->updateLocation($returnStore, 'in_warehouse', [
+                    $barcode->updateLocation($returnStore, 'available', [
                         'return_id' => $return->id,
                         'reference_type' => 'return',
                         'reference_id' => $return->id,

@@ -143,6 +143,9 @@ class ProductReturnController extends Controller
             'items.*.quantity' => 'required|integer|min:1',
             'items.*.product_barcode_id' => 'nullable|exists:product_barcodes,id',
             'items.*.barcode_id' => 'nullable|exists:product_barcodes,id',
+            'items.*.unit_price' => 'nullable|numeric|min:0',
+            'items.*.manual_sold_at_price' => 'nullable|numeric|min:0',
+            'items.*.total_price' => 'nullable|numeric|min:0',
             'items.*.reason' => 'nullable|string',
             'customer_notes' => 'nullable|string',
         ]);
@@ -183,7 +186,8 @@ class ProductReturnController extends Controller
                     throw new \Exception("Unable to identify sold barcode units for {$orderItem->product_name}.");
                 }
 
-                $itemReturnValue = $item['quantity'] * $orderItem->unit_price;
+                $soldAtPrice = $this->resolveReturnItemSoldAtPrice($item, $orderItem);
+                $itemReturnValue = round((int) $item['quantity'] * $soldAtPrice, 2);
                 $totalReturnValue += $itemReturnValue;
 
                 $returnItems[] = [
@@ -192,7 +196,10 @@ class ProductReturnController extends Controller
                     'product_batch_id' => $orderItem->product_batch_id,
                     'product_name' => $orderItem->product_name,
                     'quantity' => $item['quantity'],
-                    'unit_price' => $orderItem->unit_price,
+                    'unit_price' => $soldAtPrice,
+                    'manual_sold_at_price' => $soldAtPrice,
+                    'original_unit_price' => $orderItem->unit_price,
+                    'order_item_discount_amount' => $orderItem->discount_amount,
                     'total_price' => $itemReturnValue,
                     'reason' => $item['reason'] ?? null,
                     'returned_barcode_ids' => $returnableBarcodes->pluck('id')->values()->all(),
@@ -229,8 +236,12 @@ class ProductReturnController extends Controller
             // 3. Approve (logic from approve())
             $return->approve($employee);
 
-            // 4. Restore Inventory (Logic inside approve handles this)
-            $this->restoreInventoryForReturn($return, $employee);
+            // 4. Restore only non-defective returns. Defective-related returns must not become sellable.
+            if ($this->isDefectiveReturnReason($return->return_reason)) {
+                $this->markReturnedBarcodesAsDefective($return, $employee);
+            } else {
+                $this->restoreInventoryForReturn($return, $employee);
+            }
 
             // 5. Process
             $return->process($employee);
@@ -270,6 +281,9 @@ class ProductReturnController extends Controller
             'items.*.quantity' => 'required|integer|min:1',
             'items.*.product_barcode_id' => 'nullable|exists:product_barcodes,id',
             'items.*.barcode_id' => 'nullable|exists:product_barcodes,id',
+            'items.*.unit_price' => 'nullable|numeric|min:0',
+            'items.*.manual_sold_at_price' => 'nullable|numeric|min:0',
+            'items.*.total_price' => 'nullable|numeric|min:0',
             'items.*.reason' => 'nullable|string',
             'customer_notes' => 'nullable|string',
             'attachments' => 'nullable|array',
@@ -321,7 +335,8 @@ class ProductReturnController extends Controller
                     throw new \Exception("Unable to identify {$item['quantity']} sold barcode unit(s) for {$orderItem->product_name}. Return requires sold barcode tracking.");
                 }
 
-                $itemReturnValue = $item['quantity'] * $orderItem->unit_price;
+                $soldAtPrice = $this->resolveReturnItemSoldAtPrice($item, $orderItem);
+                $itemReturnValue = round((int) $item['quantity'] * $soldAtPrice, 2);
                 $totalReturnValue += $itemReturnValue;
 
                 $returnItems[] = [
@@ -330,7 +345,10 @@ class ProductReturnController extends Controller
                     'product_batch_id' => $orderItem->product_batch_id,
                     'product_name' => $orderItem->product_name,
                     'quantity' => $item['quantity'],
-                    'unit_price' => $orderItem->unit_price,
+                    'unit_price' => $soldAtPrice,
+                    'manual_sold_at_price' => $soldAtPrice,
+                    'original_unit_price' => $orderItem->unit_price,
+                    'order_item_discount_amount' => $orderItem->discount_amount,
                     'total_price' => $itemReturnValue,
                     'reason' => $item['reason'] ?? null,
                     'returned_barcode_ids' => $returnableBarcodes->pluck('id')->values()->all(),
@@ -493,8 +511,12 @@ class ProductReturnController extends Controller
 
             $return->approve($employee);
 
-            // Requirement: accepted return should immediately restore inventory in receiving store.
-            $this->restoreInventoryForReturn($return, $employee);
+            // Requirement: accepted non-defective return should immediately restore inventory in receiving store.
+            if ($this->isDefectiveReturnReason($return->return_reason)) {
+                $this->markReturnedBarcodesAsDefective($return, $employee);
+            } else {
+                $this->restoreInventoryForReturn($return, $employee);
+            }
 
             $return->save();
 
@@ -574,7 +596,11 @@ class ProductReturnController extends Controller
 
             // Keep endpoint backward-compatible but make restoration idempotent.
             if ($request->get('restore_inventory', true)) {
-                $this->restoreInventoryForReturn($return, $employee);
+                if ($this->isDefectiveReturnReason($return->return_reason)) {
+                    $this->markReturnedBarcodesAsDefective($return, $employee);
+                } else {
+                    $this->restoreInventoryForReturn($return, $employee);
+                }
             }
 
             $return->process($employee);
@@ -615,14 +641,7 @@ class ProductReturnController extends Controller
             }
 
             // Check if return reason is defective-related
-            $defectiveReasons = [
-                'defective_product',
-                'quality_issue',
-                'not_as_described',
-                'wrong_item'
-            ];
-
-            $autoMarkDefective = in_array($return->return_reason, $defectiveReasons);
+            $autoMarkDefective = $this->isDefectiveReturnReason($return->return_reason);
             $markedAsDefective = [];
             $failedToMark = [];
 
@@ -800,6 +819,32 @@ class ProductReturnController extends Controller
         }
     }
 
+    private function resolveReturnItemSoldAtPrice(array $item, OrderItem $orderItem): float
+    {
+        foreach (['manual_sold_at_price', 'unit_price', 'sold_at_price'] as $key) {
+            if (array_key_exists($key, $item) && $item[$key] !== null && $item[$key] !== '') {
+                return round((float) $item[$key], 2);
+            }
+        }
+
+        $quantity = max(1, (int) $orderItem->quantity);
+        if ($orderItem->total_amount !== null) {
+            return round((float) $orderItem->total_amount / $quantity, 2);
+        }
+
+        return round((float) $orderItem->unit_price, 2);
+    }
+
+    private function isDefectiveReturnReason(?string $returnReason): bool
+    {
+        return in_array($returnReason, [
+            'defective_product',
+            'quality_issue',
+            'not_as_described',
+            'wrong_item',
+        ], true);
+    }
+
     private function getExactReturnableBarcodeForOrderItem(Order $order, OrderItem $orderItem, int $barcodeId, int $quantity): ProductBarcode
     {
         if ($quantity !== 1) {
@@ -855,6 +900,38 @@ class ProductReturnController extends Controller
         });
 
         return $query->take($requiredQty)->get();
+    }
+
+    private function markReturnedBarcodesAsDefective(ProductReturn $return, Employee $employee): void
+    {
+        $returnStore = $return->received_at_store_id ?? $return->store_id;
+
+        foreach ($return->return_items ?? [] as $item) {
+            $barcodeIds = collect($item['returned_barcode_ids'] ?? [])->filter()->values();
+            if ($barcodeIds->isEmpty()) {
+                continue;
+            }
+
+            $barcodes = ProductBarcode::whereIn('id', $barcodeIds)->lockForUpdate()->get();
+            foreach ($barcodes as $barcode) {
+                $barcode->updateLocation(
+                    $returnStore,
+                    'defective',
+                    [
+                        'return_id' => $return->id,
+                        'return_reason' => $return->return_reason,
+                        'defective_from_return' => true,
+                        'returned_at' => now()->toISOString(),
+                    ],
+                    true,
+                    $employee->id
+                );
+
+                $barcode->is_active = false;
+                $barcode->is_defective = true;
+                $barcode->save();
+            }
+        }
     }
 
     private function restoreInventoryForReturn(ProductReturn $return, Employee $employee): void
@@ -933,7 +1010,7 @@ class ProductReturnController extends Controller
 
                 $barcode->updateLocation(
                     $returnStore,
-                    'in_warehouse',
+                    'available',
                     [
                         'return_id' => $return->id,
                         'return_reason' => $return->return_reason,
@@ -945,6 +1022,7 @@ class ProductReturnController extends Controller
                 );
 
                 $barcode->is_active = true;
+                $barcode->is_defective = false;
                 if ((int) $originalBatch->store_id !== (int) $returnStore) {
                     $barcode->batch_id = $targetBatch->id;
                 }

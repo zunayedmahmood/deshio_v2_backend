@@ -25,7 +25,7 @@ class EcommerceCatalogController extends Controller
      * Architecture — two-step approach to avoid MySQL ONLY_FULL_GROUP_BY errors:
      *   Step 1: buildFilterQuery() — raw DB::table query, explicit columns only (no SELECT *),
      *           every non-aggregate column in SELECT is also in GROUP BY.
-     *   Step 2: Eloquent with(['images','category','batches']) on the resolved IDs/base_names.
+     *   Step 2: Eloquent with(['images','category','batches']) on the resolved IDs/SKUs.
      */
     public function getProducts(Request $request)
     {
@@ -76,7 +76,7 @@ class EcommerceCatalogController extends Controller
      *  - Text search uses correlated WHERE EXISTS sub-selects to avoid
      *    joining more tables that would force more GROUP BY columns.
      *
-     * Returned columns: id, base_name, category_id, created_at,
+     * Returned columns: id, sku, base_name, category_id, created_at,
      *                   min_batch_price, total_qty
      */
         private function buildFilterQuery(
@@ -97,13 +97,14 @@ class EcommerceCatalogController extends Controller
             ->where('products.is_archived', false)
             ->select([
                 'products.id',
+                'products.sku',
                 'products.base_name',
                 'products.created_at',
                 DB::raw('MIN(product_batches.sell_price) AS min_batch_price'),
                 // We keep category_id in select/groupby because it's often needed for further filtering/grouping
                 'products.category_id', 
             ])
-            ->groupBy('products.id', 'products.base_name', 'products.created_at', 'products.category_id');
+            ->groupBy('products.id', 'products.sku', 'products.base_name', 'products.created_at', 'products.category_id');
 
         if ($categoryIds !== null) {
             $q->whereIn('products.category_id', $categoryIds);
@@ -159,11 +160,11 @@ class EcommerceCatalogController extends Controller
     }
 
     /**
-     * Grouped listing: groups by base_name ("mother products"), paginates groups,
-     * then fetches full Eloquent data for the page's base_names.
+     * Grouped listing: groups by SKU, paginates SKU groups,
+     * then fetches full Eloquent data for the page's SKUs.
      *
-     * The outer GROUP BY base_name subquery is ONLY_FULL_GROUP_BY-safe because it
-     * selects only base_name plus aggregates — no raw product columns leak through.
+     * The outer GROUP BY sku subquery is ONLY_FULL_GROUP_BY-safe because it
+     * selects only sku plus aggregates — no raw product columns leak through.
      */
         private function getGroupedProducts(
         Request $request,
@@ -182,15 +183,16 @@ class EcommerceCatalogController extends Controller
         // Step 1: Build the inner query that applies all filters and joins.
         $baseQ = $this->buildFilterQuery($categoryIds, $minPrice, $maxPrice, $sortBy, $search, $inStock);
 
-        // Subquery wrap: group by base_name. NO select * here.
+        // Subquery wrap: group by SKU. NO select * here.
         $groupQ = DB::table(DB::raw("({$baseQ->toSql()}) AS pq"))
             ->mergeBindings($baseQ)
             ->select([
-                'base_name',
+                'sku',
+                DB::raw('MIN(base_name) AS group_base_name'),
                 DB::raw('MIN(min_batch_price) AS group_min_price'),
                 DB::raw('MAX(created_at)      AS latest_created_at'),
             ])
-            ->groupBy('base_name');
+            ->groupBy('sku');
 
         // Sorting groups
         if ($sortBy === 'price_asc') {
@@ -198,7 +200,7 @@ class EcommerceCatalogController extends Controller
         } elseif ($sortBy === 'price_desc') {
             $groupQ->orderBy('group_min_price', 'desc');
         } elseif ($sortBy === 'name') {
-            $groupQ->orderBy('base_name', 'asc');
+            $groupQ->orderBy('group_base_name', 'asc');
         } else {
             $groupQ->orderBy('latest_created_at', 'desc');
         }
@@ -209,23 +211,23 @@ class EcommerceCatalogController extends Controller
 
         // Paginate groups
         $pagedGroups = $groupQ->offset(($page - 1) * $perPage)->limit($perPage)->get();
-        $baseNames   = $pagedGroups->pluck('base_name')->filter()->values();
+        $skus        = $pagedGroups->pluck('sku')->filter()->values();
 
-        if ($baseNames->isEmpty()) {
+        if ($skus->isEmpty()) {
             return $this->emptyResponse($request, $perPage, $categorySlug, $categoryId, $minPrice, $maxPrice, $search, $sortBy, true);
         }
 
         // Step 2: Load Eloquent models only for the filtered and paginated results.
         $allVariants = Product::with(['images', 'category', 'batches.store'])
-            ->whereIn('base_name', $baseNames)
+            ->whereIn('sku', $skus)
             ->where('is_archived', false)
             ->whereNull('deleted_at')
             ->get();
-        $variantsByBaseName = $allVariants->groupBy('base_name');
+        $variantsBySku = $allVariants->groupBy('sku');
 
         $orderedResult = [];
-        foreach ($baseNames as $baseName) {
-            $group = $variantsByBaseName->get($baseName);
+        foreach ($skus as $sku) {
+            $group = $variantsBySku->get($sku);
             if (!$group || $group->isEmpty()) continue;
 
             // Sort variants within group for deterministic main product

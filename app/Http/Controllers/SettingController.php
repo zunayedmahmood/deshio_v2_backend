@@ -506,7 +506,7 @@ class SettingController extends Controller
                 $file = $uploadedFiles[$item['fileIndex']];
                 $path = $file->store('homepage/bannered', 'public');
                 $banneredItem['override_image'] = [
-                    'url' => asset('storage/' . ltrim($path, '/')),
+                    'url' => '/storage/' . ltrim($path, '/'),
                     'path' => $path,
                 ];
             } else {
@@ -557,7 +557,7 @@ class SettingController extends Controller
                     $file = $uploadedFiles[$item['fileIndex']];
                     $path = $file->store('homepage', 'public');
                     $newImages[] = [
-                        'url' => asset('storage/' . ltrim($path, '/')),
+                        'url' => '/storage/' . ltrim($path, '/'),
                         'path' => $path,
                     ];
                 }

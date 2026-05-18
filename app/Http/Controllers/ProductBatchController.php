@@ -702,6 +702,8 @@ class ProductBatchController extends Controller
         $validator = Validator::make($request->all(), [
             'sell_price' => 'nullable|required_without:cost_price|numeric|min:0',
             'cost_price' => 'nullable|required_without:sell_price|numeric|min:0',
+            'product_ids' => 'nullable|array',
+            'product_ids.*' => 'integer|exists:products,id',
         ]);
 
         if ($validator->fails()) {
@@ -722,18 +724,34 @@ class ProductBatchController extends Controller
                 ], 404);
             }
 
+            $targetProductIds = $request->filled('product_ids')
+                ? collect($request->input('product_ids'))
+                    ->map(fn ($id) => (int) $id)
+                    ->filter(fn ($id) => $id > 0)
+                    ->unique()
+                    ->values()
+                    ->all()
+                : [(int) $productId];
+
+            if (empty($targetProductIds)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'No products selected for batch price update',
+                ], 422);
+            }
+
             $hasSellPrice = $request->filled('sell_price');
             $hasCostPrice = $request->filled('cost_price');
             $newSellPrice = $hasSellPrice ? (float)$request->sell_price : null;
             $newCostPrice = $hasCostPrice ? (float)$request->cost_price : null;
 
-            // Get all batches for this product
-            $batches = ProductBatch::where('product_id', $productId)->with(['store', 'product'])->get();
+            // Get all batches for the selected product(s)
+            $batches = ProductBatch::whereIn('product_id', $targetProductIds)->with(['store', 'product'])->get();
 
             if ($batches->isEmpty()) {
                 return response()->json([
                     'success' => false,
-                    'message' => 'No batches found for this product',
+                    'message' => 'No batches found for selected products',
                 ], 404);
             }
 
@@ -785,6 +803,7 @@ class ProductBatchController extends Controller
                     'message' => 'Successfully updated batch prices',
                     'data' => [
                         'product_id' => $product->id,
+                        'product_ids' => $targetProductIds,
                         'product_name' => $product->name,
                         'product_sku' => $product->sku,
                         'new_sell_price' => $hasSellPrice ? number_format((float)$newSellPrice, 2) : null,

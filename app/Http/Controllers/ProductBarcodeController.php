@@ -30,7 +30,8 @@ class ProductBarcodeController extends Controller
     public function scan(Request $request)
     {
         $validator = Validator::make($request->all(), [
-            'barcode' => 'required|string'
+            'barcode' => 'required|string',
+            'store_id' => 'nullable|integer|exists:stores,id',
         ]);
 
         if ($validator->fails()) {
@@ -48,6 +49,21 @@ class ProductBarcodeController extends Controller
                 'success' => false,
                 'message' => $scanResult['message']
             ], 404);
+        }
+
+        if ($request->filled('store_id')) {
+            $selectedStoreId = (int) $request->store_id;
+            $productName = $scanResult['product']->name ?? 'Product';
+            $batchStoreId = $scanResult['current_batch']->store_id ?? null;
+            $currentStoreId = $scanResult['current_location']->id ?? null;
+
+            if (($batchStoreId && (int) $batchStoreId !== $selectedStoreId) ||
+                ($currentStoreId && (int) $currentStoreId !== $selectedStoreId)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Product "' . $productName . '" is not available in this store'
+                ], 422);
+            }
         }
 
         return response()->json([
@@ -79,6 +95,7 @@ class ProductBarcodeController extends Controller
                 'current_batch' => $scanResult['current_batch'] ? [
                     'id' => $scanResult['current_batch']->id,
                     'batch_number' => $scanResult['current_batch']->batch_number,
+                    'store_id' => $scanResult['current_batch']->store_id,
                     'quantity' => $scanResult['current_batch']->quantity,
                     'cost_price' => number_format((float)$scanResult['current_batch']->cost_price, 2),
                     'sell_price' => number_format((float)$scanResult['current_batch']->sell_price, 2),

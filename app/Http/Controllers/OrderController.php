@@ -524,7 +524,7 @@ class OrderController extends Controller
                 // Validate batch belongs to the store (only if batch exists AND store_id is provided)
                 // For social_commerce/ecommerce without store_id, skip this validation (store assigned later)
                 if ($batch && $request->store_id && $batch->store_id != $request->store_id) {
-                    throw new \Exception("Product batch not available at this store");
+                    throw new \Exception("Product \"{$product->name}\" is not available in this store.");
                 }
 
                 // Handle barcode if provided (optional for backward compatibility)
@@ -1824,8 +1824,12 @@ class OrderController extends Controller
                     throw new \Exception("Batch not found for item {$item->product_name}");
                 }
 
+                if ($order->store_id && $batch->store_id && (int) $batch->store_id !== (int) $order->store_id) {
+                    throw new \Exception("Product \"{$item->product_name}\" is not available in this store.");
+                }
+
                 if ($batch->quantity < $item->quantity) {
-                    throw new \Exception("Insufficient stock for {$item->product_name}. Available: {$batch->quantity}");
+                    throw new \Exception("Order creation failed for {$item->product_name}: insufficient stock. Available: {$batch->quantity}");
                 }
 
                 // Handle barcode-tracked items (check if barcode exists and is not null)

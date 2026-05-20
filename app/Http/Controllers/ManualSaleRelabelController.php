@@ -98,9 +98,13 @@ class ManualSaleRelabelController extends Controller
                 $batch = ProductBatch::findOrFail($itemData['batch_id']);
                 $quantity = (int)$itemData['quantity'];
                 
+                if ($batch->store_id && (int) $batch->store_id !== (int) $request->store_id) {
+                    throw new \Exception("Product \"{$product->name}\" is not available in this store.");
+                }
+
                 // Validate stock (both local and global)
                 if ($batch->quantity < $quantity) {
-                    throw new \Exception("Insufficient stock for {$product->name}. Available: {$batch->quantity}");
+                    throw new \Exception("Order creation failed for {$product->name}: insufficient stock. Available: {$batch->quantity}");
                 }
 
                 // Check global reservation table

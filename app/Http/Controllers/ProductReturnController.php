@@ -914,22 +914,41 @@ class ProductReturnController extends Controller
 
             $barcodes = ProductBarcode::whereIn('id', $barcodeIds)->lockForUpdate()->get();
             foreach ($barcodes as $barcode) {
-                $barcode->updateLocation(
-                    $returnStore,
-                    'defective',
-                    [
-                        'return_id' => $return->id,
-                        'return_reason' => $return->return_reason,
-                        'defective_from_return' => true,
-                        'returned_at' => now()->toISOString(),
-                    ],
-                    true,
-                    $employee->id
-                );
+                $oldStatus = $barcode->current_status;
 
-                $barcode->is_active = false;
-                $barcode->is_defective = true;
-                $barcode->save();
+                // Single atomic update for all barcode fields
+                $barcode->update([
+                    'current_status'     => 'defective',
+                    'is_active'          => false,
+                    'is_defective'       => true,
+                    'current_store_id'   => $returnStore,
+                    'location_updated_at' => now(),
+                    'location_metadata'   => array_merge($barcode->location_metadata ?? [], [
+                        'return_id'           => $return->id,
+                        'return_reason'       => $return->return_reason,
+                        'defective_from_return' => true,
+                        'returned_at'         => now()->toISOString(),
+                        'previous_status'     => $oldStatus,
+                    ]),
+                ]);
+
+                // Create movement record for audit trail
+                if ($oldStatus !== 'defective') {
+                    ProductMovement::create([
+                        'product_id'         => $item['product_id'] ?? $barcode->product_id,
+                        'product_batch_id'   => $barcode->batch_id,
+                        'product_barcode_id' => $barcode->id,
+                        'to_store_id'        => $returnStore,
+                        'movement_type'      => 'return',
+                        'quantity'           => 1,
+                        'status_before'      => $oldStatus,
+                        'status_after'       => 'defective',
+                        'reference_type'     => 'return',
+                        'reference_id'       => $return->id,
+                        'notes'              => "Defective return: {$return->return_number}",
+                        'performed_by'       => $employee->id,
+                    ]);
+                }
             }
         }
     }
@@ -1003,30 +1022,44 @@ class ProductReturnController extends Controller
             }
 
             foreach ($barcodes as $barcode) {
+                $oldStatus = $barcode->current_status;
+
                 // Handle replacement barcode logic (mark as open again)
                 if ($barcode->is_replacement) {
                     $this->relabelService->returnBarcodeFromSold($barcode, $return->order);
                 }
 
-                $barcode->updateLocation(
-                    $returnStore,
-                    'available',
-                    [
-                        'return_id' => $return->id,
-                        'return_reason' => $return->return_reason,
-                        'returned_at' => now()->toISOString(),
+                // Use a single atomic update to restore ALL barcode fields at once.
+                // This avoids split-write issues where current_status and is_active
+                // could end up out of sync if saved in separate calls.
+                $barcode->update([
+                    'current_status'     => 'available',
+                    'is_active'          => true,
+                    'is_defective'       => false,
+                    'current_store_id'   => $returnStore,
+                    'batch_id'           => ((int) $originalBatch->store_id !== (int) $returnStore)
+                                                ? $targetBatch->id
+                                                : $barcode->batch_id,
+                    'location_updated_at' => now(),
+                    'location_metadata'   => array_merge($barcode->location_metadata ?? [], [
+                        'return_id'          => $return->id,
+                        'return_reason'      => $return->return_reason,
+                        'returned_at'        => now()->toISOString(),
                         'cross_store_return' => (int) $originalBatch->store_id !== (int) $returnStore,
-                        'original_store_id' => $originalBatch->store_id,
-                    ],
-                    false
-                );
+                        'original_store_id'  => $originalBatch->store_id,
+                        'previous_status'    => $oldStatus,
+                    ]),
+                ]);
 
-                $barcode->is_active = true;
-                $barcode->is_defective = false;
-                if ((int) $originalBatch->store_id !== (int) $returnStore) {
-                    $barcode->batch_id = $targetBatch->id;
-                }
-                $barcode->save();
+                Log::info('Barcode restored after return', [
+                    'barcode_id'      => $barcode->id,
+                    'barcode'         => $barcode->barcode,
+                    'return_id'       => $return->id,
+                    'old_status'      => $oldStatus,
+                    'new_status'      => $barcode->current_status,
+                    'is_active'       => $barcode->is_active,
+                    'store_id'        => $returnStore,
+                ]);
 
                 ProductMovement::create([
                     'product_id' => $item['product_id'],

@@ -127,6 +127,16 @@ class FloatingBarcodeRelabelService
             throw new \Exception("Barcode {$barcode->barcode} is not associated with any batch.");
         }
 
+        if ($order && $order->store_id) {
+            $productName = $barcode->product->name ?? 'Product';
+            if ($barcode->batch->store_id && (int)$barcode->batch->store_id !== (int)$order->store_id) {
+                throw new \Exception("Product \"{$productName}\" is not available in this store.");
+            }
+            if ($barcode->current_store_id && (int)$barcode->current_store_id !== (int)$order->store_id) {
+                throw new \Exception("Product \"{$productName}\" is not available in this store.");
+            }
+        }
+
         if ((int)$barcode->batch->quantity < 1) {
             throw new \Exception("Product batch {$barcode->batch->batch_number} has no stock available.");
         }
@@ -141,7 +151,7 @@ class FloatingBarcodeRelabelService
         $reservedElsewhere = OrderItem::where('product_barcode_id', $barcode->id)
             ->when($ignoreOrderItemId, fn($q) => $q->where('id', '!=', $ignoreOrderItemId))
             ->whereHas('order', function ($q) {
-                $q->whereNotIn('status', ['cancelled', 'delivered']);
+                $q->whereNotIn('status', ['cancelled', 'delivered', 'completed', 'refunded', 'returned']);
             })
             ->exists();
 

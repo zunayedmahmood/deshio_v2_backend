@@ -652,22 +652,58 @@ class ExchangeController extends Controller
 
             if ($barcodes->isNotEmpty()) {
                 foreach ($barcodes as $barcode) {
-                    $barcode->batch_id = $targetBatch->id; // Update batch if it changed store
-                    $barcode->product_id = $targetBatch->product_id; // ✅ Sync product_id
-                    $barcode->is_active = true;
-                    $barcode->is_defective = false;
+                    $oldStatus = $barcode->current_status;
 
                     // Handle replacement barcode logic (mark as open again)
                     if ($barcode->is_replacement) {
                         $this->relabelService->returnBarcodeFromSold($barcode, $return->order);
                     }
 
-                    $barcode->updateLocation($returnStore, 'available', [
-                        'return_id' => $return->id,
+                    // Use a single atomic update to restore ALL barcode fields at once.
+                    $barcode->update([
+                        'batch_id'           => $targetBatch->id,
+                        'product_id'         => $targetBatch->product_id,
+                        'is_active'          => true,
+                        'is_defective'       => false,
+                        'current_store_id'   => $returnStore,
+                        'current_status'     => 'available',
+                        'location_updated_at' => now(),
+                        'location_metadata'   => array_merge($barcode->location_metadata ?? [], [
+                            'return_id' => $return->id,
+                            'reference_type' => 'return',
+                            'reference_id' => $return->id,
+                            'notes' => "Customer Return via Exchange. Reason: " . ($item['return_reason'] ?? 'N/A'),
+                            'previous_status' => $oldStatus,
+                        ]),
+                    ]);
+
+                    // Create movement record for audit trail
+                    ProductMovement::create([
+                        'product_id' => $item['product_id'],
+                        'product_batch_id' => $targetBatch->id,
+                        'product_barcode_id' => $barcode->id,
+                        'to_store_id' => $returnStore,
+                        'movement_type' => 'return',
+                        'quantity' => 1,
+                        'unit_cost' => $originalBatch->cost_price,
+                        'total_cost' => $originalBatch->cost_price,
                         'reference_type' => 'return',
                         'reference_id' => $return->id,
-                        'notes' => "Customer Return via Exchange. Reason: " . ($item['return_reason'] ?? 'N/A')
-                    ], true, $employee->id);
+                        'status_before' => $oldStatus,
+                        'status_after' => 'available',
+                        'notes' => "Customer Return via Exchange #{$return->return_number}",
+                        'performed_by' => $employee->id,
+                    ]);
+
+                    Log::info('Barcode restored after exchange return', [
+                        'barcode_id'  => $barcode->id,
+                        'barcode'     => $barcode->barcode,
+                        'return_id'   => $return->id,
+                        'old_status'  => $oldStatus,
+                        'new_status'  => $barcode->current_status,
+                        'is_active'   => $barcode->is_active,
+                        'store_id'    => $returnStore,
+                    ]);
                 }
             } else {
                 // Fallback for products that might not have barcodes (if any)

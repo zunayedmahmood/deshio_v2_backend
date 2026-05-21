@@ -180,86 +180,41 @@ class EcommerceCatalogController extends Controller
     ) {
         $page  = max(1, (int) $request->get('page', 1));
 
-        if ($search) {
-            $scored = $this->searchAndScore($search, $categoryIds, $minPrice, $maxPrice, $inStock);
-            $candidates = $scored['candidates'];
-            
-            // Group by SKU
-            $groupsBySku = [];
-            foreach ($candidates as $candidate) {
-                $groupsBySku[$candidate['sku']][] = $candidate;
-            }
-            
-            // For each SKU group, calculate the max score and best item
-            $rankedSkuGroups = [];
-            foreach ($groupsBySku as $sku => $variants) {
-                $bestVariant = $variants[0];
-                $rankedSkuGroups[] = [
-                    'sku' => $sku,
-                    'max_score' => $bestVariant['score'],
-                    'best_variant' => $bestVariant,
-                ];
-            }
-            
-            // Sort ranked SKU groups
-            usort($rankedSkuGroups, function ($a, $b) {
-                if ($b['max_score'] !== $a['max_score']) {
-                    return $b['max_score'] <=> $a['max_score'];
-                }
-                $aSuffix = $a['best_variant']['is_meaningful_suffix'] ? 1 : 0;
-                $bSuffix = $b['best_variant']['is_meaningful_suffix'] ? 1 : 0;
-                if ($aSuffix !== $bSuffix) {
-                    return $bSuffix <=> $aSuffix;
-                }
-                return strcmp($a['best_variant']['created_at'], $b['best_variant']['created_at']);
-            });
-            
-            $totalGroups = count($rankedSkuGroups);
-            $lastPage = max(1, (int) ceil($totalGroups / $perPage));
-            
-            $pagedSkuGroups = array_slice($rankedSkuGroups, ($page - 1) * $perPage, $perPage);
-            $skus = collect($pagedSkuGroups)->pluck('sku')->filter()->values();
-            
-            if ($skus->isEmpty()) {
-                return $this->emptyResponse($request, $perPage, $categorySlug, $categoryId, $minPrice, $maxPrice, $search, $sortBy, true);
-            }
+        // Step 1: Build the inner query that applies all filters and joins.
+        $baseQ = $this->buildFilterQuery($categoryIds, $minPrice, $maxPrice, $sortBy, $search, $inStock);
+
+        // Subquery wrap: group by SKU. NO select * here.
+        $groupQ = DB::table(DB::raw("({$baseQ->toSql()}) AS pq"))
+            ->mergeBindings($baseQ)
+            ->select([
+                'sku',
+                DB::raw('MIN(base_name) AS group_base_name'),
+                DB::raw('MIN(min_batch_price) AS group_min_price'),
+                DB::raw('MAX(created_at)      AS latest_created_at'),
+            ])
+            ->groupBy('sku');
+
+        // Sorting groups
+        if ($sortBy === 'price_asc') {
+            $groupQ->orderBy('group_min_price', 'asc');
+        } elseif ($sortBy === 'price_desc') {
+            $groupQ->orderBy('group_min_price', 'desc');
+        } elseif ($sortBy === 'name') {
+            $groupQ->orderBy('group_base_name', 'asc');
         } else {
-            // Step 1: Build the inner query that applies all filters and joins.
-            $baseQ = $this->buildFilterQuery($categoryIds, $minPrice, $maxPrice, $sortBy, $search, $inStock);
+            $groupQ->orderBy('latest_created_at', 'desc');
+        }
 
-            // Subquery wrap: group by SKU. NO select * here.
-            $groupQ = DB::table(DB::raw("({$baseQ->toSql()}) AS pq"))
-                ->mergeBindings($baseQ)
-                ->select([
-                    'sku',
-                    DB::raw('MIN(base_name) AS group_base_name'),
-                    DB::raw('MIN(min_batch_price) AS group_min_price'),
-                    DB::raw('MAX(created_at)      AS latest_created_at'),
-                ])
-                ->groupBy('sku');
+        // Count groups safely
+        $totalGroupsRaw = DB::select("select count(*) as aggregate from (" . $groupQ->toSql() . ") AS gq", $groupQ->getBindings());
+        $totalGroups = $totalGroupsRaw[0]->aggregate ?? 0;
 
-            // Sorting groups
-            if ($sortBy === 'price_asc') {
-                $groupQ->orderBy('group_min_price', 'asc');
-            } elseif ($sortBy === 'price_desc') {
-                $groupQ->orderBy('group_min_price', 'desc');
-            } elseif ($sortBy === 'name') {
-                $groupQ->orderBy('group_base_name', 'asc');
-            } else {
-                $groupQ->orderBy('latest_created_at', 'desc');
-            }
+        // Paginate groups
+        $pagedGroups = $groupQ->offset(($page - 1) * $perPage)->limit($perPage)->get();
+        $skus        = $pagedGroups->pluck('sku')->filter()->values();
 
-            // Count groups safely
-            $totalGroupsRaw = DB::select("select count(*) as aggregate from (" . $groupQ->toSql() . ") AS gq", $groupQ->getBindings());
-            $totalGroups = $totalGroupsRaw[0]->aggregate ?? 0;
-
-            // Paginate groups
-            $pagedGroups = $groupQ->offset(($page - 1) * $perPage)->limit($perPage)->get();
-            $skus        = $pagedGroups->pluck('sku')->filter()->values();
-
-            if ($skus->isEmpty()) {
-                return $this->emptyResponse($request, $perPage, $categorySlug, $categoryId, $minPrice, $maxPrice, $search, $sortBy, true);
-            }
+        if ($skus->isEmpty()) {
+            return $this->emptyResponse($request, $perPage, $categorySlug, $categoryId, $minPrice, $maxPrice, $search, $sortBy, true);
         }
 
         // Step 2: Load Eloquent models only for the filtered and paginated results.
@@ -276,17 +231,10 @@ class EcommerceCatalogController extends Controller
             if (!$group || $group->isEmpty()) continue;
 
             // Sort variants within group for deterministic main product
-            if ($search) {
-                $group = $group->sortByDesc(function ($p) use ($scored) {
-                    return $scored['scores'][$p->id] ?? 0;
-                });
-            } else {
-                $group = $group->sortBy(function ($p) {
-                    $price = $p->batches->where('is_active', true)->where('availability', true)->where('quantity', '>', 0)->min('sell_price');
-                    return $price ?? PHP_INT_MAX;
-                });
-            }
-            $mainProduct = $group->first();
+            $mainProduct = $group->sortBy(function ($p) {
+                $price = $p->batches->where('is_active', true)->where('availability', true)->where('quantity', '>', 0)->min('sell_price');
+                return $price ?? PHP_INT_MAX;
+            })->first() ?? $group->first();
 
             $groupMin = $group->min(fn($p) => $p->batches->where('is_active', true)->where('availability', true)->min('sell_price'));
             $groupMax = $group->max(fn($p) => $p->batches->where('is_active', true)->where('availability', true)->max('sell_price'));
@@ -302,7 +250,6 @@ class EcommerceCatalogController extends Controller
                 'name'             => $mainProduct->name,
                 'base_name'        => $mainProduct->base_name,
                 'variation_suffix' => $mainProduct->variation_suffix,
-                'semantic_name'    => self::extractSemanticName($mainProduct->base_name),
                 'sku'              => $mainProduct->sku,
                 'description'      => $mainProduct->description,
                 'category'         => $mainProduct->category,
@@ -331,7 +278,6 @@ class EcommerceCatalogController extends Controller
                     'total'          => $totalGroups,
                     'has_more_pages' => $page < $lastPage,
                 ],
-                'did_you_mean'     => $search ? ($scored['suggestion'] ?? null) : null,
                 'filters_applied' => [
                     'category_slug' => $categorySlug,
                     'category_id'   => $categoryId,
@@ -362,58 +308,34 @@ class EcommerceCatalogController extends Controller
         $categoryId
     ) {
         $page  = max(1, (int) $request->get('page', 1));
+        $baseQ = $this->buildFilterQuery($categoryIds, $minPrice, $maxPrice, $sortBy, $search, $inStock);
 
-        if ($search) {
-            $scored = $this->searchAndScore($search, $categoryIds, $minPrice, $maxPrice, $inStock);
-            $candidates = $scored['candidates'];
-            
-            $total = count($candidates);
-            $lastPage = max(1, (int) ceil($total / $perPage));
-            
-            $pagedCandidates = array_slice($candidates, ($page - 1) * $perPage, $perPage);
-            $productIds = collect($pagedCandidates)->pluck('id');
-            
-            if ($productIds->isEmpty()) {
-                return $this->emptyResponse($request, $perPage, $categorySlug, $categoryId, $minPrice, $maxPrice, $search, $sortBy, false);
-            }
-            
-            $products = Product::with(['images', 'category', 'batches.store'])
-                ->whereIn('id', $productIds)
-                ->whereNull('deleted_at')
-                ->get()
-                ->sortBy(fn($p) => $productIds->search($p->id))
-                ->values()
-                ->map(fn($p) => $this->formatProductForApi($p));
+        if ($sortBy === 'price_asc') {
+            $baseQ->orderBy('min_batch_price', 'asc');
+        } elseif ($sortBy === 'price_desc') {
+            $baseQ->orderBy('min_batch_price', 'desc');
+        } elseif ($sortBy === 'name') {
+            $baseQ->orderBy('products.name', $sortOrder === 'asc' ? 'asc' : 'desc');
         } else {
-            $baseQ = $this->buildFilterQuery($categoryIds, $minPrice, $maxPrice, $sortBy, $search, $inStock);
-
-            if ($sortBy === 'price_asc') {
-                $baseQ->orderBy('min_batch_price', 'asc');
-            } elseif ($sortBy === 'price_desc') {
-                $baseQ->orderBy('min_batch_price', 'desc');
-            } elseif ($sortBy === 'name') {
-                $baseQ->orderBy('products.name', $sortOrder === 'asc' ? 'asc' : 'desc');
-            } else {
-                $baseQ->orderBy('products.created_at', 'desc');
-            }
-
-            // Count safely
-            $totalRaw = DB::select("select count(*) as aggregate from (" . $baseQ->toSql() . ") AS pq", $baseQ->getBindings());
-            $total    = $totalRaw[0]->aggregate ?? 0;
-
-            $rows       = $baseQ->offset(($page - 1) * $perPage)->limit($perPage)->get();
-            $productIds = $rows->pluck('id');
-
-            $products = Product::with(['images', 'category', 'batches.store'])
-                ->whereIn('id', $productIds)
-                ->whereNull('deleted_at')
-                ->get()
-                ->sortBy(fn($p) => $productIds->search($p->id))
-                ->values()
-                ->map(fn($p) => $this->formatProductForApi($p));
-            
-            $lastPage = max(1, (int) ceil($total / $perPage));
+            $baseQ->orderBy('products.created_at', 'desc');
         }
+
+        // Count safely
+        $totalRaw = DB::select("select count(*) as aggregate from (" . $baseQ->toSql() . ") AS pq", $baseQ->getBindings());
+        $total    = $totalRaw[0]->aggregate ?? 0;
+
+        $rows       = $baseQ->offset(($page - 1) * $perPage)->limit($perPage)->get();
+        $productIds = $rows->pluck('id');
+
+        $products = Product::with(['images', 'category', 'batches.store'])
+            ->whereIn('id', $productIds)
+            ->whereNull('deleted_at')
+            ->get()
+            ->sortBy(fn($p) => $productIds->search($p->id))
+            ->values()
+            ->map(fn($p) => $this->formatProductForApi($p));
+
+        $lastPage = max(1, (int) ceil($total / $perPage));
 
         return response()->json([
             'success' => true,
@@ -426,7 +348,6 @@ class EcommerceCatalogController extends Controller
                     'total'          => $total,
                     'has_more_pages' => $page < $lastPage,
                 ],
-                'did_you_mean'     => $search ? ($scored['suggestion'] ?? null) : null,
                 'filters_applied' => [
                     'category_slug' => $categorySlug,
                     'category_id'   => $categoryId,
@@ -467,7 +388,6 @@ class EcommerceCatalogController extends Controller
             'name'                => $product->name,
             'base_name'           => $product->base_name,
             'variation_suffix'    => $product->variation_suffix,
-            'semantic_name'       => self::extractSemanticName($product->base_name),
             'sku'                 => $product->sku,
             'description'         => $product->description,
             'selling_price'       => $sellingPrice,   // REQUIRED by frontend normalizeProduct()
@@ -1304,431 +1224,5 @@ class EcommerceCatalogController extends Controller
             ->pluck('id');
 
         return $ids->merge($descendantIds)->unique()->values()->all();
-    }
-
-    public static function extractSemanticName(string $baseName): string
-    {
-        $name = preg_replace('/\s*[-–]\s*[A-Z]{1,4}\d+.*$/ui', '', $baseName);
-        $name = preg_replace('/\s*[-–]\s*\d+.*$/ui', '', $name);
-        return trim($name);
-    }
-
-    public static function tokenize(string $string): array
-    {
-        $string = mb_strtolower($string, 'UTF-8');
-        $string = preg_replace('/[^\p{L}\p{N}]+/u', ' ', $string);
-        $tokens = preg_split('/\s+/', trim($string));
-        if (!$tokens) {
-            return [];
-        }
-        $stopWords = ['the' => true, 'a' => true, 'an' => true, 'and' => true, 'or' => true, 'for' => true, 'with' => true, 'of' => true];
-        return array_values(array_filter($tokens, function ($token) use ($stopWords) {
-            return !isset($stopWords[$token]) && strlen($token) > 0;
-        }));
-    }
-
-    public static function extractColorWords(string $name): array
-    {
-        $colors = ['red', 'blue', 'green', 'yellow', 'white', 'black', 'pink', 'purple', 'violet', 'orange', 'ash', 'grey', 'gray'];
-        $nameLower = mb_strtolower($name, 'UTF-8');
-        $matched = [];
-        foreach ($colors as $color) {
-            if (preg_match('/\b' . $color . '\b/i', $nameLower)) {
-                $matched[] = $color;
-            }
-        }
-        return $matched;
-    }
-
-    private function getSearchIndex(): array
-    {
-        return Cache::remember('ecommerce_product_search_index_v1', 3600, function () {
-            $products = DB::table('products')
-                ->leftJoin('product_batches', function ($join) {
-                    $join->on('products.id', '=', 'product_batches.product_id')
-                         ->where('product_batches.is_active', true)
-                         ->where('product_batches.availability', true);
-                })
-                ->leftJoin('reserved_products', 'products.id', '=', 'reserved_products.product_id')
-                ->whereNull('products.deleted_at')
-                ->where('products.is_archived', false)
-                ->select([
-                    'products.id',
-                    'products.sku',
-                    'products.name',
-                    'products.base_name',
-                    'products.variation_suffix',
-                    'products.created_at',
-                    'products.category_id',
-                    DB::raw('MIN(product_batches.sell_price) AS price'),
-                    DB::raw('COALESCE(SUM(product_batches.quantity), 0) AS total_qty'),
-                    DB::raw('COALESCE(reserved_products.reserved_inventory, 0) AS reserved_qty')
-                ])
-                ->groupBy('products.id', 'products.sku', 'products.name', 'products.base_name', 'products.variation_suffix', 'products.created_at', 'products.category_id', 'reserved_products.reserved_inventory')
-                ->get();
-
-            $indexData = [];
-            $invertedIndex = [];
-
-            foreach ($products as $row) {
-                $baseName = $row->base_name ?? '';
-                $name = $row->name ?? '';
-                $variationSuffix = $row->variation_suffix ?? '';
-                $sku = $row->sku ?? '';
-                
-                $semanticName = self::extractSemanticName($baseName);
-                $searchTokens = self::tokenize($semanticName);
-                $colorTags = self::extractColorWords($name);
-                
-                $skuTokens = self::tokenize($sku);
-                $variationTokens = self::tokenize($variationSuffix);
-                $baseNameTokens = self::tokenize($baseName);
-                
-                $allTokens = array_unique(array_merge($searchTokens, $skuTokens, $variationTokens, $baseNameTokens, $colorTags));
-                
-                foreach ($allTokens as $token) {
-                    if (!isset($invertedIndex[$token])) {
-                        $invertedIndex[$token] = [];
-                    }
-                    $invertedIndex[$token][] = (int) $row->id;
-                }
-                
-                $indexData[(int) $row->id] = [
-                    'id' => (int) $row->id,
-                    'sku' => $sku,
-                    'name' => $name,
-                    'base_name' => $baseName,
-                    'variation_suffix' => $variationSuffix,
-                    'created_at' => $row->created_at,
-                    'category_id' => (int) $row->category_id,
-                    'price' => $row->price !== null ? (float) $row->price : 0.0,
-                    'in_stock' => ($row->total_qty - $row->reserved_qty) > 0,
-                    'semantic_name' => $semanticName,
-                    'search_tokens' => $searchTokens,
-                    'color_tags' => $colorTags,
-                ];
-            }
-
-            return [
-                'products' => $indexData,
-                'invertedIndex' => $invertedIndex,
-            ];
-        });
-    }
-
-    private function searchAndScore(string $query, ?array $categoryIds = null, ?string $minPrice = null, ?string $maxPrice = null, ?string $inStock = null): array
-    {
-        $originalQuery = $query;
-        
-        // 3.1 Bangla -> English Transliteration
-        $banglaToEnglish = [
-            'থ্রি পিস' => '3piece',
-            'নেকপিস' => 'neck piece',
-            'নেকলেস' => 'neck piece',
-            'কানের দুল' => 'ear piece',
-            'ইয়ারিং' => 'ear piece',
-            'জামদানি' => 'jamdani',
-            'শাড়ি' => 'saree',
-            'শাড়ী' => 'saree',
-            'থ্রিপিস' => '3piece',
-            'কটন' => 'cotton',
-            'সিল্ক' => 'silk',
-            'চুড়ি' => 'bangle',
-            'বালা' => 'bangle',
-            'মনিপুরি' => 'monipuri',
-            'তাঁত' => 'tant tangail',
-            'কুর্তি' => 'kurti',
-            'ওড়না' => 'orna',
-            'লাল' => 'red',
-            'নীল' => 'blue',
-            'সবুজ' => 'green',
-            'হলুদ' => 'yellow',
-            'সাদা' => 'white',
-            'কালো' => 'black',
-            'গোলাপি' => 'pink',
-            'বেগুনি' => 'purple violet',
-            'কমলা' => 'orange',
-            'ধূসর' => 'ash grey',
-            'ছাই' => 'ash grey',
-        ];
-        
-        if (preg_match('/[\x{0980}-\x{09FF}]/u', $query)) {
-            foreach ($banglaToEnglish as $bangla => $english) {
-                $query = str_ireplace($bangla, $english, $query);
-            }
-        }
-        
-        // 3.2 Price Intent Detection
-        $hasPriceHint = false;
-        $priceHint = null;
-        $priceMin = null;
-        $priceMax = null;
-        
-        $upperQuery = mb_strtoupper($query, 'UTF-8');
-        if (preg_match('/(?<![A-Z0-9])\b(\d{3,5})\b(?![A-Z])/u', $upperQuery, $matches)) {
-            $priceHint = (float) $matches[1];
-            $hasPriceHint = true;
-            $query = preg_replace('/(?<![A-Z0-9])\b' . $matches[1] . '\b(?![A-Z])/ui', ' ', $query);
-            $priceMin = $priceHint * 0.8;
-            $priceMax = $priceHint * 1.2;
-        }
-        
-        $cleanedQuery = trim($query);
-        $queryTokens = self::tokenize($cleanedQuery);
-        
-        $index = $this->getSearchIndex();
-        $productsIndex = $index['products'];
-        $invertedIndex = $index['invertedIndex'];
-        
-        $candidateIds = [];
-        
-        if (!empty($queryTokens)) {
-            // 1. Exact & Prefix Match first
-            foreach ($queryTokens as $qToken) {
-                $qLen = strlen($qToken);
-                
-                // Exact Match
-                if (isset($invertedIndex[$qToken])) {
-                    foreach ($invertedIndex[$qToken] as $pid) {
-                        $candidateIds[$pid] = true;
-                    }
-                }
-                
-                // Prefix Match (min 3 chars)
-                if ($qLen >= 3) {
-                    foreach ($invertedIndex as $idxToken => $pids) {
-                        if ($idxToken !== $qToken && strpos($idxToken, $qToken) === 0) {
-                            foreach ($pids as $pid) {
-                                $candidateIds[$pid] = true;
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // 2. Fuzzy Match ONLY if exact/prefix yielded < 20 candidates
-            if (count($candidateIds) < 20) {
-                foreach ($queryTokens as $qToken) {
-                    $qLen = strlen($qToken);
-                    if ($qLen >= 5) {
-                        $maxDist = ($qLen >= 8) ? 2 : 1;
-                        foreach ($invertedIndex as $idxToken => $pids) {
-                            if ($idxToken === $qToken || ($qLen >= 3 && strpos($idxToken, $qToken) === 0)) {
-                                continue;
-                            }
-                            
-                            $idxLen = strlen($idxToken);
-                            if (abs($idxLen - $qLen) <= $maxDist) {
-                                if (levenshtein($qToken, $idxToken) <= $maxDist) {
-                                    foreach ($pids as $pid) {
-                                        $candidateIds[$pid] = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // If query is empty but we have filters (e.g. price hint only), all active products are candidates
-            $candidateIds = array_fill_keys(array_keys($productsIndex), true);
-        }
-        
-        // Check if query is a staff code only (e.g. MJ1)
-        $isStaffCodeQuery = false;
-        if (count($queryTokens) === 1) {
-            if (preg_match('/^[A-Z]{1,4}\d+$/i', $queryTokens[0])) {
-                $isStaffCodeQuery = true;
-            }
-        }
-        
-        $scoredCandidates = [];
-        $scoresMap = [];
-        
-        foreach (array_keys($candidateIds) as $pid) {
-            $product = $productsIndex[$pid];
-            
-            // Apply hard filters to reduce candidate set immediately
-            if ($categoryIds !== null && !in_array($product['category_id'], $categoryIds)) {
-                continue;
-            }
-            
-            if ($minPrice !== null && $minPrice !== '' && $product['price'] < (float) $minPrice) {
-                continue;
-            }
-            if ($maxPrice !== null && $maxPrice !== '' && $product['price'] > (float) $maxPrice) {
-                continue;
-            }
-            
-            if ($inStock === 'true' || $inStock === true || $inStock === 'in_stock') {
-                if (!$product['in_stock']) {
-                    continue;
-                }
-            } elseif ($inStock === 'false' || $inStock === false || $inStock === 'out_of_stock' || $inStock === 'not_in_stock') {
-                if ($product['in_stock']) {
-                    continue;
-                }
-            }
-            
-            if ($hasPriceHint) {
-                if ($product['price'] < $priceMin || $product['price'] > $priceMax) {
-                    continue; // Exclude from results
-                }
-            }
-            
-            // Scoring
-            $score = 0;
-            $prodSemanticTokens = $product['search_tokens'];
-            
-            $matchedQueryTokensCount = 0;
-            $matchedQueryTokenPositions = [];
-            
-            foreach ($queryTokens as $qIdx => $qToken) {
-                $exactKey = array_search($qToken, $prodSemanticTokens);
-                if ($exactKey !== false) {
-                    $score += 10;
-                    $matchedQueryTokensCount++;
-                    $matchedQueryTokenPositions[$qIdx] = $exactKey;
-                    continue;
-                }
-                
-                $prefixKey = false;
-                if (strlen($qToken) >= 3) {
-                    foreach ($prodSemanticTokens as $pIdx => $pToken) {
-                        if (strpos($pToken, $qToken) === 0) {
-                            $prefixKey = $pIdx;
-                            break;
-                        }
-                    }
-                }
-                if ($prefixKey !== false) {
-                    $score += 5;
-                    $matchedQueryTokensCount++;
-                    $matchedQueryTokenPositions[$qIdx] = $prefixKey;
-                    continue;
-                }
-                
-                $fuzzyKey = false;
-                if (strlen($qToken) >= 5) {
-                    $maxDist = (strlen($qToken) >= 8) ? 2 : 1;
-                    foreach ($prodSemanticTokens as $pIdx => $pToken) {
-                        if (abs(strlen($pToken) - strlen($qToken)) <= $maxDist) {
-                            if (levenshtein($qToken, $pToken) <= $maxDist) {
-                                $fuzzyKey = $pIdx;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if ($fuzzyKey !== false) {
-                    $score += 3;
-                    $matchedQueryTokensCount++;
-                    $matchedQueryTokenPositions[$qIdx] = $fuzzyKey;
-                    continue;
-                }
-            }
-            
-            if ($matchedQueryTokensCount === count($queryTokens) && count($queryTokens) > 0) {
-                $score += 20;
-            }
-            
-            if (count($matchedQueryTokenPositions) > 1) {
-                $inOrder = true;
-                $prevPos = -1;
-                ksort($matchedQueryTokenPositions);
-                foreach ($matchedQueryTokenPositions as $qIdx => $pIdx) {
-                    if ($pIdx <= $prevPos) {
-                        $inOrder = false;
-                        break;
-                    }
-                    $prevPos = $pIdx;
-                }
-                if ($inOrder) {
-                    $score += 15;
-                }
-            }
-            
-            $hasStaffCode = preg_match('/[-–]\s*[A-Z]{1,4}\d+/ui', $product['base_name']);
-            $isStaffOnly = (empty($product['variation_suffix']) && $hasStaffCode);
-            if ($isStaffOnly && !$isStaffCodeQuery) {
-                $score -= 2;
-            }
-            
-            $queryColorTokens = array_intersect($queryTokens, ['red', 'blue', 'green', 'yellow', 'white', 'black', 'pink', 'purple', 'violet', 'orange', 'ash', 'grey', 'gray']);
-            foreach ($queryColorTokens as $cToken) {
-                if (in_array($cToken, $product['color_tags'])) {
-                    $score += 8;
-                }
-            }
-            
-            if ($hasPriceHint) {
-                $priceDiffPercent = abs($product['price'] - $priceHint) / $priceHint;
-                if ($product['price'] == $priceHint) {
-                    $score += 25;
-                } elseif ($priceDiffPercent <= 0.05) {
-                    $score += 15;
-                } elseif ($priceDiffPercent <= 0.20) {
-                    $score += 5;
-                }
-            }
-            
-            $scoredCandidates[] = [
-                'id' => $product['id'],
-                'sku' => $product['sku'],
-                'name' => $product['name'],
-                'base_name' => $product['base_name'],
-                'variation_suffix' => $product['variation_suffix'],
-                'created_at' => $product['created_at'],
-                'score' => $score,
-                'semantic_name' => $product['semantic_name'],
-                'is_meaningful_suffix' => !empty($product['variation_suffix']) && !$isStaffOnly,
-            ];
-            
-            $scoresMap[$product['id']] = $score;
-        }
-        
-        // Sort Candidates
-        usort($scoredCandidates, function ($a, $b) {
-            if ($b['score'] !== $a['score']) {
-                return $b['score'] <=> $a['score'];
-            }
-            $aSuffix = $a['is_meaningful_suffix'] ? 1 : 0;
-            $bSuffix = $b['is_meaningful_suffix'] ? 1 : 0;
-            if ($aSuffix !== $bSuffix) {
-                return $bSuffix <=> $aSuffix;
-            }
-            return strcmp($a['created_at'], $b['created_at']);
-        });
-        
-        // Handle "Did you mean..." suggestion if no results matched
-        $suggestion = null;
-        if (empty($scoredCandidates) && !empty($cleanedQuery)) {
-            $uniqueSemanticNames = [];
-            foreach ($productsIndex as $prod) {
-                $uniqueSemanticNames[$prod['semantic_name']] = true;
-            }
-            $uniqueSemanticNames = array_keys($uniqueSemanticNames);
-            
-            $bestDist = 9999;
-            $bestName = '';
-            
-            foreach ($uniqueSemanticNames as $sName) {
-                $dist = levenshtein($cleanedQuery, mb_strtolower($sName, 'UTF-8'));
-                if ($dist < $bestDist) {
-                    $bestDist = $dist;
-                    $bestName = $sName;
-                }
-            }
-            
-            if ($bestDist < 5 && !empty($bestName)) {
-                $suggestion = $bestName;
-            }
-        }
-        
-        return [
-            'candidates' => $scoredCandidates,
-            'scores' => $scoresMap,
-            'suggestion' => $suggestion,
-        ];
     }
 }

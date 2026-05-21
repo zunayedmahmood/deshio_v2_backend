@@ -25,7 +25,7 @@ class DefectiveProductController extends Controller
     {
         try {
             $query = DefectiveProduct::with([
-                'product',
+                'product.vendor',
                 'barcode',
                 'batch',
                 'store',
@@ -44,6 +44,17 @@ class DefectiveProductController extends Controller
             // Filter by store
             if ($request->has('store_id')) {
                 $query->where('store_id', $request->store_id);
+            }
+
+            // Filter by product/return vendor
+            if ($request->has('vendor_id')) {
+                $vendorId = $request->vendor_id;
+                $query->where(function ($q) use ($vendorId) {
+                    $q->where('vendor_id', $vendorId)
+                      ->orWhereHas('product', function ($productQuery) use ($vendorId) {
+                          $productQuery->where('vendor_id', $vendorId);
+                      });
+                });
             }
 
             // Filter by severity
@@ -144,6 +155,7 @@ class DefectiveProductController extends Controller
             'defect_images' => 'nullable|array',
             'defect_images.*' => 'image|mimes:jpeg,png,jpg,gif|max:5120',
             'internal_notes' => 'nullable|string',
+            'barcode_status' => 'nullable|in:employee_use',
         ]);
 
         DB::beginTransaction();
@@ -180,6 +192,7 @@ class DefectiveProductController extends Controller
                 'defect_images' => !empty($imagePaths) ? $imagePaths : null,
                 'identified_by' => $employee->id,
                 'internal_notes' => $request->internal_notes,
+                'barcode_status' => $request->barcode_status,
             ]);
 
             DB::commit();

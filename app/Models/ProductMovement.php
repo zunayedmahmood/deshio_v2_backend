@@ -156,6 +156,7 @@ class ProductMovement extends Model
             'transfer' => "Transferred from {$fromStore} to {$toStore}",
             'return' => "Returned from {$fromStore} to {$toStore}",
             'adjustment' => "Inventory adjusted at {$toStore}",
+            'employee_use' => "Marked for employee use at {$toStore}",
             default => "Moved from {$fromStore} to {$toStore}",
         };
     }

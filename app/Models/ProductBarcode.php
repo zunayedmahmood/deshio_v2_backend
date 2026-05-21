@@ -322,12 +322,16 @@ class ProductBarcode extends Model
             ->orderBy('movement_date', 'desc')
             ->get()
             ->map(function ($movement) {
+                $movementType = $movement->status_after === 'employee_use'
+                    ? 'employee_use'
+                    : $movement->movement_type;
+
                 return [
                     'id' => $movement->id,
                     'date' => $movement->movement_date,
                     'from_store' => $movement->fromStore?->name,
                     'to_store' => $movement->toStore?->name,
-                    'movement_type' => $movement->movement_type,
+                    'movement_type' => $movementType,
                     'status_before' => $movement->status_before,
                     'status_after' => $movement->status_after,
                     'reference_type' => $movement->reference_type,
@@ -419,6 +423,7 @@ class ProductBarcode extends Model
             'available' => 'Available',
             'in_return' => 'Customer Return Processing',
             'defective' => 'Marked as Defective',
+            'employee_use' => 'Employee Usage',
             'repair' => 'Sent for Repair',
             'vendor_return' => 'Returned to Vendor',
             'disposed' => 'Disposed/Written Off',
@@ -435,6 +440,7 @@ class ProductBarcode extends Model
         if ($newStatus === 'in_return') return 'return';
         if ($newStatus === 'in_transit') return 'dispatch';
         if ($newStatus === 'defective') return 'defective';
+        if ($newStatus === 'employee_use') return 'employee_use';
         if ($oldStatus === 'in_warehouse' && $newStatus === 'in_shop') return 'transfer';
         
         return 'adjustment';
@@ -686,8 +692,24 @@ class ProductBarcode extends Model
     // Defective product methods
     public function markAsDefective(array $defectData): DefectiveProduct
     {
-        // Mark barcode as defective
-        $this->update(['is_defective' => true, 'is_active' => false]);
+        $oldStatus = $this->current_status;
+        $barcodeStatus = $defectData['barcode_status'] ?? null;
+        $barcodeUpdate = [
+            'is_defective' => true,
+            'is_active' => false,
+        ];
+
+        if ($barcodeStatus) {
+            $barcodeUpdate['current_status'] = $barcodeStatus;
+            $barcodeUpdate['location_updated_at'] = now();
+            $barcodeUpdate['location_metadata'] = array_merge($this->location_metadata ?? [], [
+                'marked_at' => now()->toDateTimeString(),
+                'marked_as' => $barcodeStatus,
+            ]);
+        }
+
+        // Mark barcode as defective/non-sellable, with optional specific barcode status
+        $this->update($barcodeUpdate);
 
         // Create defective product record
         $defectiveProduct = DefectiveProduct::create([
@@ -717,14 +739,18 @@ class ProductBarcode extends Model
                     'product_batch_id' => $batch->id,
                     'product_barcode_id' => $this->id,
                     'to_store_id' => $defectData['store_id'],
-                    'movement_type' => 'defective',
+                    'movement_type' => $barcodeStatus === 'employee_use' ? 'employee_use' : 'defective',
                     'quantity' => -1,
                     'unit_cost' => $defectData['original_price'],
                     'total_cost' => $defectData['original_price'],
                     'movement_date' => now(),
                     'reference_type' => 'defective_product',
                     'reference_id' => $defectiveProduct->id,
-                    'notes' => "Marked as defective: {$defectData['defect_type']}",
+                    'status_before' => $oldStatus,
+                    'status_after' => $barcodeStatus,
+                    'notes' => $barcodeStatus === 'employee_use'
+                        ? 'Marked as employee usage'
+                        : "Marked as defective: {$defectData['defect_type']}",
                     'performed_by' => $defectData['identified_by'] ?? null,
                 ]);
             }

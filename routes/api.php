@@ -1307,6 +1307,7 @@ Route::middleware('auth:api')->group(function () {
         Route::get('/available-fields', [ProductController::class, 'getAvailableFields']);
         Route::post('/search-by-field', [ProductController::class, 'searchByCustomField']);
         Route::post('/bulk-update', [ProductController::class, 'bulkUpdate']);
+        Route::get('/names-export', [ProductController::class, 'exportNames']);
 
         Route::prefix('{id}')->group(function () {
             Route::get('/', [ProductController::class, 'show']);

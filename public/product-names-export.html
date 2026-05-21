@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deshio Product Names Export</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #f6f7fb; color: #111827; }
+    .wrap { max-width: 880px; margin: 0 auto; padding: 28px; }
+    .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 18px; box-shadow: 0 12px 36px rgba(15, 23, 42, .06); padding: 22px; margin-bottom: 18px; }
+    h1 { margin: 0 0 8px; font-size: 26px; }
+    p { color: #4b5563; line-height: 1.55; }
+    label { display: block; font-size: 13px; font-weight: 700; color: #374151; margin-bottom: 6px; }
+    input { width: 100%; box-sizing: border-box; border: 1px solid #d1d5db; border-radius: 12px; padding: 11px 12px; font-size: 14px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .full { grid-column: 1 / -1; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+    button { border: 0; border-radius: 12px; padding: 12px 16px; font-weight: 800; cursor: pointer; background: #111827; color: #fff; }
+    button.secondary { background: #2563eb; }
+    button.ghost { background: #eef2ff; color: #3730a3; }
+    button:disabled { opacity: .55; cursor: wait; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #0b1020; color: #d1e7ff; border-radius: 14px; padding: 16px; max-height: 420px; overflow: auto; font-size: 12px; line-height: 1.45; }
+    .status { padding: 10px 12px; border-radius: 12px; background: #f3f4f6; margin-top: 12px; font-weight: 700; }
+    .ok { color: #047857; }
+    .bad { color: #b91c1c; }
+    code { background: #f3f4f6; padding: 2px 5px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Deshio Product Names Export</h1>
+      <p>
+        Press <code>Login</code>, then press <code>Get All Product Names</code> to download a JSON file containing every product row's <code>name</code>, <code>base_name</code>, and <code>variation_suffix</code>.
+      </p>
+
+      <div class="grid">
+        <div class="full">
+          <label for="baseUrl">Backend base URL</label>
+          <input id="baseUrl" placeholder="https://your-deshio-backend-domain.com" />
+        </div>
+        <div>
+          <label for="email">Email</label>
+          <input id="email" type="email" value="mueedibnesami.anoy@gmail.com" autocomplete="username" />
+        </div>
+        <div>
+          <label for="password">Password</label>
+          <input id="password" type="password" value="12345678" autocomplete="current-password" />
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="login" class="ghost">Login</button>
+        <button id="download" class="secondary">Get All Product Names</button>
+        <button id="clear" class="ghost">Clear Output</button>
+      </div>
+      <div id="status" class="status">Ready.</div>
+    </div>
+
+    <div class="card">
+      <h2>Raw Output</h2>
+      <pre id="output">[]</pre>
+    </div>
+  </div>
+
+  <script>
+    const output = document.getElementById('output');
+    const statusBox = document.getElementById('status');
+    const buttons = [...document.querySelectorAll('button')];
+    const results = [];
+    let authToken = localStorage.getItem('deshioProductNamesExportToken') || '';
+
+    document.getElementById('baseUrl').value = window.location.origin && window.location.protocol.startsWith('http')
+      ? window.location.origin
+      : '';
+
+    function baseUrl() {
+      return document.getElementById('baseUrl').value.replace(/\/$/, '');
+    }
+
+    function setBusy(busy, message) {
+      buttons.forEach(btn => btn.disabled = busy);
+      statusBox.textContent = message || (busy ? 'Running...' : 'Ready.');
+    }
+
+    function appendResult(label, data) {
+      results.push({ label, at: new Date().toISOString(), data });
+      output.textContent = JSON.stringify(results, null, 2);
+    }
+
+    async function readResponse(res) {
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        return { raw: text };
+      }
+    }
+
+    async function login() {
+      if (!baseUrl()) {
+        statusBox.innerHTML = '<span class="bad">Enter the backend base URL first.</span>';
+        return false;
+      }
+
+      setBusy(true, 'Logging in...');
+
+      const res = await fetch(`${baseUrl()}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+          email: document.getElementById('email').value.trim(),
+          password: document.getElementById('password').value
+        })
+      });
+
+      const body = await readResponse(res);
+      appendResult('Login', { ok: res.ok, status: res.status, body });
+
+      if (!res.ok || !body.access_token) {
+        authToken = '';
+        localStorage.removeItem('deshioProductNamesExportToken');
+        setBusy(false, 'Login failed. Check raw output.');
+        statusBox.innerHTML = '<span class="bad">Login failed. Check raw output.</span>';
+        return false;
+      }
+
+      authToken = body.access_token;
+      localStorage.setItem('deshioProductNamesExportToken', authToken);
+      setBusy(false, 'Logged in.');
+      statusBox.innerHTML = '<span class="ok">Logged in. You can download the JSON now.</span>';
+      return true;
+    }
+
+    function fileNameFromDisposition(disposition) {
+      if (!disposition) return null;
+      const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+      return match ? decodeURIComponent(match[1]) : null;
+    }
+
+    async function downloadProductNames() {
+      if (!authToken) {
+        const loggedIn = await login();
+        if (!loggedIn) return;
+      }
+
+      setBusy(true, 'Preparing product names JSON...');
+
+      const res = await fetch(`${baseUrl()}/api/products/names-export`, {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${authToken}`
+        }
+      });
+
+      const text = await res.text();
+
+      if (!res.ok) {
+        let body = text;
+        try { body = JSON.parse(text); } catch (e) {}
+        appendResult('Get All Product Names failed', { ok: false, status: res.status, body });
+        if (res.status === 401) {
+          authToken = '';
+          localStorage.removeItem('deshioProductNamesExportToken');
+        }
+        setBusy(false, 'Download failed. Check raw output.');
+        statusBox.innerHTML = '<span class="bad">Download failed. Check raw output.</span>';
+        return;
+      }
+
+      const blob = new Blob([text], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileNameFromDisposition(res.headers.get('Content-Disposition')) || `product-names-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+
+      let count = null;
+      try { count = JSON.parse(text).length; } catch (e) {}
+      appendResult('Get All Product Names', { ok: true, status: res.status, product_count: count });
+      setBusy(false, 'Product names JSON downloaded.');
+      statusBox.innerHTML = '<span class="ok">Product names JSON downloaded.</span>';
+    }
+
+    document.getElementById('login').addEventListener('click', login);
+    document.getElementById('download').addEventListener('click', downloadProductNames);
+    document.getElementById('clear').addEventListener('click', () => {
+      results.length = 0;
+      output.textContent = '[]';
+      statusBox.textContent = 'Ready.';
+    });
+  </script>
+</body>
+</html>

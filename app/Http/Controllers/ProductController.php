@@ -19,6 +19,41 @@ class ProductController extends Controller
     use ProductImageFallback;
 
     /**
+     * Export every product row with only the name fields needed for cleanup/mapping checks.
+     */
+    public function exportNames()
+    {
+        $fileName = 'product-names-' . now()->format('Ymd-His') . '.json';
+
+        return response()->streamDownload(function () {
+            $first = true;
+            echo "[\n";
+
+            Product::select('id', 'name', 'base_name', 'variation_suffix')
+                ->orderBy('id')
+                ->chunkById(500, function ($products) use (&$first) {
+                    foreach ($products as $product) {
+                        if (!$first) {
+                            echo ",\n";
+                        }
+
+                        echo json_encode([
+                            'name' => $product->name,
+                            'base_name' => $product->base_name,
+                            'variation_suffix' => $product->variation_suffix,
+                        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+                        $first = false;
+                    }
+                });
+
+            echo "\n]\n";
+        }, $fileName, [
+            'Content-Type' => 'application/json',
+        ]);
+    }
+
+    /**
      * Preserve variation suffix text exactly as entered, only enforcing the required leading dash.
      */
     private function normalizeVariationSuffix(?string $suffix): string

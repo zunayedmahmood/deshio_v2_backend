@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\ServiceOrder;
 use App\Models\ServiceOrderItem;
 use App\Models\ServiceOrderPayment;
+use App\Models\PaymentMethod;
 use App\Models\Service;
 use App\Models\Customer;
 use App\Traits\DatabaseAgnosticSearch;
@@ -436,28 +437,37 @@ class ServiceOrderController extends Controller
 
         DB::beginTransaction();
         try {
-            // Create payment
+            $amount = (float) $request->amount;
+            $paymentMethod = PaymentMethod::findOrFail($request->payment_method_id);
+            $paymentDate = $request->filled('payment_date')
+                ? \Carbon\Carbon::parse($request->payment_date)
+                : now();
+            $fee = $paymentMethod->calculateFee($amount);
+            $balanceBefore = (float) $order->outstanding_amount;
+            $balanceAfter = max(0, $balanceBefore - $amount);
+
+            // Create payment using the actual service_order_payments schema.
             $payment = $order->payments()->create([
-                'amount' => $request->amount,
-                'payment_method_id' => $request->payment_method_id,
-                'payment_date' => $request->payment_date ?? now(),
-                'reference_number' => $request->reference_number,
-                'notes' => $request->notes,
-                'received_by' => Auth::id(),
+                'payment_method_id' => $paymentMethod->id,
+                'customer_id' => $order->customer_id,
+                'store_id' => $order->store_id,
+                'processed_by' => Auth::id(),
+                'amount' => $amount,
+                'fee_amount' => $fee,
+                'net_amount' => $amount - $fee,
+                'is_partial_payment' => $balanceAfter > 0,
+                'payment_type' => $balanceAfter <= 0 ? ($order->paid_amount > 0 ? 'final' : 'full') : 'partial',
+                'payment_received_date' => $paymentDate->toDateString(),
+                'order_balance_before' => $balanceBefore,
+                'order_balance_after' => $balanceAfter,
                 'status' => 'completed',
+                'transaction_reference' => $request->reference_number,
+                'processed_at' => $paymentDate,
+                'completed_at' => $paymentDate,
+                'notes' => $request->notes,
             ]);
 
-            // Update order payment status
-            $order->paid_amount += $request->amount;
-            $order->outstanding_amount = $order->total_amount - $order->paid_amount;
-
-            if ($order->outstanding_amount <= 0) {
-                $order->payment_status = 'paid';
-            } elseif ($order->paid_amount > 0) {
-                $order->payment_status = 'partially_paid';
-            }
-
-            $order->save();
+            $order->updatePaymentStatus();
 
             DB::commit();
 

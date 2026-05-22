@@ -551,11 +551,40 @@ class CustomerController extends Controller
      */
     public function search(Request $request)
     {
-        $query = $request->get('q', '');
-        
+        $query = trim((string) $request->get('q', $request->get('search', '')));
+        $phone = trim((string) $request->get('phone', ''));
+        $email = trim((string) $request->get('email', ''));
+        $customerCode = trim((string) $request->get('customer_code', ''));
+
         $customers = Customer::query();
-        $this->whereAnyLike($customers, ['name', 'phone', 'email', 'customer_code'], $query);
-        $customers = $customers->limit(20)->get();
+
+        if ($query !== '') {
+            $this->whereAnyLike($customers, ['name', 'phone', 'email', 'customer_code'], $query);
+        }
+
+        if ($phone !== '') {
+            $cleanPhone = preg_replace('/\D+/', '', $phone);
+            $customers->where(function ($q) use ($phone, $cleanPhone) {
+                if ($cleanPhone !== '') {
+                    $this->whereLike($q, 'phone', $cleanPhone);
+                    $this->orWhereLike($q, 'name', $cleanPhone);
+                }
+
+                if ($phone !== $cleanPhone) {
+                    $this->orWhereLike($q, 'phone', $phone);
+                }
+            });
+        }
+
+        if ($email !== '') {
+            $this->whereLike($customers, 'email', $email);
+        }
+
+        if ($customerCode !== '') {
+            $this->whereLike($customers, 'customer_code', $customerCode);
+        }
+
+        $customers = $customers->limit((int) $request->get('per_page', 20))->get();
 
         return response()->json([
             'success' => true,

@@ -66,13 +66,30 @@ class OrderController extends Controller
             'salesman',
             'items.product',
             'items.batch',
-            'serviceItems',
+            'serviceItems.service',
             'payments.paymentMethod',
         ]);
 
         // Filter by order type (counter, social_commerce, ecommerce)
         if ($request->filled('order_type')) {
             $query->where('order_type', $request->order_type);
+        }
+
+        // Filter by multiple order types (used by service-order viewer for POS + online orders)
+        if ($request->filled('order_types')) {
+            $orderTypes = $request->input('order_types');
+            if (is_string($orderTypes)) {
+                $orderTypes = explode(',', $orderTypes);
+            }
+            $orderTypes = array_values(array_filter((array) $orderTypes));
+            if (!empty($orderTypes)) {
+                $query->whereIn('order_type', $orderTypes);
+            }
+        }
+
+        // Filter orders that contain at least one service item
+        if ($request->boolean('has_service_items')) {
+            $query->whereHas('serviceItems');
         }
 
         // Filter by status
@@ -122,6 +139,12 @@ class OrderController extends Controller
         // "Order Placed" uses the business order_date. "Last Updated" uses updated_at.
         $dateColumn = $this->getOrderDateColumn($request);
         $this->applyOrderDateFilters($query, $request);
+
+        // Exact order lookup (used by /lookup to avoid old orders being hidden behind broad search pagination)
+        if ($request->filled('order_number')) {
+            $orderNumber = ltrim((string) $request->order_number, '#');
+            $query->where('order_number', $orderNumber);
+        }
 
         // Search by order number or customer name
         if ($request->filled('search')) {
@@ -2126,6 +2149,8 @@ class OrderController extends Controller
             'status' => $order->status,
             'fulfillment_status' => $order->fulfillment_status,
             'payment_status' => $order->payment_status,
+            'has_service_items' => $order->serviceItems->isNotEmpty(),
+            'service_items_count' => $order->serviceItems->count(),
             'customer' => [
                 'id' => $order->customer->id,
                 'name' => $order->customer->name,

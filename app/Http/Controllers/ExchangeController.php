@@ -15,6 +15,7 @@ use App\Models\Employee;
 use App\Models\ReservedProduct;
 use App\Models\PaymentMethod;
 use App\Models\OrderPayment;
+use App\Models\Setting;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
@@ -385,6 +386,10 @@ class ExchangeController extends Controller
 
             // 3c. Handle refund/credit: replacement is less expensive, store owes the difference.
             if ($refundDue > 0) {
+                if (!$this->partialRefundsEnabled() && $settlementAmount + 0.01 < $refundDue) {
+                    throw new \Exception("Partial refunds are disabled. Refund the full exchange difference of ৳" . number_format($refundDue, 2) . " before submitting this exchange.");
+                }
+
                 $immediateRefund = round(min($settlementAmount, $refundDue), 2);
                 $storeCreditAmount = round($refundDue - $immediateRefund, 2);
 
@@ -457,6 +462,28 @@ class ExchangeController extends Controller
                 'message' => 'Exchange failed: ' . $e->getMessage()
             ], 500);
         }
+    }
+
+
+    private function partialRefundsEnabled(): bool
+    {
+        $setting = Setting::where('key', 'allow_partial_refunds')->first();
+        $value = $setting?->value;
+
+        if (is_array($value)) {
+            return (bool) ($value['enabled'] ?? false);
+        }
+
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                return (bool) ($decoded['enabled'] ?? false);
+            }
+
+            return filter_var($value, FILTER_VALIDATE_BOOLEAN);
+        }
+
+        return (bool) $value;
     }
 
     private function getOrCreatePaymentMethod(string $code, string $name, string $type = 'other'): PaymentMethod

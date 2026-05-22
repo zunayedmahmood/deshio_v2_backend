@@ -1507,6 +1507,8 @@ Route::middleware('auth:api')->group(function () {
         Route::post('/', [ProductReturnController::class, 'store']);
         Route::get('/statistics', [ProductReturnController::class, 'statistics']);
         Route::post('/quick-complete', [ProductReturnController::class, 'quickComplete']);
+        Route::get('/settings/partial-refund', [ProductReturnController::class, 'getPartialRefundSetting']);
+        Route::put('/settings/partial-refund', [ProductReturnController::class, 'updatePartialRefundSetting']);
         
         Route::prefix('{id}')->group(function () {
             Route::get('/', [ProductReturnController::class, 'show']);

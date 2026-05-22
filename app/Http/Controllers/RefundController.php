@@ -7,6 +7,7 @@ use App\Models\ProductReturn;
 use App\Models\Order;
 use App\Models\Employee;
 use App\Models\Transaction;
+use App\Models\Setting;
 use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
@@ -156,22 +157,31 @@ class RefundController extends Controller
             }
 
             // Calculate refund amount
-            $originalAmount = $return->total_refund_amount; // Employee-adjusted amount
-            $processingFee = $request->get('processing_fee', 0);
+            $originalAmount = (float) $return->total_refund_amount; // Employee-adjusted amount
+            $processingFee = (float) $request->get('processing_fee', 0);
+            $alreadyRefunded = (float) $return->getTotalRefundedAmount();
+            $remainingAmount = round(max(0, $originalAmount - $alreadyRefunded), 2);
             
             $refundAmount = match ($request->refund_type) {
-                'full' => $originalAmount - $processingFee,
-                'percentage' => ($originalAmount * $request->refund_percentage / 100) - $processingFee,
-                'partial_amount' => $request->refund_amount,
+                // Full means the full remaining refundable balance, not the original amount again.
+                'full' => max(0, $remainingAmount - $processingFee),
+                'percentage' => max(0, (($originalAmount * $request->refund_percentage / 100) - $processingFee)),
+                'partial_amount' => (float) $request->refund_amount,
                 default => 0,
             };
+            $refundAmount = round($refundAmount, 2);
 
             // Validate refund amount
-            $alreadyRefunded = $return->getTotalRefundedAmount();
-            $remainingAmount = $originalAmount - $alreadyRefunded;
+            if ($refundAmount <= 0) {
+                throw new \Exception('Refund amount must be greater than zero');
+            }
 
-            if ($refundAmount > $remainingAmount) {
+            if ($refundAmount - $remainingAmount > 0.01) {
                 throw new \Exception("Refund amount ({$refundAmount}) exceeds remaining amount ({$remainingAmount})");
+            }
+
+            if (!$this->partialRefundsEnabled() && $remainingAmount - $refundAmount > 0.01) {
+                throw new \Exception("Partial refunds are disabled. Refund the full remaining amount ({$remainingAmount}) or enable partial refunds from the returns page.");
             }
 
             // Create refund
@@ -451,6 +461,28 @@ class RefundController extends Controller
                 'message' => 'Failed to fetch statistics: ' . $e->getMessage(),
             ], 500);
         }
+    }
+
+
+    private function partialRefundsEnabled(): bool
+    {
+        $setting = Setting::where('key', 'allow_partial_refunds')->first();
+        $value = $setting?->value;
+
+        if (is_array($value)) {
+            return (bool) ($value['enabled'] ?? false);
+        }
+
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                return (bool) ($decoded['enabled'] ?? false);
+            }
+
+            return filter_var($value, FILTER_VALIDATE_BOOLEAN);
+        }
+
+        return (bool) $value;
     }
 
     /**

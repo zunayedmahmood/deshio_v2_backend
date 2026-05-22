@@ -10,6 +10,7 @@ use App\Models\ProductBatch;
 use App\Models\ProductBarcode;
 use App\Models\ProductMovement;
 use App\Models\Transaction;
+use App\Models\Setting;
 use App\Traits\DatabaseAgnosticSearch;
 use App\Services\FloatingBarcodeRelabelService;
 use Illuminate\Http\Request;
@@ -27,6 +28,61 @@ class ProductReturnController extends Controller
     public function __construct(FloatingBarcodeRelabelService $relabelService)
     {
         $this->relabelService = $relabelService;
+    }
+
+
+    public function getPartialRefundSetting(): JsonResponse
+    {
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'enabled' => $this->partialRefundsEnabled(),
+            ],
+        ]);
+    }
+
+    public function updatePartialRefundSetting(Request $request): JsonResponse
+    {
+        $request->validate([
+            'enabled' => 'required|boolean',
+        ]);
+
+        Setting::updateOrCreate(
+            ['key' => 'allow_partial_refunds'],
+            [
+                'group' => 'returns',
+                'value' => ['enabled' => (bool) $request->boolean('enabled')],
+            ]
+        );
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Partial refund setting updated successfully',
+            'data' => [
+                'enabled' => (bool) $request->boolean('enabled'),
+            ],
+        ]);
+    }
+
+    private function partialRefundsEnabled(): bool
+    {
+        $setting = Setting::where('key', 'allow_partial_refunds')->first();
+        $value = $setting?->value;
+
+        if (is_array($value)) {
+            return (bool) ($value['enabled'] ?? false);
+        }
+
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                return (bool) ($decoded['enabled'] ?? false);
+            }
+
+            return filter_var($value, FILTER_VALIDATE_BOOLEAN);
+        }
+
+        return (bool) $value;
     }
 
     /**

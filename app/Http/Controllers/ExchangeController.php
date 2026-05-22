@@ -391,7 +391,6 @@ class ExchangeController extends Controller
                 }
 
                 $immediateRefund = round(min($settlementAmount, $refundDue), 2);
-                $storeCreditAmount = round($refundDue - $immediateRefund, 2);
 
                 if ($immediateRefund > 0) {
                     $this->createExchangeRefund(
@@ -401,18 +400,6 @@ class ExchangeController extends Controller
                         $totalReturnValue,
                         $immediateRefund,
                         $this->normalizeRefundMethod($settlementMethodCode),
-                        $employee
-                    );
-                }
-
-                if ($storeCreditAmount > 0) {
-                    $this->createExchangeRefund(
-                        $productReturn,
-                        $originalOrder ?: $replacementOrder,
-                        $customer_id,
-                        $totalReturnValue,
-                        $storeCreditAmount,
-                        'store_credit',
                         $employee
                     );
                 }
@@ -431,9 +418,7 @@ class ExchangeController extends Controller
                 'order_id' => $replacementOrder->id,
             ]]);
             
-            if ($request->paymentRefund['type'] !== 'surplus') {
-                 $productReturn->status = 'refunded'; // Fully utilized or refunded
-            }
+            $productReturn->status = $productReturn->isFullyRefunded() ? 'refunded' : 'completed';
             $productReturn->save();
 
             // Unified Exchange Journal

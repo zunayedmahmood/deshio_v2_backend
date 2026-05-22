@@ -146,8 +146,10 @@ class RefundController extends Controller
         try {
             $return = ProductReturn::findOrFail($request->return_id);
 
-            // Check if return is ready for refund (processing or completed)
-            if (!in_array($return->status, ['processing', 'completed'])) {
+            // Check if return is ready for refund. Legacy partial exchanges may already be
+            // marked refunded while still having a remaining balance, so allow those too.
+            if (!in_array($return->status, ['processing', 'completed'])
+                && !($return->status === 'refunded' && !$return->isFullyRefunded())) {
                 throw new \Exception('Return must be processing or completed before creating refund');
             }
 

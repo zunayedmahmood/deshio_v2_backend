@@ -331,6 +331,7 @@ class Order extends Model
             'payment_type' => 'installment',
             'expected_installment_amount' => $this->installment_amount,
             'installment_notes' => "Installment {$nextInstallment} of {$this->total_installments}",
+            'skip_amount_limit_check' => true,
         ]);
 
         $payment = $this->addPayment(

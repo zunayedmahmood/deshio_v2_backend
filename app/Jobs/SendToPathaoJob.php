@@ -23,17 +23,17 @@ class SendToPathaoJob implements ShouldQueue
     /**
      * Number of times the job may be attempted
      */
-    public int $tries = 3;
+    public int $tries = 10;
 
     /**
      * Number of seconds to wait before retrying (exponential backoff)
      */
-    public array $backoff = [10, 30, 60];
+    public array $backoff = [5, 10, 20, 40, 60, 90, 120, 180, 240, 300];
 
     /**
      * The number of seconds the job can run before timing out
      */
-    public int $timeout = 60;
+    public int $timeout = 300;
 
     /**
      * Create a new job instance

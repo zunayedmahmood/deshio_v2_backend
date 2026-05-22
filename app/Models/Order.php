@@ -208,21 +208,38 @@ class Order extends Model
             return;
         }
 
-        $completedInstallments = $this->payments()
+        // Completed installment progress is based on MONEY paid, not number of payment rows.
+        $installmentAmount = (float) $this->installment_amount;
+
+        $installmentPaymentsQuery = $this->payments()
             ->where('is_partial_payment', true)
             ->where('payment_type', 'installment')
-            ->count();
+            ->completed();
+
+        if ($installmentAmount > 0) {
+            $paidTowardsInstallments = (float) $installmentPaymentsQuery->sum('amount');
+            $completedInstallments = (int) floor($paidTowardsInstallments / $installmentAmount);
+            $completedInstallments = min($completedInstallments, (int) $this->total_installments);
+        } else {
+            $completedInstallments = (int) $installmentPaymentsQuery->count();
+        }
 
         $this->paid_installments = $completedInstallments;
 
-        // Calculate next payment due date if installment amount is set
-        if ($this->installment_amount && $this->paid_installments < $this->total_installments) {
-            $nextInstallmentNumber = $this->paid_installments + 1;
-            // This would need to be calculated based on payment schedule
-            // For now, we'll assume monthly installments
-            $this->update(['next_payment_due' => now()->addMonths($nextInstallmentNumber - 1)->format('Y-m-d')]);
+        $nextPaymentDue = null;
+        if ($completedInstallments < (int) $this->total_installments) {
+            $schedule = is_array($this->payment_schedule) ? $this->payment_schedule : [];
+            $nextScheduleItem = $schedule[$completedInstallments] ?? null;
+
+            if (!empty($nextScheduleItem['due_date'])) {
+                $nextPaymentDue = $nextScheduleItem['due_date'];
+            } else {
+                $baseDate = $this->order_date ? $this->order_date->copy() : now();
+                $nextPaymentDue = $baseDate->addMonths($completedInstallments)->format('Y-m-d');
+            }
         }
 
+        $this->next_payment_due = $nextPaymentDue;
         $this->save();
     }
 

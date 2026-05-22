@@ -489,6 +489,10 @@ class PaymentController extends Controller
             'payment_method_id' => 'required|exists:payment_methods,id',
             'payment_data' => 'nullable|array',
             'notes' => 'nullable|string|max:500',
+            'transaction_reference' => 'nullable|string|max:255',
+            'external_reference' => 'nullable|string|max:255',
+            'collected_by_name' => 'nullable|string|max:255',
+            'next_collection_date' => 'nullable|date',
         ]);
 
         if ($validator->fails()) {
@@ -510,36 +514,68 @@ class PaymentController extends Controller
                 ], 400);
             }
 
-            // Validate amount matches expected installment amount
-            $nextInstallment = $order->paid_installments + 1;
-            if ($request->amount != $order->installment_amount) {
+            // Allow partial installment payments (e.g., 700 now, 1200 later) as long as it does not exceed outstanding amount.
+            $amount = (float) $request->amount;
+            if ($amount <= 0) {
                 return response()->json([
                     'success' => false,
-                    'message' => "Installment amount must be {$order->installment_amount}",
-                ], 400);
+                    'message' => 'Payment amount must be greater than 0',
+                ], 422);
             }
 
-            $payment = $order->addInstallmentPayment($request->amount, [
+            if ($amount > (float) $order->outstanding_amount) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Payment amount exceeds outstanding amount',
+                ], 422);
+            }
+
+            // Next installment number is derived from paid progress, not from the number of payment rows.
+            $nextInstallment = $order->paid_installments + 1;
+
+            $paymentMeta = $request->payment_data ?? [];
+            if ($request->filled('transaction_reference') && empty($paymentMeta['transaction_reference'])) {
+                $paymentMeta['transaction_reference'] = $request->transaction_reference;
+            }
+            if ($request->filled('external_reference') && empty($paymentMeta['external_reference'])) {
+                $paymentMeta['external_reference'] = $request->external_reference;
+            }
+            if ($request->filled('collected_by_name')) {
+                $paymentMeta['collected_by_name'] = $request->collected_by_name;
+            }
+            if ($request->filled('next_collection_date')) {
+                $paymentMeta['next_collection_date'] = $request->next_collection_date;
+            }
+
+            $payment = $order->addInstallmentPayment($amount, [
                 'payment_method_id' => $request->payment_method_id,
-                'payment_data' => $request->payment_data ?? [],
+                'payment_data' => $paymentMeta,
                 'notes' => $request->notes,
+                'payment_due_date' => $request->next_collection_date,
             ]);
 
             if ($payment) {
                 // Process the payment
-                $transactionReference = $request->payment_data['transaction_reference'] ?? null;
-                $externalReference = $request->payment_data['external_reference'] ?? null;
+                $transactionReference = $paymentMeta['transaction_reference'] ?? null;
+                $externalReference = $paymentMeta['external_reference'] ?? null;
 
                 if ($order->processPayment($payment, $transactionReference, $externalReference)) {
+                    if ($request->filled('next_collection_date') && (float) $order->fresh()->outstanding_amount > 0) {
+                        $order->update([
+                            'next_payment_due' => $request->next_collection_date,
+                        ]);
+                    }
+
+                    $order->refresh();
                     DB::commit();
 
                     return response()->json([
                         'success' => true,
                         'message' => "Installment {$nextInstallment} payment processed successfully",
                         'data' => [
-                            'payment' => $payment->load('paymentMethod'),
+                            'payment' => $payment->fresh()->load('paymentMethod'),
                             'order_summary' => $order->payment_summary,
-                            'next_installment_due' => $order->next_payment_due,
+                            'next_installment_due' => $order->next_payment_due ? $order->next_payment_due->format('Y-m-d') : null,
                         ],
                     ]);
                 } else {

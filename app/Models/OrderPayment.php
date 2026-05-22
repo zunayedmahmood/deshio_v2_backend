@@ -501,8 +501,16 @@ class OrderPayment extends Model
         $fee = $paymentMethod->calculateFee($amount);
         $netAmount = $amount - $fee;
 
-        $paymentType = $paymentData['payment_type'] ?? null;
-        unset($paymentData['payment_type']);
+        $meta = $paymentData['payment_data'] ?? $paymentData;
+        if (!is_array($meta)) {
+            $meta = [];
+        }
+
+        foreach (['transaction_reference', 'external_reference', 'collected_by_name', 'next_collection_date'] as $key) {
+            if (array_key_exists($key, $paymentData) && !array_key_exists($key, $meta)) {
+                $meta[$key] = $paymentData[$key];
+            }
+        }
 
         return static::create([
             'order_id' => $order->id,
@@ -513,8 +521,16 @@ class OrderPayment extends Model
             'amount' => $amount,
             'fee_amount' => $fee,
             'net_amount' => $netAmount,
-            'payment_type' => $paymentType ?: 'full',
-            'payment_data' => $paymentData,
+            'is_partial_payment' => (bool) ($paymentData['is_partial_payment'] ?? false),
+            'installment_number' => $paymentData['installment_number'] ?? null,
+            'payment_type' => $paymentData['payment_type'] ?? 'full',
+            'payment_due_date' => $paymentData['payment_due_date'] ?? null,
+            'payment_received_date' => now()->format('Y-m-d'),
+            'expected_installment_amount' => $paymentData['expected_installment_amount'] ?? null,
+            'installment_notes' => $paymentData['installment_notes'] ?? null,
+            'transaction_reference' => $paymentData['transaction_reference'] ?? ($meta['transaction_reference'] ?? null),
+            'external_reference' => $paymentData['external_reference'] ?? ($meta['external_reference'] ?? null),
+            'payment_data' => $meta,
             'notes' => $paymentData['notes'] ?? null,
             'status' => 'pending',
         ]);

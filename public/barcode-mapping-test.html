@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deshio Barcode Mapping Test</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --bg: #f6f7fb;
+      --card: #ffffff;
+      --text: #111827;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --blue: #2563eb;
+      --green: #047857;
+      --red: #b91c1c;
+      --amber: #92400e;
+      --ink: #0b1020;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 28px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; box-shadow: 0 12px 36px rgba(15, 23, 42, .06); padding: 22px; margin-bottom: 18px; }
+    h1 { margin: 0 0 8px; font-size: 26px; letter-spacing: -0.02em; }
+    h2 { margin: 0 0 12px; font-size: 18px; }
+    h3 { margin: 0 0 8px; font-size: 15px; }
+    p { color: var(--muted); line-height: 1.55; margin: 8px 0; }
+    label { display: block; font-size: 13px; font-weight: 700; color: #374151; margin-bottom: 6px; }
+    input { width: 100%; border: 1px solid #d1d5db; border-radius: 12px; padding: 11px 12px; font-size: 14px; outline: none; background: #fff; }
+    input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37, 99, 235, .12); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 16px; }
+    .full { grid-column: 1 / -1; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+    button { border: 0; border-radius: 12px; padding: 11px 14px; font-weight: 800; cursor: pointer; background: var(--blue); color: white; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    button.secondary { background: var(--green); }
+    button.ghost { background: #eef2ff; color: #1e3a8a; }
+    button.danger { background: #fee2e2; color: var(--red); }
+    button.dark { background: #111827; color: #fff; }
+    code { background: #f3f4f6; padding: 2px 5px; border-radius: 6px; }
+    .status { padding: 10px 12px; border-radius: 12px; background: #f3f4f6; margin-top: 12px; font-weight: 700; }
+    .ok { color: var(--green); }
+    .bad { color: var(--red); }
+    .warn { color: var(--amber); }
+    .progress-grid { display: grid; gap: 12px; }
+    .stage { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: #fafafa; }
+    .stage-line { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; color: #4b5563; }
+    .bar-wrap { background: #eef2f7; border-radius: 999px; overflow: hidden; height: 12px; }
+    .bar { width: 0%; height: 12px; background: var(--blue); transition: width .2s ease; }
+    .summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+    .metric { border: 1px solid var(--line); border-radius: 14px; padding: 12px; background: #f9fafb; color: var(--muted); }
+    .metric strong { display: block; font-size: 22px; margin-top: 4px; color: var(--text); }
+    pre { margin: 0; background: var(--ink); color: #d1e7ff; border-radius: 14px; padding: 16px; max-height: 520px; overflow: auto; font-size: 12px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .tiny { font-size: 12px; color: var(--muted); }
+    .pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 999px; background: #eef2ff; color: #1e3a8a; font-size: 12px; font-weight: 800; }
+    @media (max-width: 840px) { .grid, .summary, .split { grid-template-columns: 1fr; } .full { grid-column: auto; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Deshio Barcode Mapping Test</h1>
+      <p>
+        Login, then run the automated barcode mapping test. It creates a diagnostic PO in <code>store_id=2</code>, receives it through the real PO receiving code, scans every generated barcode through POS and lookup logic, logs mismatches/errors, then deletes the PO through the existing PO deletion route.
+      </p>
+      <p class="warn">
+        Target setup: <code>1000 barcodes</code> with <code>5 units per product</code>. This requires <code>200 product variants</code>, so the backend starts with 10 random SKU groups and keeps filling from additional SKU groups until the barcode target is reachable.
+      </p>
+
+      <div class="grid">
+        <div class="full">
+          <label for="baseUrl">Backend base URL</label>
+          <input id="baseUrl" placeholder="https://your-deshio-backend-domain.com" />
+        </div>
+        <div>
+          <label for="email">Email</label>
+          <input id="email" type="email" value="mueedibnesami.anoy@gmail.com" autocomplete="username" />
+        </div>
+        <div>
+          <label for="password">Password</label>
+          <input id="password" type="password" value="12345678" autocomplete="current-password" />
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="login" class="ghost">Login</button>
+        <button id="run" class="secondary">Run Barcode Mapping Test</button>
+        <button id="copyFull" class="dark">Copy Full Output</button>
+        <button id="copyIssues" class="ghost">Copy Mismatches & Errors</button>
+        <button id="clear" class="ghost">Clear Output</button>
+        <button id="stop" class="danger">Stop Reading Stream</button>
+      </div>
+      <div id="status" class="status">Ready.</div>
+      <p class="tiny">Stopping the browser stream only stops this page from reading updates. The backend is configured to attempt cleanup if the request continues on the server.</p>
+    </div>
+
+    <div class="card">
+      <h2>Live Progress</h2>
+      <div id="progress" class="progress-grid"></div>
+    </div>
+
+    <div class="card">
+      <h2>Summary</h2>
+      <div class="summary">
+        <div class="metric">Barcodes<strong id="metricBarcodes">0</strong></div>
+        <div class="metric">Scan Checks<strong id="metricChecks">0</strong></div>
+        <div class="metric">POS Matches<strong id="metricPos">0</strong></div>
+        <div class="metric">Lookup Matches<strong id="metricLookup">0</strong></div>
+        <div class="metric">Issues<strong id="metricIssues">0</strong></div>
+      </div>
+    </div>
+
+    <div class="split">
+      <div class="card">
+        <h2>Mismatches & Errors</h2>
+        <p class="tiny">Only issue events are shown here for fast review. Use the copy button for sharing with devs.</p>
+        <pre id="issuesOutput">[]</pre>
+      </div>
+      <div class="card">
+        <h2>Raw Output</h2>
+        <p class="tiny">Full streamed NDJSON events converted into one JSON array.</p>
+        <pre id="output">[]</pre>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const output = document.getElementById('output');
+    const issuesOutput = document.getElementById('issuesOutput');
+    const statusBox = document.getElementById('status');
+    const progressBox = document.getElementById('progress');
+    const results = [];
+    const issues = [];
+    let authToken = localStorage.getItem('deshioBarcodeMappingTestToken') || '';
+    let abortController = null;
+
+    document.getElementById('baseUrl').value = window.location.origin && window.location.protocol.startsWith('http')
+      ? window.location.origin
+      : '';
+
+    function baseUrl() {
+      return document.getElementById('baseUrl').value.replace(/\/$/, '');
+    }
+
+    function setBusy(busy, message) {
+      document.getElementById('login').disabled = busy;
+      document.getElementById('run').disabled = busy;
+      statusBox.textContent = message || (busy ? 'Running...' : 'Ready.');
+    }
+
+    function appendResult(label, data) {
+      const row = { label, at: new Date().toISOString(), data };
+      results.push(row);
+      output.textContent = JSON.stringify(results, null, 2);
+      output.scrollTop = output.scrollHeight;
+
+      if (['mismatch', 'error', 'fatal_error', 'complete_with_error'].includes(data?.type)) {
+        issues.push(row);
+        issuesOutput.textContent = JSON.stringify(issues, null, 2);
+        issuesOutput.scrollTop = issuesOutput.scrollHeight;
+      }
+    }
+
+    async function readResponse(res) {
+      const text = await res.text();
+      try { return JSON.parse(text); } catch (e) { return { raw: text }; }
+    }
+
+    async function login() {
+      if (!baseUrl()) {
+        statusBox.innerHTML = '<span class="bad">Enter the backend base URL first.</span>';
+        return false;
+      }
+
+      setBusy(true, 'Logging in...');
+
+      try {
+        const res = await fetch(`${baseUrl()}/api/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify({
+            email: document.getElementById('email').value.trim(),
+            password: document.getElementById('password').value
+          })
+        });
+
+        const body = await readResponse(res);
+        appendResult('Login', { ok: res.ok, status: res.status, body });
+
+        if (!res.ok || !body.access_token) {
+          authToken = '';
+          localStorage.removeItem('deshioBarcodeMappingTestToken');
+          setBusy(false, 'Login failed. Check raw output.');
+          statusBox.innerHTML = '<span class="bad">Login failed. Check raw output.</span>';
+          return false;
+        }
+
+        authToken = body.access_token;
+        localStorage.setItem('deshioBarcodeMappingTestToken', authToken);
+        setBusy(false, 'Logged in.');
+        statusBox.innerHTML = '<span class="ok">Logged in. You can run the test now.</span>';
+        return true;
+      } catch (error) {
+        appendResult('Login error', { message: error.message });
+        setBusy(false, 'Login error. Check raw output.');
+        statusBox.innerHTML = '<span class="bad">Login error. Check raw output.</span>';
+        return false;
+      }
+    }
+
+    function stageTitle(stage) {
+      return String(stage || 'running').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    }
+
+    function updateProgress(event) {
+      if (!event || !event.stage) return;
+
+      let stage = document.getElementById(`stage-${event.stage}`);
+      if (!stage) {
+        stage = document.createElement('div');
+        stage.className = 'stage';
+        stage.id = `stage-${event.stage}`;
+        stage.innerHTML = `
+          <div class="stage-line"><strong>${stageTitle(event.stage)}</strong><span class="pct">0%</span></div>
+          <div class="bar-wrap"><div class="bar"></div></div>
+          <div class="stage-line"><span class="msg"></span><span class="meta"></span></div>
+        `;
+        progressBox.appendChild(stage);
+      }
+
+      const pct = Math.max(0, Math.min(100, Number(event.percent || 0)));
+      stage.querySelector('.pct').textContent = `${pct}%`;
+      stage.querySelector('.bar').style.width = `${pct}%`;
+      stage.querySelector('.msg').textContent = event.message || '';
+
+      const meta = [];
+      if (event.checked_barcodes) meta.push(`${event.checked_barcodes}/${event.total_barcodes} checked`);
+      if (event.selected_products) meta.push(`${event.selected_products}/${event.target_products || '?'} products`);
+      if (event.sku_groups_used) meta.push(`${event.sku_groups_used} SKU groups`);
+      if (event.barcode_count) meta.push(`${event.barcode_count} barcodes`);
+      if (event.mismatch_count !== undefined) meta.push(`${event.mismatch_count} mismatches`);
+      if (event.error_count !== undefined) meta.push(`${event.error_count} errors`);
+      if (event.internal_integrity_issue_count !== undefined) meta.push(`${event.internal_integrity_issue_count} internal issues`);
+      stage.querySelector('.meta').textContent = meta.join(' • ');
+
+      if (event.summary) updateSummary(event.summary);
+      updateLiveCounters(event);
+    }
+
+    function updateLiveCounters(event) {
+      if (typeof event.total_barcodes === 'number') document.getElementById('metricBarcodes').textContent = event.total_barcodes;
+      if (typeof event.barcode_count === 'number') document.getElementById('metricBarcodes').textContent = event.barcode_count;
+      if (typeof event.checked_barcodes === 'number') document.getElementById('metricChecks').textContent = event.checked_barcodes * 2;
+      if (typeof event.pos_matches === 'number') document.getElementById('metricPos').textContent = event.pos_matches;
+      if (typeof event.lookup_matches === 'number') document.getElementById('metricLookup').textContent = event.lookup_matches;
+      const issueCount = Number(event.mismatch_count || 0) + Number(event.error_count || 0) + Number(event.internal_integrity_issue_count || 0);
+      if (issueCount > 0) document.getElementById('metricIssues').textContent = issueCount;
+    }
+
+    function updateSummary(summary) {
+      const mismatch = Number(summary.mismatch_count || 0);
+      const errors = Number(summary.error_count || 0);
+      const internal = Number(summary.internal_integrity_issue_count || 0);
+      document.getElementById('metricBarcodes').textContent = summary.actual_barcodes ?? summary.total_barcodes ?? 0;
+      document.getElementById('metricChecks').textContent = summary.total_scan_checks ?? 0;
+      document.getElementById('metricPos').textContent = summary.pos_matches ?? 0;
+      document.getElementById('metricLookup').textContent = summary.lookup_matches ?? 0;
+      document.getElementById('metricIssues').textContent = mismatch + errors + internal;
+    }
+
+    async function runTest() {
+      if (!authToken) {
+        const loggedIn = await login();
+        if (!loggedIn) return;
+      }
+
+      setBusy(true, 'Running barcode mapping test...');
+      progressBox.innerHTML = '';
+      abortController = new AbortController();
+
+      try {
+        const res = await fetch(`${baseUrl()}/api/barcode-mapping-test/run`, {
+          method: 'POST',
+          headers: {
+            'Accept': 'application/x-ndjson, application/json',
+            'Authorization': `Bearer ${authToken}`
+          },
+          signal: abortController.signal
+        });
+
+        if (!res.ok) {
+          const body = await readResponse(res);
+          appendResult('Barcode Mapping Test failed', { type: 'error', ok: false, status: res.status, body });
+          if (res.status === 401) {
+            authToken = '';
+            localStorage.removeItem('deshioBarcodeMappingTestToken');
+          }
+          setBusy(false, 'Test failed. Check raw output.');
+          statusBox.innerHTML = '<span class="bad">Test failed. Check raw output.</span>';
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            let event;
+            try {
+              event = JSON.parse(trimmed);
+            } catch (error) {
+              appendResult('Invalid stream line', { type: 'error', raw: trimmed, message: error.message });
+              continue;
+            }
+
+            appendResult(event.stage || event.type || 'event', event);
+            updateProgress(event);
+
+            if (event.type === 'error' || event.type === 'fatal_error') {
+              statusBox.innerHTML = `<span class="bad">${event.message || 'Error'}</span>`;
+            }
+            if (event.type === 'complete') {
+              statusBox.innerHTML = '<span class="ok">Barcode mapping test completed.</span>';
+            }
+            if (event.type === 'complete_with_error') {
+              statusBox.innerHTML = '<span class="bad">Test completed with a fatal setup/runtime error. Cleanup was attempted.</span>';
+            }
+          }
+        }
+      } catch (error) {
+        appendResult('Stream stopped', { type: 'error', message: error.message });
+        statusBox.innerHTML = '<span class="bad">Stream stopped. Check raw output.</span>';
+      } finally {
+        abortController = null;
+        setBusy(false, statusBox.textContent || 'Ready.');
+      }
+    }
+
+    async function copyText(text, label) {
+      try {
+        await navigator.clipboard.writeText(text);
+        statusBox.innerHTML = `<span class="ok">${label} copied.</span>`;
+      } catch (error) {
+        statusBox.innerHTML = `<span class="bad">Copy failed: ${error.message}</span>`;
+      }
+    }
+
+    function clearOutput() {
+      results.length = 0;
+      issues.length = 0;
+      output.textContent = '[]';
+      issuesOutput.textContent = '[]';
+      progressBox.innerHTML = '';
+      updateSummary({});
+      statusBox.textContent = 'Ready.';
+    }
+
+    document.getElementById('login').addEventListener('click', login);
+    document.getElementById('run').addEventListener('click', runTest);
+    document.getElementById('copyFull').addEventListener('click', () => copyText(output.textContent, 'Full output'));
+    document.getElementById('copyIssues').addEventListener('click', () => copyText(issuesOutput.textContent, 'Mismatches & errors'));
+    document.getElementById('clear').addEventListener('click', clearOutput);
+    document.getElementById('stop').addEventListener('click', () => {
+      if (abortController) abortController.abort();
+    });
+  </script>
+</body>
+</html>

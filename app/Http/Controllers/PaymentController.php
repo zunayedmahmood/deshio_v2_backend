@@ -504,11 +504,10 @@ class PaymentController extends Controller
         }
 
         try {
-            DB::beginTransaction();
+            $order->refresh();
 
-            // Check if order can accept installment payment
+            // Check if order can accept installment payment before opening a transaction.
             if (!$order->canAcceptInstallmentPayment()) {
-                DB::rollBack();
                 return response()->json([
                     'success' => false,
                     'message' => 'Order cannot accept installment payments',
@@ -518,7 +517,6 @@ class PaymentController extends Controller
             // Allow partial installment payments (e.g., 700 now, 1200 later) as long as it does not exceed outstanding amount.
             $amount = (float) $request->amount;
             if ($amount <= 0) {
-                DB::rollBack();
                 return response()->json([
                     'success' => false,
                     'message' => 'Payment amount must be greater than 0',
@@ -526,12 +524,13 @@ class PaymentController extends Controller
             }
 
             if ($amount > (float) $order->outstanding_amount) {
-                DB::rollBack();
                 return response()->json([
                     'success' => false,
                     'message' => 'Payment amount exceeds outstanding amount',
                 ], 422);
             }
+
+            DB::beginTransaction();
 
             // Next installment number is derived from paid progress, not from the number of payment rows.
             $nextInstallment = $order->paid_installments + 1;
@@ -599,7 +598,9 @@ class PaymentController extends Controller
             }
 
         } catch (\Exception $e) {
-            DB::rollBack();
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
 
             return response()->json([
                 'success' => false,

@@ -6,7 +6,6 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Str;
-use Illuminate\Support\Facades\DB;
 
 class PathaoBulkBatch extends Model
 {
@@ -124,52 +123,27 @@ class PathaoBulkBatch extends Model
     }
 
     /**
-     * Record result for a single shipment.
-     *
-     * Uses a row lock so concurrent queue workers do not overwrite the JSON
-     * results field and make the batch look stuck or under-counted.
+     * Record result for a single shipment
      */
     public function recordShipmentResult(int $shipmentId, bool $success, string $message, ?string $consignmentId = null)
     {
-        return DB::transaction(function () use ($shipmentId, $success, $message, $consignmentId) {
-            /** @var self|null $batch */
-            $batch = static::whereKey($this->getKey())->lockForUpdate()->first();
+        $results = $this->results ?? [];
+        
+        $results[$shipmentId] = [
+            'success' => $success,
+            'message' => $message,
+            'consignment_id' => $consignmentId,
+            'processed_at' => now()->toISOString(),
+        ];
 
-            if (!$batch || $batch->isCancelled()) {
-                return null;
-            }
+        $this->results = $results;
+        $this->processed_count = count($results);
+        $this->success_count = collect($results)->where('success', true)->count();
+        $this->failed_count = collect($results)->where('success', false)->count();
+        $this->save();
 
-            $results = $batch->results ?? [];
-
-            $existingResult = $results[(string) $shipmentId] ?? [];
-            $retryAttempts = (int) ($existingResult['retry_attempts'] ?? 0);
-
-            $results[(string) $shipmentId] = [
-                'success' => $success,
-                'message' => $message,
-                'consignment_id' => $consignmentId,
-                'processed_at' => now()->toISOString(),
-                'retry_attempts' => $retryAttempts,
-            ];
-
-            $processedResults = collect($results)->reject(fn ($item) => !empty($item['retrying']));
-
-            $processedCount = $processedResults->count();
-            $successCount = $processedResults->where('success', true)->count();
-            $failedCount = $processedResults->where('success', false)->count();
-
-            $batch->results = $results;
-            $batch->processed_count = $processedCount;
-            $batch->success_count = $successCount;
-            $batch->failed_count = $failedCount;
-            $batch->save();
-
-            $batch->checkCompletion();
-
-            $this->setRawAttributes($batch->fresh()->getAttributes(), true);
-
-            return $batch;
-        });
+        // Check if batch is complete
+        $this->checkCompletion();
     }
 
     /**
@@ -210,8 +184,7 @@ class PathaoBulkBatch extends Model
             'processed' => $this->processed_count,
             'success' => $this->success_count,
             'failed' => $this->failed_count,
-            'pending' => max(0, $this->total_shipments - $this->processed_count),
-            'retrying' => collect($this->results ?? [])->filter(fn ($item) => !empty($item['retrying']))->count(),
+            'pending' => $this->total_shipments - $this->processed_count,
             'progress' => $this->progress,
             'started_at' => $this->started_at?->toISOString(),
             'completed_at' => $this->completed_at?->toISOString(),
@@ -248,9 +221,7 @@ class PathaoBulkBatch extends Model
                 'success' => $result['success'],
                 'message' => $result['message'],
                 'consignment_id' => $result['consignment_id'] ?? null,
-                'processed_at' => $result['processed_at'] ?? null,
-                'retry_attempts' => (int) ($result['retry_attempts'] ?? 0),
-                'retrying' => !empty($result['retrying']),
+                'processed_at' => $result['processed_at'],
             ];
         }
 

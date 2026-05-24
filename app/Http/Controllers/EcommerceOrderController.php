@@ -12,6 +12,8 @@ use App\Models\ReservedProduct;
 use App\Models\Customer;
 use App\Models\CustomerAddress;
 use App\Traits\DatabaseAgnosticSearch;
+use App\Services\InventoryReservationService;
+use App\Services\OrderBarcodeLifecycleService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
@@ -433,7 +435,7 @@ class EcommerceOrderController extends Controller
             
             $order = Order::where('customer_id', $customerId)
                 ->where('order_number', $orderNumber)
-                ->with('items.product')
+                ->with(['items.product', 'items.batch', 'items.barcode'])
                 ->firstOrFail();
 
             if (!$this->canCancelOrder($order)) {
@@ -446,6 +448,34 @@ class EcommerceOrderController extends Controller
             DB::beginTransaction();
 
             try {
+                $affectedProductIds = $order->items->pluck('product_id')->filter()->unique()->values();
+                $barcodeItemIds = $order->items
+                    ->whereNotNull('product_barcode_id')
+                    ->pluck('id')
+                    ->map(fn ($id) => (int) $id)
+                    ->all();
+
+                $releasedBarcodes = app(OrderBarcodeLifecycleService::class)->releaseAllOrderBarcodes(
+                    $order,
+                    'customer_order_cancelled',
+                    true,
+                    true,
+                    $order->store_id,
+                    auth('customer')->id()
+                );
+
+                // Restore non-barcode-tracked deducted stock. Barcode-tracked rows are handled above.
+                foreach ($order->items as $item) {
+                    if (in_array((int) $item->id, $barcodeItemIds, true)) {
+                        continue;
+                    }
+
+                    if ($item->is_inventory_deducted && $item->batch) {
+                        $item->batch->addStock((int) $item->quantity);
+                        $item->update(['is_inventory_deducted' => false]);
+                    }
+                }
+
                 // Update order status
                 $order->update([
                     'status' => 'cancelled',
@@ -453,14 +483,18 @@ class EcommerceOrderController extends Controller
                     'cancellation_reason' => 'Customer cancellation',
                 ]);
 
-                // OrderObserver handles reservation release on cancellation
+                foreach ($affectedProductIds as $productId) {
+                    app(InventoryReservationService::class)->syncProduct((int) $productId);
+                }
 
                 DB::commit();
 
                 return response()->json([
                     'success' => true,
                     'message' => 'Order cancelled successfully',
-                    'data' => ['order' => $order],
+                    'released_barcodes_count' => count($releasedBarcodes),
+                    'released_barcodes' => $releasedBarcodes,
+                    'data' => ['order' => $order->fresh(['items.product', 'items.batch', 'items.barcode'])],
                 ]);
 
             } catch (\Exception $e) {

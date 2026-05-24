@@ -18,6 +18,7 @@ use App\Models\ServiceOrderItem;
 use App\Traits\DatabaseAgnosticSearch;
 use App\Services\FloatingBarcodeRelabelService;
 use App\Services\InventoryReservationService;
+use App\Services\OrderBarcodeLifecycleService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
@@ -2028,17 +2029,52 @@ class OrderController extends Controller
 
         DB::beginTransaction();
         try {
+            $order->load(['items.batch', 'items.barcode']);
+            $affectedProductIds = $order->items->pluck('product_id')->filter()->unique()->values();
+            $barcodeItemIds = $order->items
+                ->whereNotNull('product_barcode_id')
+                ->pluck('id')
+                ->map(fn ($id) => (int) $id)
+                ->all();
+
+            $releasedBarcodes = app(OrderBarcodeLifecycleService::class)->releaseAllOrderBarcodes(
+                $order,
+                'order_cancelled',
+                true,
+                true,
+                $order->store_id,
+                auth('api')->id() ?: auth()->id()
+            );
+
+            // Restore non-barcode-tracked deducted stock. Barcode-tracked rows are handled above.
+            foreach ($order->items as $item) {
+                if (in_array((int) $item->id, $barcodeItemIds, true)) {
+                    continue;
+                }
+
+                if ($item->is_inventory_deducted && $item->batch) {
+                    $item->batch->addStock((int) $item->quantity);
+                    $item->update(['is_inventory_deducted' => false]);
+                }
+            }
+
             $order->update([
                 'status' => 'cancelled',
                 'cancelled_at' => now(),
                 'notes' => ($order->notes ? $order->notes . "\n" : '') . 'Cancelled: ' . ($request->reason ?? 'No reason provided'),
             ]);
 
+            foreach ($affectedProductIds as $productId) {
+                app(InventoryReservationService::class)->syncProduct((int) $productId);
+            }
+
             DB::commit();
 
             return response()->json([
                 'success' => true,
                 'message' => 'Order cancelled successfully',
+                'released_barcodes_count' => count($releasedBarcodes),
+                'released_barcodes' => $releasedBarcodes,
                 'data' => $this->formatOrderResponse($order->fresh(), true)
             ]);
 
@@ -2181,6 +2217,14 @@ class OrderController extends Controller
             'gross_margin' => number_format($grossMargin, 2),
             'gross_margin_percentage' => $order->total_amount > 0 ? number_format(($grossMargin / (float)$order->total_amount) * 100, 2) : '0.00',
             'is_installment' => $order->is_installment_payment,
+            'installment_info' => $order->is_installment_payment ? [
+                'total_installments' => $order->total_installments,
+                'paid_installments' => $order->paid_installments,
+                'installment_amount' => number_format((float)$order->installment_amount, 2),
+                'next_payment_due' => $order->next_payment_due ? date('Y-m-d', strtotime($order->next_payment_due)) : null,
+                'is_overdue' => $order->isPaymentOverdue(),
+                'days_overdue' => $order->getDaysOverdue(),
+            ] : null,
             'order_date' => $order->order_date->format('Y-m-d H:i:s'),
             'created_at' => $order->created_at->format('Y-m-d H:i:s'),
             'updated_at' => $order->updated_at->format('Y-m-d H:i:s'),
@@ -2224,21 +2268,47 @@ class OrderController extends Controller
             });
 
             $response['payments'] = $order->payments->map(function ($payment) {
+                $rawPaymentData = $payment->payment_data ?? [];
+                if (!is_array($rawPaymentData)) {
+                    $decodedPaymentData = json_decode((string) $rawPaymentData, true);
+                    $rawPaymentData = is_array($decodedPaymentData) ? $decodedPaymentData : [];
+                }
+
                 $paymentData = [
                     'id' => $payment->id,
+                    'payment_number' => $payment->payment_number,
                     'amount' => number_format((float)$payment->amount, 2),
+                    'payment_method_id' => $payment->payment_method_id,
                     'payment_method' => $payment->payment_method_name,
+                    'payment_method_name' => $payment->paymentMethod?->name,
                     'payment_type' => $payment->payment_type,
                     'status' => $payment->status,
+                    'installment_number' => $payment->installment_number,
+                    'expected_installment_amount' => $payment->expected_installment_amount !== null
+                        ? number_format((float)$payment->expected_installment_amount, 2)
+                        : null,
+                    'payment_due_date' => $payment->payment_due_date
+                        ? $payment->payment_due_date->format('Y-m-d')
+                        : null,
+                    'payment_received_date' => $payment->payment_received_date
+                        ? $payment->payment_received_date->format('Y-m-d')
+                        : null,
+                    'transaction_reference' => $payment->transaction_reference ?? ($rawPaymentData['transaction_reference'] ?? null),
+                    'external_reference' => $payment->external_reference ?? ($rawPaymentData['external_reference'] ?? null),
+                    'collected_by_name' => $rawPaymentData['collected_by_name'] ?? null,
+                    'next_collection_date' => $rawPaymentData['next_collection_date'] ?? null,
+                    'notes' => $payment->notes,
+                    'installment_notes' => $payment->installment_notes,
                     'processed_by' => $payment->processedBy?->name,
                     'created_at' => $payment->created_at->format('Y-m-d H:i:s'),
+                    'payment_data' => $rawPaymentData,
                 ];
 
                 // Include split details if it's a split payment
                 if ($payment->isSplitPayment()) {
                     $paymentData['splits'] = $payment->paymentSplits->map(function ($split) {
                         return [
-                            'payment_method' => $split->paymentMethod->name,
+                            'payment_method' => $split->paymentMethod?->name,
                             'amount' => number_format((float)$split->amount, 2),
                             'status' => $split->status,
                         ];
@@ -2247,17 +2317,6 @@ class OrderController extends Controller
 
                 return $paymentData;
             });
-
-            if ($order->is_installment_payment) {
-                $response['installment_info'] = [
-                    'total_installments' => $order->total_installments,
-                    'paid_installments' => $order->paid_installments,
-                    'installment_amount' => number_format((float)$order->installment_amount, 2),
-                    'next_payment_due' => $order->next_payment_due ? date('Y-m-d', strtotime($order->next_payment_due)) : null,
-                    'is_overdue' => $order->isPaymentOverdue(),
-                    'days_overdue' => $order->getDaysOverdue(),
-                ];
-            }
 
             $response['notes'] = $order->notes;
             $response['shipping_address'] = $order->shipping_address;

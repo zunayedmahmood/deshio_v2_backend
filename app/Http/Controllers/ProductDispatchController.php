@@ -1452,6 +1452,243 @@ if (!$barcodeAtSourceStore) {
     }
 
     /**
+     * Export dispatch barcode/product/store-transfer report as CSV.
+     *
+     * GET /api/dispatches/barcodes/csv
+     *
+     * Query Parameters:
+     * - date_from: Start dispatch date (YYYY-MM-DD) - optional
+     * - date_to: End dispatch date (YYYY-MM-DD) - optional
+     * - store_id: Match either source or destination store - optional
+     * - source_store_id: Filter by source store - optional
+     * - destination_store_id: Filter by destination store - optional
+     * - status: pending, in_transit, delivered, cancelled - optional
+     *
+     * This report is barcode-level: one row per scanned barcode. If a dispatch
+     * item has no scanned barcode yet, one item-level row is still exported with
+     * blank barcode fields so missing scan work is visible to operations.
+     */
+    public function exportBarcodesCsv(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'date_from' => 'nullable|date',
+            'date_to' => 'nullable|date|after_or_equal:date_from',
+            'store_id' => 'nullable|exists:stores,id',
+            'source_store_id' => 'nullable|exists:stores,id',
+            'destination_store_id' => 'nullable|exists:stores,id',
+            'status' => 'nullable|in:pending,in_transit,delivered,cancelled',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $query = ProductDispatch::with([
+            'sourceStore',
+            'destinationStore',
+            'createdBy',
+            'approvedBy',
+            'items.batch.product.category',
+            'items.scannedBarcodes.product.category',
+            'items.scannedBarcodes.batch',
+            'items.scannedBarcodes.currentStore',
+        ]);
+
+        if ($request->filled('date_from')) {
+            $query->whereDate('dispatch_date', '>=', $request->date_from);
+        }
+
+        if ($request->filled('date_to')) {
+            $query->whereDate('dispatch_date', '<=', $request->date_to);
+        }
+
+        if ($request->filled('status')) {
+            $query->where('status', $request->status);
+        }
+
+        if ($request->filled('store_id')) {
+            $storeId = (int) $request->store_id;
+            $query->where(function ($q) use ($storeId) {
+                $q->where('source_store_id', $storeId)
+                  ->orWhere('destination_store_id', $storeId);
+            });
+        }
+
+        if ($request->filled('source_store_id')) {
+            $query->where('source_store_id', $request->source_store_id);
+        }
+
+        if ($request->filled('destination_store_id')) {
+            $query->where('destination_store_id', $request->destination_store_id);
+        }
+
+        $dispatches = $query->orderBy('dispatch_date', 'desc')
+            ->orderBy('id', 'desc')
+            ->get();
+
+        $filename = 'dispatch-barcode-report-' . now()->format('Y-m-d-His') . '.csv';
+
+        $headers = [
+            'Content-Type' => 'text/csv; charset=UTF-8',
+            'Content-Disposition' => "attachment; filename=\"{$filename}\"",
+        ];
+
+        $formatDate = function ($value) {
+            if (!$value) return '';
+            try {
+                if ($value instanceof \Carbon\CarbonInterface) {
+                    return $value->format('Y-m-d H:i:s');
+                }
+                return \Carbon\Carbon::parse($value)->format('Y-m-d H:i:s');
+            } catch (\Throwable $e) {
+                return (string) $value;
+            }
+        };
+
+        $num = function ($value, int $decimals = 2) {
+            return number_format((float) ($value ?? 0), $decimals, '.', '');
+        };
+
+        $receivedStatuses = $this->receivedStatuses();
+
+        $callback = function () use ($dispatches, $formatDate, $num, $receivedStatuses) {
+            $file = fopen('php://output', 'w');
+            fprintf($file, chr(0xEF).chr(0xBB).chr(0xBF));
+
+            fputcsv($file, [
+                'Dispatch Number',
+                'Dispatch Status',
+                'Dispatch Date',
+                'Expected Delivery Date',
+                'Actual Delivery Date',
+                'Source Store ID',
+                'Source Store',
+                'Source Store Code',
+                'Destination Store ID',
+                'Destination Store',
+                'Destination Store Code',
+                'Carrier Name',
+                'Tracking Number',
+                'Product ID',
+                'Product Name',
+                'Product SKU',
+                'Category',
+                'Batch ID',
+                'Batch Number',
+                'Item Quantity',
+                'Item Status',
+                'Scanned Count',
+                'Received Quantity',
+                'Damaged Quantity',
+                'Missing Quantity',
+                'Barcode ID',
+                'Barcode',
+                'Barcode Current Store ID',
+                'Barcode Current Store',
+                'Barcode Current Status',
+                'Barcode Is Active',
+                'Barcode Is Defective',
+                'Scanned At',
+                'Scanned By ID',
+                'Received At',
+                'Received By ID',
+                'Received At Destination',
+                'Unit Cost',
+                'Unit Price',
+                'Item Total Cost',
+                'Item Total Value',
+                'Created By',
+                'Approved By',
+                'Approved At',
+                'Notes',
+            ]);
+
+            foreach ($dispatches as $dispatch) {
+                foreach ($dispatch->items as $item) {
+                    $batch = $item->batch;
+                    $product = $batch?->product;
+                    $category = $product?->category;
+                    $barcodes = $item->scannedBarcodes;
+                    $scannedCount = $barcodes->count();
+
+                    $writeRow = function ($barcode = null) use ($file, $dispatch, $item, $batch, $product, $category, $scannedCount, $formatDate, $num, $receivedStatuses) {
+                        $pivot = $barcode?->pivot;
+                        $metadata = is_array($barcode?->location_metadata ?? null) ? $barcode->location_metadata : [];
+                        $currentStore = $barcode?->currentStore;
+                        $isReceivedAtDestination = $barcode
+                            && (int) ($barcode->current_store_id ?? 0) === (int) ($dispatch->destination_store_id ?? 0)
+                            && in_array($barcode->current_status, $receivedStatuses, true);
+
+                        fputcsv($file, [
+                            $dispatch->dispatch_number,
+                            $dispatch->status,
+                            $formatDate($dispatch->dispatch_date),
+                            $dispatch->expected_delivery_date ? $dispatch->expected_delivery_date->format('Y-m-d') : '',
+                            $formatDate($dispatch->actual_delivery_date),
+                            $dispatch->source_store_id,
+                            $dispatch->sourceStore?->name,
+                            $dispatch->sourceStore?->store_code,
+                            $dispatch->destination_store_id,
+                            $dispatch->destinationStore?->name,
+                            $dispatch->destinationStore?->store_code,
+                            $dispatch->carrier_name,
+                            $dispatch->tracking_number,
+                            $product?->id,
+                            $product?->name,
+                            $product?->sku,
+                            $category?->title,
+                            $batch?->id,
+                            $batch?->batch_number,
+                            $item->quantity,
+                            $item->status,
+                            $scannedCount,
+                            $item->received_quantity,
+                            $item->damaged_quantity,
+                            $item->missing_quantity,
+                            $barcode?->id,
+                            $barcode?->barcode,
+                            $barcode?->current_store_id,
+                            $currentStore?->name,
+                            $barcode?->current_status,
+                            is_null($barcode?->is_active) ? '' : ($barcode->is_active ? 'Yes' : 'No'),
+                            is_null($barcode?->is_defective) ? '' : ($barcode->is_defective ? 'Yes' : 'No'),
+                            $formatDate($pivot?->scanned_at),
+                            $pivot?->scanned_by,
+                            $metadata['received_at'] ?? '',
+                            $metadata['received_by'] ?? '',
+                            $isReceivedAtDestination ? 'Yes' : 'No',
+                            $num($item->unit_cost),
+                            $num($item->unit_price),
+                            $num($item->total_cost),
+                            $num($item->total_value),
+                            $dispatch->createdBy?->name,
+                            $dispatch->approvedBy?->name,
+                            $formatDate($dispatch->approved_at),
+                            $dispatch->notes,
+                        ]);
+                    };
+
+                    if ($scannedCount > 0) {
+                        foreach ($barcodes as $barcode) {
+                            $writeRow($barcode);
+                        }
+                    } else {
+                        $writeRow(null);
+                    }
+                }
+            }
+
+            fclose($file);
+        };
+
+        return response()->stream($callback, 200, $headers);
+    }
+
+    /**
      * Helper function to format dispatch response
      */
     private function formatDispatchResponse(ProductDispatch $dispatch, $detailed = false)

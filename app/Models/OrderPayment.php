@@ -493,11 +493,8 @@ class OrderPayment extends Model
             throw new \Exception("Payment method {$paymentMethod->name} is not allowed for {$order->customer->customer_type} customers");
         }
 
-        // Validate amount limits unless a higher-level payment flow already validated
-        // the amount against the order balance. Installment collections may intentionally
-        // cover multiple planned installments in one receipt (e.g. 6000 against two 3000
-        // installments), so they should not be capped by a single-installment/method limit.
-        if (empty($paymentData['skip_amount_limit_check']) && !$paymentMethod->canProcessAmount($amount)) {
+        // Validate amount limits
+        if (!$paymentMethod->canProcessAmount($amount)) {
             throw new \Exception("Amount {$amount} is not within allowed limits for {$paymentMethod->name}");
         }
 

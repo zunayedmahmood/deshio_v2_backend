@@ -110,6 +110,11 @@ class ProductBarcode extends Model
         return $this->hasOne(ProductBarcodeRelabel::class, 'reconciled_original_barcode_id');
     }
 
+    public function orderItems(): HasMany
+    {
+        return $this->hasMany(OrderItem::class, 'product_barcode_id');
+    }
+
     /**
      * NEW: Current physical location relationship
      */

@@ -7,9 +7,11 @@ use App\Models\ProductBarcode;
 use App\Models\ProductBatch;
 use App\Models\ProductMovement;
 use App\Models\ProductBarcodeRelabel;
+use App\Models\OrderItem;
 use App\Models\ProductDispatchItemBarcode;
 use App\Models\Store;
 use App\Services\FloatingBarcodeRelabelService;
+use App\Services\OrderBarcodeLifecycleService;
 use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
@@ -448,6 +450,179 @@ class ProductBarcodeController extends Controller
                 'message' => 'Failed to revive barcode',
                 'error' => $e->getMessage(),
             ], 500);
+        }
+    }
+
+    /**
+     * List barcodes that are still locked by non-terminal/open order items.
+     *
+     * GET /api/barcodes/order-locks?search=123&per_page=20
+     */
+    public function orderLocks(Request $request)
+    {
+        $perPage = max(1, min((int) $request->input('per_page', 20), 100));
+        $search = trim((string) $request->input('search', ''));
+
+        $query = ProductBarcode::query()
+            ->with(['product:id,name,sku', 'batch:id,batch_number,quantity,store_id', 'batch.store:id,name', 'currentStore:id,name'])
+            ->whereHas('orderItems.order', function ($q) {
+                $q->whereNotIn('status', OrderBarcodeLifecycleService::NON_LOCKING_ORDER_STATUSES);
+            });
+
+        if ($search !== '') {
+            $query->where(function ($q) use ($search) {
+                $this->whereLike($q, 'barcode', $search);
+                $q->orWhereHas('product', function ($pq) use ($search) {
+                    $this->whereLike($pq, 'name', $search);
+                    $this->orWhereLike($pq, 'sku', $search);
+                });
+                $q->orWhereHas('orderItems.order', function ($oq) use ($search) {
+                    $this->whereLike($oq, 'order_number', ltrim($search, '#'));
+                });
+            });
+        }
+
+        $page = $query->latest('updated_at')->paginate($perPage);
+
+        $items = collect($page->items())->map(function (ProductBarcode $barcode) {
+            $locks = OrderItem::with(['order:id,order_number,status,order_type,store_id,customer_id', 'order.customer:id,name,phone'])
+                ->where('product_barcode_id', $barcode->id)
+                ->whereHas('order', function ($q) {
+                    $q->whereNotIn('status', OrderBarcodeLifecycleService::NON_LOCKING_ORDER_STATUSES);
+                })
+                ->latest('updated_at')
+                ->get()
+                ->map(function (OrderItem $item) {
+                    return [
+                        'order_item_id' => $item->id,
+                        'order_id' => $item->order_id,
+                        'order_number' => $item->order?->order_number,
+                        'order_status' => $item->order?->status,
+                        'order_type' => $item->order?->order_type,
+                        'customer_name' => $item->order?->customer?->name,
+                        'customer_phone' => $item->order?->customer?->phone,
+                        'quantity' => $item->quantity,
+                        'is_inventory_deducted' => (bool) $item->is_inventory_deducted,
+                    ];
+                })
+                ->values();
+
+            return [
+                'id' => $barcode->id,
+                'barcode' => $barcode->barcode,
+                'current_status' => $barcode->current_status,
+                'is_active' => (bool) $barcode->is_active,
+                'is_defective' => (bool) $barcode->is_defective,
+                'product' => $barcode->product ? [
+                    'id' => $barcode->product->id,
+                    'name' => $barcode->product->name,
+                    'sku' => $barcode->product->sku,
+                ] : null,
+                'batch' => $barcode->batch ? [
+                    'id' => $barcode->batch->id,
+                    'batch_number' => $barcode->batch->batch_number,
+                    'quantity' => $barcode->batch->quantity,
+                    'store' => $barcode->batch->store ? [
+                        'id' => $barcode->batch->store->id,
+                        'name' => $barcode->batch->store->name,
+                    ] : null,
+                ] : null,
+                'current_store' => $barcode->currentStore ? [
+                    'id' => $barcode->currentStore->id,
+                    'name' => $barcode->currentStore->name,
+                ] : null,
+                'locks' => $locks,
+                'locks_count' => $locks->count(),
+                'updated_at' => optional($barcode->updated_at)->format('Y-m-d H:i:s'),
+            ];
+        })->values();
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'items' => $items,
+                'pagination' => [
+                    'current_page' => $page->currentPage(),
+                    'per_page' => $page->perPage(),
+                    'total' => $page->total(),
+                    'last_page' => $page->lastPage(),
+                ],
+            ],
+        ]);
+    }
+
+    /**
+     * Manual rescue for barcodes that are blocked by stale open order links.
+     *
+     * POST /api/barcodes/revive-order-lock
+     * Body: { barcode, store_id, status?, restore_stock? }
+     */
+    public function reviveOrderLock(Request $request, OrderBarcodeLifecycleService $lifecycle)
+    {
+        $validator = Validator::make($request->all(), [
+            'barcode' => 'required|string',
+            'store_id' => 'required|integer|exists:stores,id',
+            'status' => 'nullable|string|in:available,in_warehouse,in_shop,on_display',
+            'restore_stock' => 'nullable|boolean',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        try {
+            $result = $lifecycle->reviveBarcodeFromOrderLock(
+                (string) $request->barcode,
+                (int) $request->store_id,
+                (string) $request->input('status', 'available'),
+                $request->boolean('restore_stock', true),
+                auth('api')->id() ?: auth()->id()
+            );
+
+            /** @var ProductBarcode $barcode */
+            $barcode = $result['barcode'];
+            $targetStore = $result['target_store'];
+
+            return response()->json([
+                'success' => true,
+                'message' => $result['released_order_links_count'] > 0
+                    ? 'Barcode order lock released and barcode revived successfully.'
+                    : 'Barcode revived successfully. No open order lock was found.',
+                'data' => [
+                    'barcode' => $barcode->barcode,
+                    'product' => $barcode->product ? [
+                        'id' => $barcode->product->id,
+                        'name' => $barcode->product->name,
+                        'sku' => $barcode->product->sku,
+                    ] : null,
+                    'to_store' => [
+                        'id' => $targetStore->id,
+                        'name' => $targetStore->name,
+                    ],
+                    'batch' => $barcode->batch ? [
+                        'id' => $barcode->batch->id,
+                        'batch_number' => $barcode->batch->batch_number,
+                        'quantity' => $barcode->batch->quantity,
+                        'sell_price' => $barcode->batch->sell_price,
+                    ] : null,
+                    'from_status' => $result['old_status'],
+                    'current_status' => $result['new_status'],
+                    'released_order_links_count' => $result['released_order_links_count'],
+                    'released_order_links' => $result['released_links'],
+                    'stock_restored' => $result['stock_restored'],
+                    'revived_at' => now()->toISOString(),
+                ],
+            ]);
+        } catch (\Throwable $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to revive barcode order lock',
+                'error' => $e->getMessage(),
+            ], 422);
         }
     }
 

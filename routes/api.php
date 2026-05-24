@@ -1450,6 +1450,8 @@ Route::middleware('auth:api')->group(function () {
         Route::post('/scan', [ProductBarcodeController::class, 'scan']);
         Route::post('/batch-scan', [ProductBarcodeController::class, 'batchScan']);
         Route::post('/transfer-to-store', [ProductBarcodeController::class, 'transferToStore']);
+        Route::get('/order-locks', [ProductBarcodeController::class, 'orderLocks']);
+        Route::post('/revive-order-lock', [ProductBarcodeController::class, 'reviveOrderLock']);
 
         // Floating replacement barcode relabeling (lost/damaged sticker recovery)
         Route::get('/relabels', [ProductBarcodeController::class, 'relabels']);
@@ -1473,6 +1475,7 @@ Route::middleware('auth:api')->group(function () {
         Route::get('/', [ProductDispatchController::class, 'index']);
         Route::post('/', [ProductDispatchController::class, 'create']);
         Route::get('/statistics', [ProductDispatchController::class, 'getStatistics']);
+        Route::get('/barcodes/csv', [ProductDispatchController::class, 'exportBarcodesCsv']);
         
         // Pathao delivery integration
         Route::get('/pending-shipment', [ProductDispatchController::class, 'getPendingShipment']);
@@ -1764,14 +1767,6 @@ Route::middleware('auth:api')->group(function () {
         Route::get('/csv/stock', [\App\Http\Controllers\ReportingController::class, 'exportStockCsv']);
         // Booking Report
         Route::get('/csv/booking', [\App\Http\Controllers\ReportingController::class, 'exportBookingCsv']);
-        // Payment method cash-flow breakdown (completed payments and refunds)
-        Route::get('/csv/payment-breakdown', [\App\Http\Controllers\ReportingController::class, 'exportPaymentBreakdownCsv']);
-        // Installment/Partial Payment Report
-        Route::get('/csv/installments', [\App\Http\Controllers\ReportingController::class, 'exportInstallmentsCsv']);
-        // Additional legacy report exports kept for compatibility
-        Route::get('/csv/order-details', [\App\Http\Controllers\ReportingController::class, 'exportOrderDetailsCsv']);
-        Route::get('/csv/customer-history', [\App\Http\Controllers\ReportingController::class, 'exportCustomerHistoryCsv']);
-        Route::get('/csv/customer-summary', [\App\Http\Controllers\ReportingController::class, 'exportCustomerSummaryCsv']);
         // Daily Sales Report
         Route::get('/daily-sales', [\App\Http\Controllers\ReportingController::class, 'getDailySalesReport']);
     });

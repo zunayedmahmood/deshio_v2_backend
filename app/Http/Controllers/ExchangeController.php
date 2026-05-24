@@ -20,6 +20,7 @@ use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
 use App\Services\FloatingBarcodeRelabelService;
+use App\Services\OrderBarcodeLifecycleService;
 use Illuminate\Validation\ValidationException;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
@@ -716,6 +717,16 @@ class ExchangeController extends Controller
                         'is_active'   => $barcode->is_active,
                         'store_id'    => $returnStore,
                     ]);
+
+                    app(OrderBarcodeLifecycleService::class)->detachBarcodeFromOrderItems(
+                        $barcode,
+                        $return->order_id,
+                        'exchange_return_restored',
+                        [
+                            'return_id' => $return->id,
+                            'return_number' => $return->return_number,
+                        ]
+                    );
                 }
             } else {
                 // Fallback for products that might not have barcodes (if any)

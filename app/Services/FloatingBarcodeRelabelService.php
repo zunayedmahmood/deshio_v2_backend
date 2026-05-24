@@ -151,7 +151,7 @@ class FloatingBarcodeRelabelService
         $reservedElsewhere = OrderItem::where('product_barcode_id', $barcode->id)
             ->when($ignoreOrderItemId, fn($q) => $q->where('id', '!=', $ignoreOrderItemId))
             ->whereHas('order', function ($q) {
-                $q->whereNotIn('status', ['cancelled', 'delivered', 'completed', 'refunded', 'returned']);
+                $q->whereNotIn('status', OrderBarcodeLifecycleService::NON_LOCKING_ORDER_STATUSES);
             })
             ->exists();
 

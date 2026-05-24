@@ -13,6 +13,7 @@ use App\Models\Transaction;
 use App\Models\Setting;
 use App\Traits\DatabaseAgnosticSearch;
 use App\Services\FloatingBarcodeRelabelService;
+use App\Services\OrderBarcodeLifecycleService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
@@ -1087,6 +1088,16 @@ class ProductReturnController extends Controller
                         'performed_by'       => $employee->id,
                     ]);
                 }
+
+                app(OrderBarcodeLifecycleService::class)->detachBarcodeFromOrderItems(
+                    $barcode,
+                    $return->order_id,
+                    'defective_return',
+                    [
+                        'return_id' => $return->id,
+                        'return_number' => $return->return_number,
+                    ]
+                );
             }
         }
     }
@@ -1216,6 +1227,16 @@ class ProductReturnController extends Controller
                         : "Product return: {$return->return_number}",
                     'performed_by' => $employee->id,
                 ]);
+
+                app(OrderBarcodeLifecycleService::class)->detachBarcodeFromOrderItems(
+                    $barcode,
+                    $return->order_id,
+                    'product_return_restored',
+                    [
+                        'return_id' => $return->id,
+                        'return_number' => $return->return_number,
+                    ]
+                );
             }
         }
     }

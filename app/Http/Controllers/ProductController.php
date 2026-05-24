@@ -101,6 +101,11 @@ class ProductController extends Controller
             ->where(function ($q) {
                 $q->whereNull('order_items.is_inventory_deducted')
                   ->orWhere('order_items.is_inventory_deducted', false);
+            })
+            ->where(function ($q) {
+                $q->whereNull('order_items.product_options')
+                  ->orWhereNull('order_items.product_options->_barcode_restocked_to_inventory')
+                  ->orWhere('order_items.product_options->_barcode_restocked_to_inventory', false);
             });
 
         return [

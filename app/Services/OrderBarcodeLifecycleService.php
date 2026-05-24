@@ -195,12 +195,26 @@ class OrderBarcodeLifecycleService
         $items = $query->lockForUpdate()->get();
         $count = 0;
 
+        $affectedProductIds = [];
+
         foreach ($items as $item) {
+            $options = $item->product_options ?? [];
+            $options['_barcode_restocked_to_inventory'] = true;
+            $options['_barcode_restocked_id'] = $barcode->id;
+            $options['_barcode_restocked_reason'] = $reason;
+            $options['_barcode_restocked_at'] = now()->toISOString();
+
             $item->update([
                 'product_barcode_id' => null,
                 'is_inventory_deducted' => false,
+                'product_options' => $options,
             ]);
+            $affectedProductIds[(int) $item->product_id] = true;
             $count++;
+        }
+
+        foreach (array_keys($affectedProductIds) as $productId) {
+            app(InventoryReservationService::class)->syncProduct((int) $productId);
         }
 
         if ($count > 0) {

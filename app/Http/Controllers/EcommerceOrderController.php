@@ -284,7 +284,7 @@ class EcommerceOrderController extends Controller
                     'is_preorder' => false, // eCommerce orders are NOT pre-orders
                     'preorder_notes' => null,
                     'status' => 'pending_assignment', // Waiting for store assignment
-                    'fulfillment_status' => 'pending_fulfillment', // Mark for fulfillment workflow
+                    'fulfillment_status' => null, // Fulfillment starts after store assignment
                     'payment_status' => in_array($request->payment_method, ['cod', 'cash']) ? 'pending' : 'unpaid',
                     'payment_method' => $request->payment_method,
                     'subtotal' => $subtotal,

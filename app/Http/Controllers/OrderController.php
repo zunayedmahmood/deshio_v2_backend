@@ -340,11 +340,10 @@ class OrderController extends Controller
                 }
             }
             
-            // For social_commerce and ecommerce: store_id should be NULL (assigned later)
-            // If provided, we'll use it, but it's optional
+            // Social-commerce/e-commerce orders must enter the store-assignment workflow.
+            // Ignore any submitted store_id so these orders are created unassigned.
             if (in_array($request->order_type, ['social_commerce', 'ecommerce'])) {
-                // Allow store_id to be null - will be assigned during fulfillment
-                $storeId = $storeId ?? null;
+                $storeId = null;
             }
             
             // Get or create customer
@@ -426,18 +425,19 @@ class OrderController extends Controller
             $hasServiceItems = count((array) $request->input('services', [])) > 0;
             $isServiceOnlySocialOrder = $request->order_type === 'social_commerce' && !$hasProductItems && $hasServiceItems;
 
-            // Determine fulfillment status based on order type
-            // Counter orders: immediate fulfillment (barcode scanned at POS)
-            // Social/Ecommerce product orders: deferred fulfillment (warehouse scans barcodes later)
-            // Service-only social orders do not need package scanning.
+            // Social-commerce/e-commerce product orders wait for store assignment first.
+            // Fulfillment begins only after OrderManagementController assigns a store.
             $fulfillmentStatus = null;
-            if (in_array($request->order_type, ['social_commerce', 'ecommerce']) && !$isServiceOnlySocialOrder) {
-                $fulfillmentStatus = 'pending_fulfillment';
-            }
 
-            // Product orders start Pending. Service-only social orders get their own status
-            // so they can be filtered separately and do not appear in package workflows.
-            $initialStatus = $isServiceOnlySocialOrder ? 'service_only' : 'pending';
+            // Product online orders start pending_assignment. Service-only social orders keep
+            // their own status so they do not enter package workflows.
+            if ($isServiceOnlySocialOrder) {
+                $initialStatus = 'service_only';
+            } elseif (in_array($request->order_type, ['social_commerce', 'ecommerce'])) {
+                $initialStatus = 'pending_assignment';
+            } else {
+                $initialStatus = 'pending';
+            }
 
             // Create order
             $order = Order::create([
@@ -502,13 +502,15 @@ class OrderController extends Controller
             foreach ((array) $request->input('items', []) as $itemData) {
                 $product = Product::findOrFail($itemData['product_id']);
                 
-                // Batch is optional for pre-orders
-                $batch = !empty($itemData['batch_id']) 
-                    ? ProductBatch::findOrFail($itemData['batch_id']) 
+                // Batch is optional for pre-orders and is intentionally deferred for
+                // social-commerce/e-commerce orders until store assignment + fulfillment.
+                $batch = (!in_array($request->order_type, ['social_commerce', 'ecommerce']) && !empty($itemData['batch_id']))
+                    ? ProductBatch::findOrFail($itemData['batch_id'])
                     : null;
 
-                // Mark as pre-order if any item has no batch
-                if (!$batch) {
+                // Missing batch only means pre-order for flows that require immediate batch selection.
+                // Online orders intentionally defer batch/store selection to store assignment + fulfillment.
+                if (!$batch && !in_array($request->order_type, ['social_commerce', 'ecommerce'])) {
                     $hasPreOrderItems = true;
                 }
 
@@ -525,21 +527,12 @@ class OrderController extends Controller
                     if ($globalAvailable < $itemData['quantity']) {
                         throw new \Exception("Cannot sell {$product->name} (Global available inventory: {$globalAvailable}). Stock is reserved for online orders.");
                     }
-                } elseif ($request->order_type === 'social_commerce' && $request->store_id) {
-                    // Check store-level stock for specific store assignment without batch
-                    $storeStock = ProductBatch::where('product_id', $product->id)
-                        ->where('store_id', $request->store_id)
-                        ->sum('quantity');
-                    
-                    if ($storeStock < $itemData['quantity']) {
-                        throw new \Exception("Insufficient stock for {$product->name} at the selected branch. Available: {$storeStock}");
-                    }
-
-                    // Check global available inventory too
+                } elseif (in_array($request->order_type, ['social_commerce', 'ecommerce'])) {
+                    // Online orders are unassigned at creation, but they must still respect
+                    // global available stock before entering the assignment queue.
                     $reservedRecord = \App\Models\ReservedProduct::where('product_id', $product->id)->lockForUpdate()->first();
                     $globalAvailable = $reservedRecord ? $reservedRecord->available_inventory : 0;
-                    
-                    // Online orders (social commerce) ARE blocked by global reservations
+
                     if ($globalAvailable < $itemData['quantity']) {
                         throw new \Exception("Cannot sell {$product->name} (Global available inventory: {$globalAvailable}). Stock is reserved for online orders.");
                     }

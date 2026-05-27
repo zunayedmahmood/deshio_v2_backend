@@ -198,19 +198,30 @@ class CategoriesController extends Controller
     {
         $category = Category::findOrFail($id);
 
-        // Check if category has children
-        if ($category->hasChildren()) {
+        $activeProductNames = $category->activeProducts()
+            ->pluck('name')
+            ->filter()
+            ->values()
+            ->toArray();
+
+        if (!empty($activeProductNames)) {
             return response()->json([
                 'success' => false,
-                'message' => 'Cannot delete category with subcategories. Delete or move subcategories first.'
+                'message' => "Category can't be deleted because " . implode(', ', $activeProductNames) . ' is under it.'
             ], 400);
         }
 
-        // Check if category has products
-        if ($category->products()->exists()) {
+        $activeSubcategoryNames = $category->children()
+            ->where('is_active', true)
+            ->pluck('title')
+            ->filter()
+            ->values()
+            ->toArray();
+
+        if (!empty($activeSubcategoryNames)) {
             return response()->json([
                 'success' => false,
-                'message' => 'Cannot delete category with associated products'
+                'message' => "Category can't be deleted because " . implode(', ', $activeSubcategoryNames) . ' is under it.'
             ], 400);
         }
 

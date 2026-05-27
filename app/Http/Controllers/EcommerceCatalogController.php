@@ -218,11 +218,16 @@ class EcommerceCatalogController extends Controller
         }
 
         // Step 2: Load Eloquent models only for the filtered and paginated results.
-        $allVariants = Product::with(['images', 'category', 'batches.store'])
+        $allVariantsQuery = Product::with(['images', 'category', 'batches.store'])
             ->whereIn('sku', $skus)
             ->where('is_archived', false)
-            ->whereNull('deleted_at')
-            ->get();
+            ->whereNull('deleted_at');
+
+        if ($categoryIds !== null) {
+            $allVariantsQuery->whereIn('category_id', $categoryIds);
+        }
+
+        $allVariants = $allVariantsQuery->get();
         $variantsBySku = $allVariants->groupBy('sku');
 
         $orderedResult = [];

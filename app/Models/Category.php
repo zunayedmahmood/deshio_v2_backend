@@ -6,6 +6,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use App\Traits\AutoLogsActivity;
+use App\Support\MediaUrl;
 
 class Category extends Model
 {
@@ -193,25 +194,16 @@ class Category extends Model
      */
     public function getImageUrlAttribute()
     {
-        if ($this->image) {
-            if (filter_var($this->image, FILTER_VALIDATE_URL)) return $this->image;
-            return asset('storage/' . $this->image);
-        }
-        return null;
+        return MediaUrl::toPublicUrl($this->image);
     }
 
     public function getThumbnailUrlAttribute()
     {
-        $path = $this->thumbnail_image ?: $this->image;
-        if (!$path) return null;
-        if (filter_var($path, FILTER_VALIDATE_URL)) return $path;
-        return asset('storage/' . $path);
+        return MediaUrl::toPublicUrl($this->thumbnail_image ?: $this->image);
     }
 
     public function getBannerUrlAttribute()
     {
-        if (!$this->banner_image) return null;
-        if (filter_var($this->banner_image, FILTER_VALIDATE_URL)) return $this->banner_image;
-        return asset('storage/' . $this->banner_image);
+        return MediaUrl::toPublicUrl($this->banner_image);
     }
 }

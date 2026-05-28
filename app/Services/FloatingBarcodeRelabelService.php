@@ -7,6 +7,7 @@ use App\Models\OrderItem;
 use App\Models\ProductBarcode;
 use App\Models\ProductBarcodeRelabel;
 use App\Models\ProductBatch;
+use App\Models\DeletedPurchaseOrderBarcode;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\ValidationException;
@@ -34,6 +35,12 @@ class FloatingBarcodeRelabelService
             if ($productId !== (int)$batch->product_id) {
                 throw ValidationException::withMessages([
                     'product_id' => ['Selected product does not match the selected batch.'],
+                ]);
+            }
+
+            if (!empty($data['known_original_barcode_id']) && DeletedPurchaseOrderBarcode::where('product_barcode_id', $data['known_original_barcode_id'])->exists()) {
+                throw ValidationException::withMessages([
+                    'known_original_barcode_id' => ['This barcode belongs to a deleted purchase order. Return or exchange it first before relabelling.'],
                 ]);
             }
 
@@ -111,6 +118,10 @@ class FloatingBarcodeRelabelService
 
     public function validateBarcodeCanBeSold(ProductBarcode $barcode, ?Order $order = null, ?int $ignoreOrderItemId = null): void
     {
+        if (DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->exists()) {
+            throw new \Exception("Barcode {$barcode->barcode} belongs to a deleted purchase order. Return/exchange it first, then relabel before selling.");
+        }
+
         if (!$barcode->is_active) {
             throw new \Exception("Barcode {$barcode->barcode} is inactive and cannot be sold.");
         }
@@ -210,12 +221,18 @@ class FloatingBarcodeRelabelService
      */
     public function returnBarcodeFromSold(ProductBarcode $barcode, Order $order): void
     {
+        $deletedPoLink = DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->first();
+        if ($deletedPoLink) {
+            $deletedPoLink->delete();
+        }
+
         $metadata = array_merge($barcode->location_metadata ?? [], [
             'returned_to_stock_via' => 'order_edit',
             'order_number' => $order->order_number,
             'order_id' => $order->id,
             'return_date' => now()->toISOString(),
             'returned_by' => auth()->id(),
+            'deleted_purchase_order_reference_cleared' => (bool) $deletedPoLink,
         ]);
 
         $barcode->update([

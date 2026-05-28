@@ -1054,6 +1054,7 @@ class ProductReturnController extends Controller
             $barcodes = ProductBarcode::whereIn('id', $barcodeIds)->lockForUpdate()->get();
             foreach ($barcodes as $barcode) {
                 $oldStatus = $barcode->current_status;
+                \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
 
                 // Single atomic update for all barcode fields
                 $barcode->update([
@@ -1071,8 +1072,8 @@ class ProductReturnController extends Controller
                     ]),
                 ]);
 
-                // Create movement record for audit trail
-                if ($oldStatus !== 'defective') {
+                // Create movement record for audit trail when the original batch still exists.
+                if ($oldStatus !== 'defective' && $barcode->batch_id) {
                     ProductMovement::create([
                         'product_id'         => $item['product_id'] ?? $barcode->product_id,
                         'product_batch_id'   => $barcode->batch_id,
@@ -1086,6 +1087,12 @@ class ProductReturnController extends Controller
                         'reference_id'       => $return->id,
                         'notes'              => "Defective return: {$return->return_number}",
                         'performed_by'       => $employee->id,
+                    ]);
+                } elseif (!$barcode->batch_id) {
+                    Log::info('Defective return recorded without product movement because original batch was deleted', [
+                        'barcode_id' => $barcode->id,
+                        'barcode' => $barcode->barcode,
+                        'return_id' => $return->id,
                     ]);
                 }
 
@@ -1117,15 +1124,84 @@ class ProductReturnController extends Controller
         }
 
         $returnStore = $return->received_at_store_id ?? $return->store_id;
+        $order = $return->order ?: Order::find($return->order_id);
+        $restoredWithoutBatch = false;
 
         foreach ($return->return_items ?? [] as $item) {
-            if (!isset($item['product_batch_id'], $item['product_id'], $item['quantity'])) {
+            if (!isset($item['product_id'], $item['quantity'])) {
                 continue;
             }
 
-            $originalBatch = ProductBatch::find($item['product_batch_id']);
+            $batchId = $item['product_batch_id'] ?? null;
+            $originalBatch = $batchId ? ProductBatch::find($batchId) : null;
+            $barcodeIds = collect($item['returned_barcode_ids'] ?? [])->filter()->values();
+
             if (!$originalBatch) {
-                throw new \Exception("Original batch not found for returned item (batch_id={$item['product_batch_id']}).");
+                $barcodes = $barcodeIds->isNotEmpty()
+                    ? ProductBarcode::whereIn('id', $barcodeIds)->get()
+                    : ProductBarcode::where('product_id', $item['product_id'])
+                        ->whereIn('current_status', ['with_customer', 'sold'])
+                        ->where(function ($q) use ($return, $order) {
+                            $q->where('location_metadata->order_id', $return->order_id);
+                            if ($order?->order_number) {
+                                $q->orWhere('location_metadata->order_number', $order->order_number);
+                            }
+                        })
+                        ->limit((int) $item['quantity'])
+                        ->get();
+
+                if ($barcodes->isNotEmpty()) {
+                    $restoredWithoutBatch = true;
+                }
+
+                foreach ($barcodes as $barcode) {
+                    $oldStatus = $barcode->current_status;
+
+                    if ($order) {
+                        $this->relabelService->returnBarcodeFromSold($barcode, $order);
+                        $barcode->refresh();
+                    } else {
+                        \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
+                    }
+
+                    $barcode->update([
+                        'current_status'      => 'available',
+                        'is_active'           => true,
+                        'is_defective'        => false,
+                        'current_store_id'    => $returnStore,
+                        'batch_id'            => null,
+                        'location_updated_at' => now(),
+                        'location_metadata'   => array_merge($barcode->location_metadata ?? [], [
+                            'return_id' => $return->id,
+                            'return_reason' => $return->return_reason,
+                            'returned_at' => now()->toISOString(),
+                            'previous_status' => $oldStatus,
+                            'po_deleted_before_return' => true,
+                            'batch_deleted_before_return' => true,
+                            'deleted_purchase_order_reference_cleared' => true,
+                        ]),
+                    ]);
+
+                    Log::info('Barcode restored after return without original batch', [
+                        'barcode_id' => $barcode->id,
+                        'barcode' => $barcode->barcode,
+                        'return_id' => $return->id,
+                        'old_status' => $oldStatus,
+                        'store_id' => $returnStore,
+                    ]);
+
+                    app(OrderBarcodeLifecycleService::class)->detachBarcodeFromOrderItems(
+                        $barcode,
+                        $return->order_id,
+                        'product_return_restored_deleted_po',
+                        [
+                            'return_id' => $return->id,
+                            'return_number' => $return->return_number,
+                        ]
+                    );
+                }
+
+                continue;
             }
 
             if ((int) $originalBatch->store_id === (int) $returnStore) {
@@ -1159,7 +1235,6 @@ class ProductReturnController extends Controller
             $targetBatch->quantity += (int) $item['quantity'];
             $targetBatch->save();
 
-            $barcodeIds = collect($item['returned_barcode_ids'] ?? [])->filter()->values();
             if ($barcodeIds->isEmpty()) {
                 $barcodes = ProductBarcode::where('product_id', $item['product_id'])
                     ->where('batch_id', $item['product_batch_id'])
@@ -1173,9 +1248,9 @@ class ProductReturnController extends Controller
             foreach ($barcodes as $barcode) {
                 $oldStatus = $barcode->current_status;
 
-                // Handle replacement barcode logic (mark as open again)
-                if ($barcode->is_replacement) {
-                    $this->relabelService->returnBarcodeFromSold($barcode, $return->order);
+                if ($order) {
+                    $this->relabelService->returnBarcodeFromSold($barcode, $order);
+                    $barcode->refresh();
                 }
 
                 // Use a single atomic update to restore ALL barcode fields at once.
@@ -1239,14 +1314,36 @@ class ProductReturnController extends Controller
                 );
             }
         }
+
+        if ($restoredWithoutBatch) {
+            $history = $return->status_history ?? [];
+            $history[] = [
+                'status' => 'inventory_restored_deleted_purchase_order',
+                'changed_at' => now()->toISOString(),
+                'changed_by' => $employee->id,
+                'notes' => 'Returned barcode restored without original PO/batch; deleted PO reference cleared.',
+            ];
+            $return->status_history = $history;
+            $return->save();
+        }
     }
 
     private function isInventoryRestored(ProductReturn $return): bool
     {
-        return ProductMovement::where('reference_type', 'return')
+        if (ProductMovement::where('reference_type', 'return')
             ->where('reference_id', $return->id)
             ->whereIn('movement_type', ['return', 'cross_store_return'])
-            ->exists();
+            ->exists()) {
+            return true;
+        }
+
+        foreach ($return->status_history ?? [] as $entry) {
+            if (($entry['status'] ?? null) === 'inventory_restored_deleted_purchase_order') {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

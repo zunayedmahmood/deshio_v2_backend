@@ -8,6 +8,7 @@ use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
+use App\Support\MediaUrl;
 
 class HomepageSectionController extends Controller
 {
@@ -161,7 +162,9 @@ class HomepageSectionController extends Controller
 
     private function deleteImage(?string $path): void
     {
-        if (!$path || filter_var($path, FILTER_VALIDATE_URL)) return;
-        Storage::disk('public')->delete($path);
+        $storedPath = MediaUrl::storedPath($path);
+        if ($storedPath) {
+            Storage::disk('public')->delete($storedPath);
+        }
     }
 }

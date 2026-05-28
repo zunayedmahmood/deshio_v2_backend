@@ -68,6 +68,8 @@ class ProductBarcodeController extends Controller
             }
         }
 
+        $deletedPoLink = $scanResult['barcode']->deletedPurchaseOrderLink ?? null;
+
         return response()->json([
             'success' => true,
             'data' => [
@@ -103,6 +105,25 @@ class ProductBarcodeController extends Controller
                     'sell_price' => number_format((float)$scanResult['current_batch']->sell_price, 2),
                     'status' => $scanResult['current_batch']->status,
                     'expiry_date' => $scanResult['current_batch']->expiry_date ? date('Y-m-d', strtotime($scanResult['current_batch']->expiry_date)) : null,
+                ] : ($deletedPoLink ? [
+                    'id' => null,
+                    'batch_number' => 'Batch deleted',
+                    'deleted' => true,
+                    'deleted_product_batch_id' => $deletedPoLink->deleted_product_batch_id,
+                    'deleted_batch_number' => $deletedPoLink->deleted_batch_number,
+                    'store_id' => null,
+                    'quantity' => null,
+                    'cost_price' => null,
+                    'sell_price' => null,
+                    'status' => 'deleted',
+                    'expiry_date' => null,
+                ] : null),
+                'deleted_purchase_order' => $deletedPoLink ? [
+                    'deleted' => true,
+                    'po_number' => 'PO deleted',
+                    'deleted_purchase_order_id' => $deletedPoLink->deleted_purchase_order_id,
+                    'deleted_po_number' => $deletedPoLink->deleted_po_number,
+                    'deleted_at' => $deletedPoLink->deleted_at?->format('Y-m-d H:i:s'),
                 ] : null,
                 'is_available' => $scanResult['is_available'],
                 'quantity_available' => $scanResult['quantity_available'],

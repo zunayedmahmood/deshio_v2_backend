@@ -46,7 +46,8 @@ class LookupController extends Controller
             'product.vendor',
             'batch.store',
             'currentStore',
-            'defectiveRecord.identifiedBy'
+            'defectiveRecord.identifiedBy',
+            'deletedPurchaseOrderLink'
         ])->where('barcode', $request->barcode)->first();
 
         if (!$barcodeRecord) {
@@ -55,6 +56,8 @@ class LookupController extends Controller
                 'message' => 'Barcode not found'
             ], 404);
         }
+
+        $deletedPoLink = $barcodeRecord->deletedPurchaseOrderLink;
 
         // 1. Product Information
         $productInfo = [
@@ -117,6 +120,19 @@ class LookupController extends Controller
                     'store_code' => $barcodeRecord->batch->store->store_code,
                 ] : null,
             ];
+        } elseif ($deletedPoLink) {
+            $batchInfo = [
+                'id' => null,
+                'batch_number' => 'Batch deleted',
+                'deleted' => true,
+                'deleted_product_batch_id' => $deletedPoLink->deleted_product_batch_id,
+                'deleted_batch_number' => $deletedPoLink->deleted_batch_number,
+                'cost_price' => null,
+                'sell_price' => null,
+                'manufactured_date' => null,
+                'expiry_date' => null,
+                'original_store' => null,
+            ];
         }
 
         // 5. Purchase Order Origin - Enhanced with full PO and Vendor details
@@ -142,7 +158,7 @@ class LookupController extends Controller
         }
 
         // If no batch link, try finding PO by product_id (most recent received PO for this product)
-        if (!$poItem) {
+        if (!$poItem && !$deletedPoLink) {
             $poItem = PurchaseOrderItem::with(['purchaseOrder.vendor', 'purchaseOrder.store', 'purchaseOrder.createdBy'])
                 ->where('product_id', $barcodeRecord->product_id)
                 ->whereHas('purchaseOrder', function($q) {
@@ -216,6 +232,32 @@ class LookupController extends Controller
                     'source' => 'purchase_order',
                 ];
             }
+        } elseif ($deletedPoLink) {
+            $purchaseOrderOrigin = [
+                'po_number' => 'PO deleted',
+                'received_date' => null,
+                'source' => 'deleted_purchase_order',
+                'deleted' => true,
+                'deleted_purchase_order_id' => $deletedPoLink->deleted_purchase_order_id,
+                'deleted_po_number' => $deletedPoLink->deleted_po_number,
+            ];
+
+            $purchaseOrderDetails = [
+                'id' => null,
+                'po_number' => 'PO deleted',
+                'status' => 'deleted',
+                'payment_status' => null,
+                'deleted' => true,
+                'deleted_purchase_order_id' => $deletedPoLink->deleted_purchase_order_id,
+                'deleted_po_number' => $deletedPoLink->deleted_po_number,
+                'deleted_at' => $deletedPoLink->deleted_at?->format('Y-m-d H:i:s'),
+                'item_details' => [
+                    'receive_status' => 'deleted',
+                    'unit_cost' => null,
+                    'unit_sell_price' => null,
+                    'total_cost' => null,
+                ],
+            ];
         }
 
         // 6. Get all activity history for this barcode (DB-agnostic: PostgreSQL + MySQL/MariaDB)
@@ -423,6 +465,8 @@ class LookupController extends Controller
                     'current_status' => $barcodeRecord->current_status,
                     'has_purchase_order' => $purchaseOrderDetails !== null,
                     'has_vendor_info' => $vendorDetails !== null,
+                    'is_purchase_order_deleted' => (bool) $deletedPoLink,
+                    'is_batch_deleted' => (bool) ($deletedPoLink && !$barcodeRecord->batch),
                 ],
             ]
         ]);

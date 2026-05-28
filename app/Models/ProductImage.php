@@ -6,6 +6,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Facades\Storage;
+use App\Support\MediaUrl;
 
 class ProductImage extends Model
 {
@@ -55,7 +56,7 @@ class ProductImage extends Model
 
     public function getImageUrlAttribute()
     {
-        return $this->image_path ? Storage::url($this->image_path) : null;
+        return MediaUrl::toPublicUrl($this->image_path);
     }
 
     public function makePrimary()
@@ -72,8 +73,8 @@ class ProductImage extends Model
 
     public function deleteImage()
     {
-        if ($this->image_path && Storage::exists($this->image_path)) {
-            Storage::delete($this->image_path);
+        if ($this->image_path && Storage::disk('public')->exists($this->image_path)) {
+            Storage::disk('public')->delete($this->image_path);
         }
 
         return $this->delete();

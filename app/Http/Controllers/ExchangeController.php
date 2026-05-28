@@ -165,7 +165,7 @@ class ExchangeController extends Controller
                     $returnedBarcodes = [$barcode->barcode];
                 }
 
-                if (!$batchId) {
+                if (!$batchId && empty($returnedBarcodeIds)) {
                     throw new \Exception("Product batch ID is missing for removed product: " . $item['product_id']);
                 }
 
@@ -624,10 +624,77 @@ class ExchangeController extends Controller
     private function restoreInventoryForReturn(ProductReturn $return, Employee $employee): void
     {
         $returnStore = $return->store_id;
+        $order = $return->order ?: Order::find($return->order_id);
 
         foreach ($return->return_items ?? [] as $item) {
-            $originalBatch = ProductBatch::find($item['product_batch_id']);
-            if (!$originalBatch) continue;
+            $batchId = $item['product_batch_id'] ?? null;
+            $originalBatch = $batchId ? ProductBatch::find($batchId) : null;
+            $barcodeIds = collect($item['returned_barcode_ids'] ?? [])->filter()->values();
+
+            if (!$originalBatch) {
+                $barcodes = $barcodeIds->isNotEmpty()
+                    ? ProductBarcode::whereIn('id', $barcodeIds)->get()
+                    : ProductBarcode::where('product_id', $item['product_id'])
+                        ->whereIn('current_status', ['with_customer', 'sold'])
+                        ->where(function ($q) use ($return, $order) {
+                            $q->where('location_metadata->order_id', $return->order_id);
+                            if ($order?->order_number) {
+                                $q->orWhere('location_metadata->order_number', $order->order_number);
+                            }
+                        })
+                        ->limit((int) $item['quantity'])
+                        ->get();
+
+                foreach ($barcodes as $barcode) {
+                    $oldStatus = $barcode->current_status;
+
+                    if ($order) {
+                        $this->relabelService->returnBarcodeFromSold($barcode, $order);
+                        $barcode->refresh();
+                    } else {
+                        \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
+                    }
+
+                    $barcode->update([
+                        'batch_id'            => null,
+                        'is_active'           => true,
+                        'is_defective'        => false,
+                        'current_store_id'    => $returnStore,
+                        'current_status'      => 'available',
+                        'location_updated_at' => now(),
+                        'location_metadata'   => array_merge($barcode->location_metadata ?? [], [
+                            'return_id' => $return->id,
+                            'reference_type' => 'return',
+                            'reference_id' => $return->id,
+                            'notes' => "Customer Return via Exchange. Reason: " . ($item['return_reason'] ?? 'N/A'),
+                            'previous_status' => $oldStatus,
+                            'po_deleted_before_return' => true,
+                            'batch_deleted_before_return' => true,
+                            'deleted_purchase_order_reference_cleared' => true,
+                        ]),
+                    ]);
+
+                    Log::info('Barcode restored after exchange return without original batch', [
+                        'barcode_id' => $barcode->id,
+                        'barcode' => $barcode->barcode,
+                        'return_id' => $return->id,
+                        'old_status' => $oldStatus,
+                        'store_id' => $returnStore,
+                    ]);
+
+                    app(OrderBarcodeLifecycleService::class)->detachBarcodeFromOrderItems(
+                        $barcode,
+                        $return->order_id,
+                        'exchange_return_restored_deleted_po',
+                        [
+                            'return_id' => $return->id,
+                            'return_number' => $return->return_number,
+                        ]
+                    );
+                }
+
+                continue;
+            }
 
             // In lookup page exchange, we usually restore to the current store
             $targetBatch = null;
@@ -651,7 +718,6 @@ class ExchangeController extends Controller
 
             $targetBatch->increment('quantity', (int) $item['quantity']);
 
-            $barcodeIds = collect($item['returned_barcode_ids'] ?? [])->filter()->values();
             if ($barcodeIds->isEmpty()) {
                 // Try to find barcodes that were sold from this order/item
                 $barcodes = ProductBarcode::where('product_id', $item['product_id'])
@@ -667,9 +733,9 @@ class ExchangeController extends Controller
                 foreach ($barcodes as $barcode) {
                     $oldStatus = $barcode->current_status;
 
-                    // Handle replacement barcode logic (mark as open again)
-                    if ($barcode->is_replacement) {
-                        $this->relabelService->returnBarcodeFromSold($barcode, $return->order);
+                    if ($order) {
+                        $this->relabelService->returnBarcodeFromSold($barcode, $order);
+                        $barcode->refresh();
                     }
 
                     // Use a single atomic update to restore ALL barcode fields at once.
@@ -737,7 +803,7 @@ class ExchangeController extends Controller
                 
                 // For now, let's log if no barcodes found to help debugging
                 if ($item['quantity'] > 0) {
-                    Log::warning("No barcodes found for return item", ['product_id' => $item['product_id'], 'batch_id' => $item['product_batch_id']]);
+                    Log::warning("No barcodes found for return item", ['product_id' => $item['product_id'], 'batch_id' => $item['product_batch_id'] ?? null]);
                 }
                 
                 // If we absolutely must record it and DB requires barcode_id:
@@ -758,4 +824,5 @@ class ExchangeController extends Controller
             }
         }
     }
+
 }

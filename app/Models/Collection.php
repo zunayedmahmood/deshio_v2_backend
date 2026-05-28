@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Support\Str;
+use App\Support\MediaUrl;
 
 class Collection extends Model
 {
@@ -31,16 +32,12 @@ class Collection extends Model
 
     public function getThumbnailUrlAttribute()
     {
-        if (!$this->thumbnail_image) return null;
-        if (filter_var($this->thumbnail_image, FILTER_VALIDATE_URL)) return $this->thumbnail_image;
-        return asset('storage/' . $this->thumbnail_image);
+        return MediaUrl::toPublicUrl($this->thumbnail_image);
     }
 
     public function getBannerUrlAttribute()
     {
-        if (!$this->banner_image) return null;
-        if (filter_var($this->banner_image, FILTER_VALIDATE_URL)) return $this->banner_image;
-        return asset('storage/' . $this->banner_image);
+        return MediaUrl::toPublicUrl($this->banner_image);
     }
 
     protected static function boot()

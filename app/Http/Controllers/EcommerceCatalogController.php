@@ -630,7 +630,7 @@ class EcommerceCatalogController extends Controller
     public function getCategories(Request $request)
     {
         try {
-            $cacheKey = 'ecommerce_categories_tree';
+            $cacheKey = 'ecommerce_categories_tree_media_v2';
             $categoriesTree = Cache::remember($cacheKey, 3600, function () {
                 $categories = Category::with(['children' => function($q) {
                         $q->where('is_active', true)->orderBy('order', 'asc');

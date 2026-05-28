@@ -8,6 +8,7 @@ use App\Models\Product;
 use App\Models\Setting;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
+use App\Support\MediaUrl;
 
 class SettingController extends Controller
 {
@@ -31,7 +32,7 @@ class SettingController extends Controller
 
         if (!$group || $group === 'hero') {
             $response['ticker'] = array_merge($this->defaultTicker(), $this->settingArray($settings, 'homepage_ticker'));
-            $response['hero'] = array_merge($this->defaultHero(), $this->settingArray($settings, 'homepage_hero'));
+            $response['hero'] = $this->normalizeHero(array_merge($this->defaultHero(), $this->settingArray($settings, 'homepage_hero')));
         }
 
         if (!$group || $group === 'collections') {
@@ -63,11 +64,11 @@ class SettingController extends Controller
 
         return response()->json([
             'ticker' => array_merge($this->defaultTicker(), $this->settingArray($settings, 'homepage_ticker')),
-            'hero' => array_merge($this->defaultHero(), $this->settingArray($settings, 'homepage_hero')),
+            'hero' => $this->normalizeHero(array_merge($this->defaultHero(), $this->settingArray($settings, 'homepage_hero'))),
             'collections' => $this->settingArray($settings, 'homepage_collections'),
             'showcase' => $this->resolveShowcase($this->settingArray($settings, 'homepage_showcase')),
             'new_arrivals' => $this->resolveNewArrivals($this->settingArray($settings, 'homepage_new_arrivals')),
-            'bannered_collections' => $this->settingArray($settings, 'homepage_bannered_collections'),
+            'bannered_collections' => $this->normalizeBanneredSettings($this->settingArray($settings, 'homepage_bannered_collections')),
             'instagram_reels' => array_merge($this->defaultInstagramReels(), $this->settingArray($settings, 'homepage_instagram_reels')),
             'section_order' => $this->sectionOrder($settings),
         ]);
@@ -289,6 +290,60 @@ class SettingController extends Controller
         ];
     }
 
+    private function normalizeImagePayload($image): ?array
+    {
+        if (is_string($image)) {
+            $pathOrUrl = $image;
+            $path = null;
+        } elseif (is_array($image)) {
+            $pathOrUrl = $image['path'] ?? $image['url'] ?? null;
+            $path = $image['path'] ?? null;
+        } else {
+            return null;
+        }
+
+        if (!$pathOrUrl) {
+            return null;
+        }
+
+        $storedPayload = MediaUrl::imagePayload($pathOrUrl);
+        if ($storedPayload) {
+            return $storedPayload;
+        }
+
+        $url = MediaUrl::toPublicUrl($pathOrUrl);
+        if (!$url) {
+            return null;
+        }
+
+        return [
+            'url' => $url,
+            'path' => MediaUrl::storedPath($path) ?: null,
+        ];
+    }
+
+    private function normalizeHero(array $hero): array
+    {
+        $hero['images'] = collect($hero['images'] ?? [])
+            ->map(fn ($image) => $this->normalizeImagePayload($image))
+            ->filter()
+            ->values()
+            ->all();
+
+        return $hero;
+    }
+
+    private function normalizeBanneredSettings(array $items): array
+    {
+        return collect($items)->map(function ($item) {
+            if (!empty($item['override_image'])) {
+                $item['override_image'] = $this->normalizeImagePayload($item['override_image']);
+            }
+
+            return $item;
+        })->values()->all();
+    }
+
     private function resolveCollectionTiles(array $collectionsSetting): array
     {
         if (empty($collectionsSetting)) return [];
@@ -354,21 +409,21 @@ class SettingController extends Controller
                 'id' => $id,
                 'type' => $type,
                 'show_text' => filter_var($item['show_text'] ?? true, FILTER_VALIDATE_BOOLEAN),
-                'override_image' => $item['override_image'] ?? null,
+                'override_image' => $this->normalizeImagePayload($item['override_image'] ?? null),
             ];
 
             if ($type === 'category' && isset($categories[$id])) {
                 $cat = $categories[$id];
                 $base['title'] = !empty($item['title']) ? $item['title'] : $cat->title;
                 $base['subtitle'] = $item['subtitle'] ?? '';
-                $base['image'] = !empty($item['override_image']['url']) ? $item['override_image']['url'] : ($cat->banner_url ?: $cat->thumbnail_url ?: $cat->image_url);
+                $base['image'] = !empty($base['override_image']['url']) ? $base['override_image']['url'] : ($cat->banner_url ?: $cat->thumbnail_url ?: $cat->image_url);
                 $base['href'] = '/e-commerce/' . ($cat->slug ?? $cat->id);
                 $response[] = $base;
             } elseif ($type === 'collection' && isset($collections[$id])) {
                 $col = $collections[$id];
                 $base['title'] = !empty($item['title']) ? $item['title'] : $col->name;
                 $base['subtitle'] = $item['subtitle'] ?? '';
-                $base['image'] = !empty($item['override_image']['url']) ? $item['override_image']['url'] : ($col->banner_url ?: $col->thumbnail_url);
+                $base['image'] = !empty($base['override_image']['url']) ? $base['override_image']['url'] : ($col->banner_url ?: $col->thumbnail_url);
                 $base['href'] = '/e-commerce/collections/' . ($col->slug ?? $col->id);
                 $response[] = $base;
             }
@@ -501,14 +556,11 @@ class SettingController extends Controller
             ];
 
             if (($item['image_type'] ?? null) === 'existing') {
-                $banneredItem['override_image'] = $item['override_image'] ?? null;
+                $banneredItem['override_image'] = $this->normalizeImagePayload($item['override_image'] ?? null);
             } elseif (($item['image_type'] ?? null) === 'new' && isset($uploadedFiles[$item['fileIndex']])) {
                 $file = $uploadedFiles[$item['fileIndex']];
                 $path = $file->store('homepage/bannered', 'public');
-                $banneredItem['override_image'] = [
-                    'url' => '/storage/' . ltrim($path, '/'),
-                    'path' => $path,
-                ];
+                $banneredItem['override_image'] = MediaUrl::imagePayload($path);
             } else {
                 $banneredItem['override_image'] = null;
             }
@@ -518,8 +570,8 @@ class SettingController extends Controller
             }
         }
 
-        $oldPaths = collect($currentBannered)->pluck('override_image.path')->filter()->all();
-        $newPaths = collect($newBannered)->pluck('override_image.path')->filter()->all();
+        $oldPaths = collect($currentBannered)->pluck('override_image.path')->map(fn ($path) => MediaUrl::storedPath($path))->filter()->all();
+        $newPaths = collect($newBannered)->pluck('override_image.path')->map(fn ($path) => MediaUrl::storedPath($path))->filter()->all();
         foreach (array_diff($oldPaths, $newPaths) as $path) {
             Storage::disk('public')->delete($path);
         }
@@ -549,27 +601,24 @@ class SettingController extends Controller
 
             foreach ($meta as $item) {
                 if (($item['type'] ?? null) === 'existing') {
-                    $newImages[] = [
-                        'url' => $item['url'] ?? '',
-                        'path' => $item['path'] ?? null,
-                    ];
+                    $normalized = $this->normalizeImagePayload($item);
+                    if ($normalized) {
+                        $newImages[] = $normalized;
+                    }
                 } elseif (($item['type'] ?? null) === 'new' && isset($uploadedFiles[$item['fileIndex']])) {
                     $file = $uploadedFiles[$item['fileIndex']];
                     $path = $file->store('homepage', 'public');
-                    $newImages[] = [
-                        'url' => '/storage/' . ltrim($path, '/'),
-                        'path' => $path,
-                    ];
+                    $newImages[] = MediaUrl::imagePayload($path);
                 }
             }
 
-            $oldPaths = collect($currentHero['images'] ?? [])->pluck('path')->filter()->all();
-            $newPaths = collect($newImages)->pluck('path')->filter()->all();
+            $oldPaths = collect($currentHero['images'] ?? [])->pluck('path')->map(fn ($path) => MediaUrl::storedPath($path))->filter()->all();
+            $newPaths = collect($newImages)->pluck('path')->map(fn ($path) => MediaUrl::storedPath($path))->filter()->all();
             foreach (array_diff($oldPaths, $newPaths) as $path) {
                 Storage::disk('public')->delete($path);
             }
 
-            $currentHero['images'] = array_values(array_filter($newImages, fn ($img) => !empty($img['url'])));
+            $currentHero['images'] = array_values(array_filter($newImages, fn ($img) => is_array($img) && !empty($img['url'])));
         }
 
         if ($request->has('hero_title')) $currentHero['title'] = $request->input('hero_title');

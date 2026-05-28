@@ -9,6 +9,7 @@ use Illuminate\Support\Str;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Validation\Rule;
+use App\Support\MediaUrl;
 
 class CategoriesController extends Controller
 {
@@ -31,13 +32,16 @@ class CategoriesController extends Controller
 
     private function deleteStoredCategoryImage(?string $path): void
     {
-        if (!$path || filter_var($path, FILTER_VALIDATE_URL)) return;
-        Storage::disk('public')->delete($path);
+        $storedPath = MediaUrl::storedPath($path);
+        if ($storedPath) {
+            Storage::disk('public')->delete($storedPath);
+        }
     }
 
     private function clearCategoryCache(): void
     {
         Cache::forget('ecommerce_categories_tree');
+        Cache::forget('ecommerce_categories_tree_media_v2');
     }
 
     public function createCategory(Request $request)

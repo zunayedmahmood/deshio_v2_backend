@@ -43,6 +43,7 @@ use App\Http\Controllers\ExchangeController;
 use App\Http\Controllers\ManualSaleRelabelController;
 use App\Http\Controllers\HomepageSectionController;
 use App\Http\Controllers\SettingController;
+use App\Http\Controllers\MediaController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -68,6 +69,8 @@ use App\Http\Controllers\SslcommerzController;
 Route::post('/signup', [AuthController::class, 'signup']);
 Route::post('/login', [AuthController::class, 'login']);
 Route::post('/reset-password', [AuthController::class, 'resetPassword']);
+
+Route::get('/media/{path}', [MediaController::class, 'show'])->where('path', '.*');
 
 // ============================================
 // E-COMMERCE GUEST CHECKOUT (NO AUTH REQUIRED)

@@ -9,10 +9,19 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\Storage;
+use App\Support\MediaUrl;
 
 class CollectionController extends Controller
 {
     use DatabaseAgnosticSearch;
+
+    private function deleteStoredImage(?string $path): void
+    {
+        $storedPath = MediaUrl::storedPath($path);
+        if ($storedPath) {
+            Storage::disk('public')->delete($storedPath);
+        }
+    }
     public function index(Request $request)
     {
         $query = Collection::with(['createdBy', 'products']);
@@ -137,12 +146,12 @@ class CollectionController extends Controller
 
         // Handle Banner removal/upload
         if ($request->remove_banner && $collection->banner_image) {
-            Storage::disk('public')->delete($collection->banner_image);
+            $this->deleteStoredImage($collection->banner_image);
             $data['banner_image'] = null;
         }
         if ($request->hasFile('banner_image')) {
             if ($collection->banner_image) {
-                Storage::disk('public')->delete($collection->banner_image);
+                $this->deleteStoredImage($collection->banner_image);
             }
             $banner = $request->file('banner_image');
             $bannerName = time() . '_banner_' . Str::slug($data['name'] ?? $collection->name) . '.' . $banner->getClientOriginalExtension();
@@ -152,12 +161,12 @@ class CollectionController extends Controller
 
         // Handle Thumbnail removal/upload
         if ($request->remove_thumbnail && $collection->thumbnail_image) {
-            Storage::disk('public')->delete($collection->thumbnail_image);
+            $this->deleteStoredImage($collection->thumbnail_image);
             $data['thumbnail_image'] = null;
         }
         if ($request->hasFile('thumbnail_image')) {
             if ($collection->thumbnail_image) {
-                Storage::disk('public')->delete($collection->thumbnail_image);
+                $this->deleteStoredImage($collection->thumbnail_image);
             }
             $thumbnail = $request->file('thumbnail_image');
             $thumbnailName = time() . '_thumb_' . Str::slug($data['name'] ?? $collection->name) . '.' . $thumbnail->getClientOriginalExtension();

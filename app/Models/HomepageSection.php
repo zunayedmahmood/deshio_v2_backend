@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use App\Support\MediaUrl;
 
 class HomepageSection extends Model
 {
@@ -31,8 +32,6 @@ class HomepageSection extends Model
 
     public function getImageUrlAttribute()
     {
-        if (!$this->image) return null;
-        if (filter_var($this->image, FILTER_VALIDATE_URL)) return $this->image;
-        return asset('storage/' . $this->image);
+        return MediaUrl::toPublicUrl($this->image);
     }
 }

@@ -409,60 +409,97 @@ class PurchaseOrderController extends Controller
         ]);
     }
     /**
-     * Delete purchase order and related inventory records
+     * Delete purchase order and related inventory records.
+     *
+     * Deshio keeps physical barcode identities after PO deletion. Barcodes from
+     * deleted batches are detached from the batch and recorded in
+     * deleted_purchase_order_barcodes so lookup/return/exchange flows can still
+     * recognize that their original PO/batch was deleted.
      */
     public function destroy(Request $request, $id)
     {
         $po = PurchaseOrder::with('items')->findOrFail($id);
-        // 1. Check if user is admin
-        // (Assuming middleware handles basic auth, but we can double check roles if needed)
-        // The frontend will only show the button for admins.
-        // 2. Check if PO is unpaid
+
         if ($po->paid_amount > 0 || $po->payment_status !== 'unpaid') {
             return response()->json([
                 'success' => false,
                 'message' => 'Cannot delete purchase order as it has already been paid or partially paid.'
             ], 422);
         }
-        // 3. Verify password
-        $request->validate([
+
+        $validated = $request->validate([
             'password' => 'required|string'
         ]);
-        if (!Hash::check($request->password, auth()->user()->password)) {
+
+        if (!Hash::check($validated['password'], auth()->user()->password)) {
             return response()->json([
                 'success' => false,
                 'message' => 'Invalid password. Deletion aborted.'
             ], 401);
         }
+
         DB::beginTransaction();
         try {
             $productIdsToSync = [];
+            $batchIdsToDelete = [];
+
             foreach ($po->items as $item) {
-                $productIdsToSync[] = $item->product_id;
-                
+                if ($item->product_id) {
+                    $productIdsToSync[] = $item->product_id;
+                }
+
                 if ($item->product_batch_id) {
-                    $batch = ProductBatch::find($item->product_batch_id);
-                    if ($batch) {
-                        // Delete all barcodes for this batch
-                        ProductBarcode::where('batch_id', $batch->id)->delete();
-                        
-                        // Delete the batch
-                        $batch->delete();
-                    }
+                    $batchIdsToDelete[] = $item->product_batch_id;
                 }
             }
-            // Delete PO items
-            $po->items()->delete();
-            // Delete the purchase order
-            $po->delete();
-            // Update quantity of all products in PO (Sync Master Inventory)
-            foreach (array_unique($productIdsToSync) as $productId) {
-                MasterInventory::syncProductInventory($productId);
+
+            $batchIdsToDelete = array_values(array_unique(array_filter($batchIdsToDelete)));
+
+            if (!empty($batchIdsToDelete)) {
+                $batchesById = ProductBatch::whereIn('id', $batchIdsToDelete)
+                    ->get(['id', 'batch_number'])
+                    ->keyBy('id');
+
+                $barcodes = ProductBarcode::whereIn('batch_id', $batchIdsToDelete)
+                    ->get(['id', 'batch_id', 'product_id']);
+
+                foreach ($barcodes as $barcode) {
+                    $batch = $batchesById->get($barcode->batch_id);
+
+                    \App\Models\DeletedPurchaseOrderBarcode::updateOrCreate(
+                        ['product_barcode_id' => $barcode->id],
+                        [
+                            'deleted_purchase_order_id' => $po->id,
+                            'deleted_product_batch_id' => $barcode->batch_id,
+                            'deleted_po_number' => $po->po_number,
+                            'deleted_batch_number' => $batch?->batch_number,
+                            'product_id' => $barcode->product_id,
+                            'deleted_at' => now(),
+                        ]
+                    );
+                }
+
+                // product_barcodes.batch_id is a cascading FK in existing installs.
+                // Detach first so deleting product_batches does not delete barcodes.
+                ProductBarcode::whereIn('batch_id', $batchIdsToDelete)->update(['batch_id' => null]);
+
+                ProductBatch::whereIn('id', $batchIdsToDelete)->delete();
             }
+
+            $po->items()->delete();
+            $po->delete();
+
             DB::commit();
+
+            foreach (array_unique($productIdsToSync) as $productId) {
+                if (method_exists(MasterInventory::class, 'syncProductInventory')) {
+                    MasterInventory::syncProductInventory($productId);
+                }
+            }
+
             return response()->json([
                 'success' => true,
-                'message' => 'Purchase order and related inventory records deleted successfully.'
+                'message' => 'Purchase order deleted. Batches were removed and barcodes were preserved with deleted PO references.'
             ]);
         } catch (\Exception $e) {
             DB::rollBack();

@@ -9,15 +9,73 @@ use App\Models\Employee;
 use App\Models\Expense;
 use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
 class ReportController extends Controller
 {
     use DatabaseAgnosticSearch;
+
+    /** @var string[] statuses that are not real sales for reporting totals */
+    private array $excludedOrderStatuses = ['cancelled', 'pending_assignment', 'draft'];
+
+    /**
+     * Net line value used by all legacy reports.
+     *
+     * Many old rows have total_amount as zero even though quantity and
+     * unit_price are correct. This expression fixes zero-total reports by
+     * recalculating from item price first, then falling back to stored totals.
+     */
+    private function lineNetSql(): string
+    {
+        return "CASE
+            WHEN COALESCE(order_items.unit_price, 0) > 0 AND COALESCE(order_items.quantity, 0) > 0
+                THEN GREATEST((COALESCE(order_items.quantity, 0) * COALESCE(order_items.unit_price, 0)) - COALESCE(order_items.discount_amount, 0), 0)
+            WHEN COALESCE(order_items.total_amount, 0) > 0
+                THEN COALESCE(order_items.total_amount, 0)
+            ELSE 0
+        END";
+    }
+
+    private function orderValueSql(): string
+    {
+        return "CASE
+            WHEN COALESCE(total_amount, 0) > 0 THEN COALESCE(total_amount, 0)
+            WHEN COALESCE(subtotal, 0) > 0 THEN GREATEST(COALESCE(subtotal, 0) - COALESCE(discount_amount, 0) + COALESCE(tax_amount, 0), 0)
+            ELSE 0
+        END";
+    }
+
+    private function dateRangeFromRequest(Request $request, string $defaultPeriod = 'month'): array
+    {
+        $dateFrom = $request->get('date_from');
+        $dateTo = $request->get('date_to');
+
+        if ($dateFrom || $dateTo) {
+            return [
+                $dateFrom ? Carbon::parse($dateFrom)->startOfDay() : now()->startOfMonth(),
+                $dateTo ? Carbon::parse($dateTo)->endOfDay() : now()->endOfDay(),
+            ];
+        }
+
+        return match ($defaultPeriod) {
+            'today' => [now()->startOfDay(), now()->endOfDay()],
+            'week' => [now()->startOfWeek(), now()->endOfWeek()],
+            'year' => [now()->startOfYear(), now()->endOfYear()],
+            default => [now()->startOfMonth(), now()->endOfMonth()],
+        };
+    }
+
+    private function applySalesScope($query, string $table = 'orders')
+    {
+        return $query
+            ->whereNull("{$table}.deleted_at")
+            ->whereNotIn("{$table}.status", $this->excludedOrderStatuses);
+    }
+
     public function dashboard(Request $request)
     {
-        $period = $request->get('period', 'today'); // today, week, month, year
-
+        $period = $request->get('period', 'today');
         $dateRange = $this->getDateRange($period);
 
         $dashboard = [
@@ -25,8 +83,8 @@ class ReportController extends Controller
             'inventory_summary' => $this->getInventorySummary(),
             'customer_summary' => $this->getCustomerSummary($dateRange),
             'top_products' => $this->getTopProducts($dateRange, 5),
-            'recent_orders' => Order::with(['customer', 'items'])
-                ->whereBetween('created_at', $dateRange)
+            'recent_orders' => $this->applySalesScope(Order::with(['customer', 'items'])
+                ->whereBetween('created_at', $dateRange))
                 ->latest()
                 ->limit(10)
                 ->get(),
@@ -38,56 +96,62 @@ class ReportController extends Controller
 
     public function salesSummary(Request $request)
     {
-        $dateFrom = $request->get('date_from', now()->startOfMonth());
-        $dateTo = $request->get('date_to', now()->endOfMonth());
-        $groupBy = $request->get('group_by', 'day'); // day, week, month
+        [$dateFrom, $dateTo] = $this->dateRangeFromRequest($request);
+        $groupBy = $request->get('group_by', 'day');
 
-        $query = Order::whereBetween('created_at', [$dateFrom, $dateTo])
-            ->where('status', 'completed');
+        $base = $this->applySalesScope(Order::query())
+            ->whereBetween('created_at', [$dateFrom, $dateTo]);
 
         $dateFormatSql = $this->getDateFormatSql('created_at', $groupBy);
+        $orderValueSql = $this->orderValueSql();
 
-        $salesData = $query->selectRaw("
+        $salesData = (clone $base)->selectRaw("
                 {$dateFormatSql} as period,
                 COUNT(*) as total_orders,
-                SUM(total_amount) as total_sales,
-                SUM(paid_amount) as total_paid,
-                AVG(total_amount) as average_order_value
+                SUM({$orderValueSql}) as total_sales,
+                SUM(COALESCE(paid_amount, 0)) as total_paid,
+                AVG({$orderValueSql}) as average_order_value
             ")
             ->groupBy('period')
             ->orderBy('period')
             ->get();
 
-        $summary = [
-            'total_orders' => $query->count(),
-            'total_sales' => (float) $query->sum('total_amount'),
-            'total_paid' => (float) $query->sum('paid_amount'),
-            'average_order_value' => (float) $query->avg('total_amount'),
-            'sales_data' => $salesData,
-        ];
+        $summaryRow = (clone $base)->selectRaw("
+            COUNT(*) as total_orders,
+            SUM({$orderValueSql}) as total_sales,
+            SUM(COALESCE(paid_amount, 0)) as total_paid,
+            AVG({$orderValueSql}) as average_order_value
+        ")->first();
 
-        return response()->json(['success' => true, 'data' => $summary]);
+        return response()->json(['success' => true, 'data' => [
+            'total_orders' => (int) ($summaryRow->total_orders ?? 0),
+            'total_sales' => (float) ($summaryRow->total_sales ?? 0),
+            'total_paid' => (float) ($summaryRow->total_paid ?? 0),
+            'average_order_value' => (float) ($summaryRow->average_order_value ?? 0),
+            'sales_data' => $salesData,
+        ]]);
     }
 
     public function bestSellers(Request $request)
     {
-        $dateFrom = $request->get('date_from', now()->startOfMonth());
-        $dateTo = $request->get('date_to', now()->endOfMonth());
-        $limit = $request->get('limit', 20);
+        [$dateFrom, $dateTo] = $this->dateRangeFromRequest($request);
+        $limit = (int) $request->get('limit', 20);
+        $lineNet = $this->lineNetSql();
 
         $bestSellers = DB::table('order_items')
             ->join('orders', 'order_items.order_id', '=', 'orders.id')
             ->join('products', 'order_items.product_id', '=', 'products.id')
             ->whereBetween('orders.created_at', [$dateFrom, $dateTo])
-            ->where('orders.status', 'completed')
+            ->whereNull('orders.deleted_at')
+            ->whereNotIn('orders.status', $this->excludedOrderStatuses)
             ->select(
                 'products.id',
                 'products.name',
                 'products.sku',
-                DB::raw('SUM(order_items.quantity) as total_quantity'),
-                DB::raw('SUM(order_items.subtotal) as total_revenue'),
+                DB::raw('SUM(COALESCE(order_items.quantity, 0)) as total_quantity'),
+                DB::raw("SUM({$lineNet}) as total_revenue"),
                 DB::raw('COUNT(DISTINCT orders.id) as order_count'),
-                DB::raw('AVG(order_items.unit_price) as average_price')
+                DB::raw('AVG(NULLIF(order_items.unit_price, 0)) as average_price')
             )
             ->groupBy('products.id', 'products.name', 'products.sku')
             ->orderByDesc('total_quantity')
@@ -99,24 +163,26 @@ class ReportController extends Controller
 
     public function slowMoving(Request $request)
     {
-        $days = $request->get('days', 30);
-        $limit = $request->get('limit', 20);
+        $days = (int) $request->get('days', 30);
+        $limit = (int) $request->get('limit', 20);
 
-        $slowMoving = Product::whereHas('batches', function($q) {
-                $q->where('current_stock', '>', 0);
+        $slowMoving = Product::whereHas('batches', function ($q) {
+                $q->where('quantity', '>', 0);
             })
-            ->whereDoesntHave('orderItems', function($q) use ($days) {
-                $q->whereHas('order', function($q) use ($days) {
-                    $q->where('created_at', '>=', now()->subDays($days));
+            ->whereDoesntHave('orderItems', function ($q) use ($days) {
+                $q->whereHas('order', function ($q) use ($days) {
+                    $q->where('created_at', '>=', now()->subDays($days))
+                        ->whereNull('deleted_at')
+                        ->whereNotIn('status', $this->excludedOrderStatuses);
                 });
             })
-            ->with(['batches' => function($q) {
-                $q->where('current_stock', '>', 0);
+            ->with(['batches' => function ($q) {
+                $q->where('quantity', '>', 0);
             }])
             ->limit($limit)
             ->get()
-            ->map(function($product) {
-                $product->total_stock = $product->batches->sum('current_stock');
+            ->map(function ($product) {
+                $product->total_stock = $product->batches->sum('quantity');
                 return $product;
             });
 
@@ -125,20 +191,23 @@ class ReportController extends Controller
 
     public function staffPerformance(Request $request)
     {
-        $dateFrom = $request->get('date_from', now()->startOfMonth());
-        $dateTo = $request->get('date_to', now()->endOfMonth());
+        [$dateFrom, $dateTo] = $this->dateRangeFromRequest($request);
+        $orderValueSql = $this->orderValueSql();
 
-        $performance = Employee::with('role')
-            ->leftJoin('orders', 'employees.id', '=', 'orders.employee_id')
-            ->whereBetween('orders.created_at', [$dateFrom, $dateTo])
-            ->where('orders.status', 'completed')
+        $performance = Employee::query()
+            ->leftJoin('orders', function ($join) use ($dateFrom, $dateTo) {
+                $join->on('employees.id', '=', 'orders.created_by')
+                    ->whereBetween('orders.created_at', [$dateFrom, $dateTo])
+                    ->whereNull('orders.deleted_at')
+                    ->whereNotIn('orders.status', $this->excludedOrderStatuses);
+            })
             ->select(
                 'employees.id',
                 'employees.name',
                 'employees.employee_code',
                 DB::raw('COUNT(orders.id) as total_orders'),
-                DB::raw('SUM(orders.total_amount) as total_sales'),
-                DB::raw('AVG(orders.total_amount) as average_order_value')
+                DB::raw("SUM({$orderValueSql}) as total_sales"),
+                DB::raw("AVG({$orderValueSql}) as average_order_value")
             )
             ->groupBy('employees.id', 'employees.name', 'employees.employee_code')
             ->orderByDesc('total_sales')
@@ -149,25 +218,25 @@ class ReportController extends Controller
 
     public function profitMargins(Request $request)
     {
-        $dateFrom = $request->get('date_from', now()->startOfMonth());
-        $dateTo = $request->get('date_to', now()->endOfMonth());
+        [$dateFrom, $dateTo] = $this->dateRangeFromRequest($request);
+        $lineNet = $this->lineNetSql();
 
         $margins = DB::table('order_items')
             ->join('orders', 'order_items.order_id', '=', 'orders.id')
             ->join('products', 'order_items.product_id', '=', 'products.id')
             ->whereBetween('orders.created_at', [$dateFrom, $dateTo])
-            ->where('orders.status', 'completed')
+            ->whereNull('orders.deleted_at')
+            ->whereNotIn('orders.status', $this->excludedOrderStatuses)
             ->select(
                 'products.id',
                 'products.name',
-                'products.cost_price',
-                DB::raw('SUM(order_items.quantity) as units_sold'),
-                DB::raw('SUM(order_items.subtotal) as revenue'),
-                DB::raw('SUM(order_items.quantity * products.cost_price) as cost'),
-                DB::raw('SUM(order_items.subtotal - (order_items.quantity * products.cost_price)) as profit'),
-                DB::raw('((SUM(order_items.subtotal - (order_items.quantity * products.cost_price)) / SUM(order_items.subtotal)) * 100) as margin_percent')
+                DB::raw('SUM(COALESCE(order_items.quantity, 0)) as units_sold'),
+                DB::raw("SUM({$lineNet}) as revenue"),
+                DB::raw('SUM(COALESCE(order_items.cogs, 0)) as cost'),
+                DB::raw("SUM({$lineNet}) - SUM(COALESCE(order_items.cogs, 0)) as profit"),
+                DB::raw("CASE WHEN SUM({$lineNet}) > 0 THEN ((SUM({$lineNet}) - SUM(COALESCE(order_items.cogs, 0))) / SUM({$lineNet})) * 100 ELSE 0 END as margin_percent")
             )
-            ->groupBy('products.id', 'products.name', 'products.cost_price')
+            ->groupBy('products.id', 'products.name')
             ->orderByDesc('profit')
             ->limit(50)
             ->get();
@@ -177,9 +246,7 @@ class ReportController extends Controller
 
     public function customerAcquisition(Request $request)
     {
-        $dateFrom = $request->get('date_from', now()->startOfYear());
-        $dateTo = $request->get('date_to', now()->endOfYear());
-
+        [$dateFrom, $dateTo] = $this->dateRangeFromRequest($request, 'year');
         $dateFormatSql = $this->getDateFormatSql('created_at', 'month');
 
         $newCustomers = Customer::whereBetween('created_at', [$dateFrom, $dateTo])
@@ -188,11 +255,14 @@ class ReportController extends Controller
             ->orderBy('month')
             ->get();
 
-        $returningCustomers = Order::whereBetween('created_at', [$dateFrom, $dateTo])
-            ->whereIn('customer_id', function($query) use ($dateFrom) {
+        $returningCustomers = $this->applySalesScope(Order::query())
+            ->whereBetween('created_at', [$dateFrom, $dateTo])
+            ->whereIn('customer_id', function ($query) use ($dateFrom) {
                 $query->select('customer_id')
                     ->from('orders')
                     ->where('created_at', '<', $dateFrom)
+                    ->whereNull('deleted_at')
+                    ->whereNotIn('status', $this->excludedOrderStatuses)
                     ->distinct();
             })
             ->selectRaw("{$dateFormatSql} as month, COUNT(DISTINCT customer_id) as count")
@@ -205,7 +275,7 @@ class ReportController extends Controller
             'data' => [
                 'new_customers' => $newCustomers,
                 'returning_customers' => $returningCustomers,
-            ]
+            ],
         ]);
     }
 
@@ -215,16 +285,16 @@ class ReportController extends Controller
 
         $query = DB::table('product_batches')
             ->join('products', 'product_batches.product_id', '=', 'products.id')
-            ->where('product_batches.current_stock', '>', 0);
+            ->where('product_batches.quantity', '>', 0);
 
         if ($storeId) {
             $query->where('product_batches.store_id', $storeId);
         }
 
         $inventoryValue = $query->select(
-                DB::raw('SUM(product_batches.current_stock) as total_units'),
-                DB::raw('SUM(product_batches.current_stock * products.cost_price) as cost_value'),
-                DB::raw('SUM(product_batches.current_stock * products.selling_price) as retail_value')
+                DB::raw('SUM(product_batches.quantity) as total_units'),
+                DB::raw('SUM(product_batches.quantity * COALESCE(product_batches.cost_price, 0)) as cost_value'),
+                DB::raw('SUM(product_batches.quantity * COALESCE(product_batches.sell_price, 0)) as retail_value')
             )
             ->first();
 
@@ -233,10 +303,9 @@ class ReportController extends Controller
 
     public function expenseSummary(Request $request)
     {
-        $dateFrom = $request->get('date_from', now()->startOfMonth());
-        $dateTo = $request->get('date_to', now()->endOfMonth());
+        [$dateFrom, $dateTo] = $this->dateRangeFromRequest($request);
 
-        $summary = Expense::whereBetween('expense_date', [$dateFrom, $dateTo])
+        $summary = Expense::whereBetween('expense_date', [$dateFrom->toDateString(), $dateTo->toDateString()])
             ->join('expense_categories', 'expenses.category_id', '=', 'expense_categories.id')
             ->select(
                 'expense_categories.name as category',
@@ -253,11 +322,17 @@ class ReportController extends Controller
 
     private function getSalesSummary($dateRange)
     {
+        $orderValueSql = $this->orderValueSql();
+        $row = $this->applySalesScope(Order::query())
+            ->whereBetween('created_at', $dateRange)
+            ->selectRaw("COUNT(*) as total_orders, SUM({$orderValueSql}) as total_revenue, SUM(COALESCE(paid_amount, 0)) as total_paid")
+            ->first();
+
         return [
-            'total_orders' => Order::whereBetween('created_at', $dateRange)->count(),
-            'completed_orders' => Order::whereBetween('created_at', $dateRange)->where('status', 'completed')->count(),
-            'total_revenue' => (float) Order::whereBetween('created_at', $dateRange)->sum('total_amount'),
-            'total_paid' => (float) Order::whereBetween('created_at', $dateRange)->sum('paid_amount'),
+            'total_orders' => (int) ($row->total_orders ?? 0),
+            'completed_orders' => (int) ($row->total_orders ?? 0),
+            'total_revenue' => (float) ($row->total_revenue ?? 0),
+            'total_paid' => (float) ($row->total_paid ?? 0),
         ];
     }
 
@@ -265,11 +340,11 @@ class ReportController extends Controller
     {
         return [
             'total_products' => Product::count(),
-            'low_stock_products' => Product::whereHas('batches', function($q) {
-                $q->whereRaw('current_stock <= reorder_point');
+            'low_stock_products' => Product::whereHas('batches', function ($q) {
+                $q->where('quantity', '>', 0)->where('quantity', '<=', 5);
             })->count(),
-            'out_of_stock' => Product::whereDoesntHave('batches', function($q) {
-                $q->where('current_stock', '>', 0);
+            'out_of_stock' => Product::whereDoesntHave('batches', function ($q) {
+                $q->where('quantity', '>', 0);
             })->count(),
         ];
     }
@@ -285,15 +360,18 @@ class ReportController extends Controller
 
     private function getTopProducts($dateRange, $limit)
     {
+        $lineNet = $this->lineNetSql();
+
         return DB::table('order_items')
             ->join('orders', 'order_items.order_id', '=', 'orders.id')
             ->join('products', 'order_items.product_id', '=', 'products.id')
             ->whereBetween('orders.created_at', $dateRange)
-            ->where('orders.status', 'completed')
+            ->whereNull('orders.deleted_at')
+            ->whereNotIn('orders.status', $this->excludedOrderStatuses)
             ->select(
                 'products.name',
-                DB::raw('SUM(order_items.quantity) as quantity'),
-                DB::raw('SUM(order_items.subtotal) as revenue')
+                DB::raw('SUM(COALESCE(order_items.quantity, 0)) as quantity'),
+                DB::raw("SUM({$lineNet}) as revenue")
             )
             ->groupBy('products.id', 'products.name')
             ->orderByDesc('quantity')
@@ -304,11 +382,12 @@ class ReportController extends Controller
     private function getAlerts()
     {
         return [
-            'low_stock_count' => Product::whereHas('batches', function($q) {
-                $q->whereRaw('current_stock <= reorder_point');
+            'low_stock_count' => Product::whereHas('batches', function ($q) {
+                $q->where('quantity', '>', 0)->where('quantity', '<=', 5);
             })->count(),
-            'pending_orders' => Order::where('status', 'pending')->count(),
-            'overdue_payments' => Order::where('payment_status', 'unpaid')
+            'pending_orders' => Order::whereIn('status', ['pending', 'pending_assignment'])->count(),
+            'overdue_payments' => $this->applySalesScope(Order::query())
+                ->whereIn('payment_status', ['unpaid', 'partial', 'partially_paid'])
                 ->where('created_at', '<', now()->subDays(7))
                 ->count(),
         ];
@@ -316,7 +395,7 @@ class ReportController extends Controller
 
     private function getDateRange($period)
     {
-        return match($period) {
+        return match ($period) {
             'today' => [now()->startOfDay(), now()->endOfDay()],
             'week' => [now()->startOfWeek(), now()->endOfWeek()],
             'month' => [now()->startOfMonth(), now()->endOfMonth()],
@@ -325,4 +404,3 @@ class ReportController extends Controller
         };
     }
 }
-

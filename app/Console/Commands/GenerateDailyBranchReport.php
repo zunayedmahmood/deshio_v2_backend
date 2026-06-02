@@ -133,22 +133,25 @@ class GenerateDailyBranchReport extends Command
      */
     private function loadSalesData(array $storeIds, string $from, string $to): array
     {
-        $rows = DB::table('orders')
-            ->select(
-                'store_id',
-                DB::raw('DATE(created_at) as day'),
-                'order_type',
-                DB::raw('SUM(total_amount) as total')
-            )
-            ->whereIn('store_id', $storeIds)
-            ->whereDate('created_at', '>=', $from)
-            ->whereDate('created_at', '<=', $to)
-            ->whereNotIn('status', ['cancelled', 'refunded'])
-            ->whereIn('order_type', ['counter', 'ecommerce', 'social_commerce'])
-            ->groupBy('store_id', 'day', 'order_type')
+        $lineNet = "CASE
+            WHEN COALESCE(oi.unit_price, 0) > 0 AND COALESCE(oi.quantity, 0) > 0
+                THEN GREATEST((COALESCE(oi.quantity, 0) * COALESCE(oi.unit_price, 0)) - COALESCE(oi.discount_amount, 0), 0)
+            WHEN COALESCE(oi.total_amount, 0) > 0 THEN COALESCE(oi.total_amount, 0)
+            ELSE COALESCE(o.total_amount, 0)
+        END";
+
+        $rows = DB::table('orders as o')
+            ->leftJoin('order_items as oi', 'oi.order_id', '=', 'o.id')
+            ->select('o.store_id', DB::raw('DATE(o.order_date) as day'), 'o.order_type', DB::raw("SUM({$lineNet}) as total"))
+            ->whereIn('o.store_id', $storeIds)
+            ->whereDate('o.order_date', '>=', $from)
+            ->whereDate('o.order_date', '<=', $to)
+            ->whereNull('o.deleted_at')
+            ->whereNotIn('o.status', ['cancelled', 'pending_assignment', 'draft'])
+            ->whereIn('o.order_type', ['counter', 'ecommerce', 'social_commerce'])
+            ->groupBy('o.store_id', 'day', 'o.order_type')
             ->get();
 
-        // [store_id][date][order_type] = float
         $out = [];
         foreach ($rows as $r) {
             $out[$r->store_id][$r->day][$r->order_type] = (float) $r->total;
@@ -156,45 +159,43 @@ class GenerateDailyBranchReport extends Command
         return $out;
     }
 
-    /**
-     * Completed order payments bucketed by payment method type.
-     * Joins payment_methods to get type, maps via PM_BUCKET to four columns.
-     * Virtual types (exchange_balance, store_credit, balance_carryover) excluded.
-     */
     private function loadPaymentData(array $storeIds, string $from, string $to): array
     {
-        $rows = DB::table('order_payments as op')
+        $out = [];
+        $dateExpr = 'DATE(COALESCE(op.completed_at, op.payment_received_date, op.created_at))';
+
+        $regularRows = DB::table('order_payments as op')
             ->join('payment_methods as pm', 'pm.id', '=', 'op.payment_method_id')
-            ->select(
-                'op.store_id',
-                DB::raw('DATE(op.completed_at) as day'),
-                'pm.type as method_type',
-                DB::raw('SUM(op.amount) as total')
-            )
+            ->select('op.store_id', DB::raw("{$dateExpr} as day"), 'pm.type as method_type', DB::raw('SUM(op.amount) as total'))
             ->whereIn('op.store_id', $storeIds)
-            ->whereDate('op.completed_at', '>=', $from)
-            ->whereDate('op.completed_at', '<=', $to)
-            ->where('op.status', 'completed')
+            ->whereDate(DB::raw('COALESCE(op.completed_at, op.payment_received_date, op.created_at)'), '>=', $from)
+            ->whereDate(DB::raw('COALESCE(op.completed_at, op.payment_received_date, op.created_at)'), '<=', $to)
+            ->whereIn('op.status', ['completed', 'paid', 'success'])
             ->whereNotIn('op.payment_type', ['exchange_balance', 'store_credit', 'balance_carryover'])
-            ->whereNotNull('op.completed_at')
+            ->whereNotNull('op.payment_method_id')
             ->groupBy('op.store_id', 'day', 'pm.type')
             ->get();
 
-        // [store_id][date][bucket] = float  (buckets accumulate across multiple method types)
-        $out = [];
-        foreach ($rows as $r) {
+        $splitRows = DB::table('payment_splits as ps')
+            ->join('order_payments as op', 'op.id', '=', 'ps.order_payment_id')
+            ->join('payment_methods as pm', 'pm.id', '=', 'ps.payment_method_id')
+            ->select(DB::raw('COALESCE(ps.store_id, op.store_id) as store_id'), DB::raw('DATE(COALESCE(ps.completed_at, ps.processed_at, op.completed_at, op.payment_received_date, op.created_at)) as day'), 'pm.type as method_type', DB::raw('SUM(ps.amount) as total'))
+            ->whereIn(DB::raw('COALESCE(ps.store_id, op.store_id)'), $storeIds)
+            ->whereDate(DB::raw('COALESCE(ps.completed_at, ps.processed_at, op.completed_at, op.payment_received_date, op.created_at)'), '>=', $from)
+            ->whereDate(DB::raw('COALESCE(ps.completed_at, ps.processed_at, op.completed_at, op.payment_received_date, op.created_at)'), '<=', $to)
+            ->whereIn('op.status', ['completed', 'paid', 'success'])
+            ->whereIn('ps.status', ['completed', 'paid', 'success'])
+            ->whereNotIn('op.payment_type', ['exchange_balance', 'store_credit', 'balance_carryover'])
+            ->groupBy(DB::raw('COALESCE(ps.store_id, op.store_id)'), 'day', 'pm.type')
+            ->get();
+
+        foreach ($regularRows->concat($splitRows) as $r) {
             $bucket = self::PM_BUCKET[$r->method_type] ?? 'bank_in';
-            $out[$r->store_id][$r->day][$bucket] =
-                ($out[$r->store_id][$r->day][$bucket] ?? 0) + (float) $r->total;
+            $out[$r->store_id][$r->day][$bucket] = ($out[$r->store_id][$r->day][$bucket] ?? 0) + (float) $r->total;
         }
         return $out;
     }
 
-    /**
-     * Approved / paid expenses per store per day.
-     * This is the only cost column — rent, salary, utilities, etc.
-     * Keyed by expense_date (when the expense occurred, not when it was approved).
-     */
     private function loadExpenseData(array $storeIds, string $from, string $to): array
     {
         $rows = DB::table('expenses')

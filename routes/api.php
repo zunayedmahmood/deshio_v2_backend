@@ -557,6 +557,8 @@ Route::middleware('auth:api')->group(function () {
             Route::delete('/', [PurchaseOrderController::class, 'destroy']); // Hard delete
             Route::get('/can-delete', [PurchaseOrderController::class, 'canDelete']); // Check before delete
             Route::get('/pdf', [PurchaseOrderController::class, 'exportPdf']); // Individual PO PDF
+            Route::get('/csv', [PurchaseOrderController::class, 'exportCsv']); // Individual PO CSV
+            Route::get('/barcodes/csv', [PurchaseOrderController::class, 'exportBarcodesCsv']); // PO barcodes CSV
             
             // PO Actions
             Route::post('/approve', [PurchaseOrderController::class, 'approve']);
@@ -1390,6 +1392,8 @@ Route::middleware('auth:api')->group(function () {
             Route::put('/', [PurchaseOrderController::class, 'update']);
             Route::delete('/', [PurchaseOrderController::class, 'destroy']); // Hard delete
             Route::get('/can-delete', [PurchaseOrderController::class, 'canDelete']); // Check before delete
+            Route::get('/csv', [PurchaseOrderController::class, 'exportCsv']); // Individual PO CSV
+            Route::get('/barcodes/csv', [PurchaseOrderController::class, 'exportBarcodesCsv']); // PO barcodes CSV
             Route::post('/approve', [PurchaseOrderController::class, 'approve']);
             Route::post('/receive', [PurchaseOrderController::class, 'receive']);
             Route::post('/cancel', [PurchaseOrderController::class, 'cancel']);
@@ -1770,6 +1774,10 @@ Route::middleware('auth:api')->group(function () {
         Route::get('/csv/stock', [\App\Http\Controllers\ReportingController::class, 'exportStockCsv']);
         // Booking Report
         Route::get('/csv/booking', [\App\Http\Controllers\ReportingController::class, 'exportBookingCsv']);
+        // Payment Breakdown Report
+        Route::get('/csv/payment-breakdown', [\App\Http\Controllers\ReportingController::class, 'exportPaymentBreakdownCsv']);
+        // Installment / Due Collection Report
+        Route::get('/csv/installments', [\App\Http\Controllers\ReportingController::class, 'exportInstallmentsCsv']);
         // Daily Sales Report
         Route::get('/daily-sales', [\App\Http\Controllers\ReportingController::class, 'getDailySalesReport']);
     });

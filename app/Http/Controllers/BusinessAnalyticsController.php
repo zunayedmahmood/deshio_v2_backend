@@ -18,6 +18,105 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class BusinessAnalyticsController extends Controller
 {
+    private array $excludedOrderStatuses = ['cancelled', 'pending_assignment', 'draft'];
+    private array $completedPaymentStatuses = ['completed', 'success', 'paid'];
+    private array $internalPaymentTypes = ['exchange_balance', 'store_credit', 'balance_carryover'];
+
+    private function itemGross($item): float
+    {
+        $quantity = (float) ($item->quantity ?? 0);
+        $unitPrice = (float) ($item->unit_price ?? 0);
+        $subtotal = (float) ($item->subtotal ?? 0);
+        $storedTotal = (float) ($item->total_amount ?? 0);
+
+        if ($quantity > 0 && $unitPrice > 0) {
+            return $quantity * $unitPrice;
+        }
+
+        if ($subtotal > 0) {
+            return $subtotal;
+        }
+
+        return $storedTotal;
+    }
+
+    private function itemNet($item): float
+    {
+        $gross = $this->itemGross($item);
+        $discount = (float) ($item->discount_amount ?? 0);
+        $storedTotal = (float) ($item->total_amount ?? 0);
+
+        if ($gross > 0) {
+            return max($gross - $discount, 0);
+        }
+
+        return max($storedTotal, 0);
+    }
+
+    private function itemsNet(Collection $items): float
+    {
+        return (float) $items->sum(fn ($item) => $this->itemNet($item));
+    }
+
+    private function itemsGross(Collection $items): float
+    {
+        return (float) $items->sum(fn ($item) => $this->itemGross($item));
+    }
+
+    private function itemsCost(Collection $items): float
+    {
+        return (float) $items->sum(fn ($item) => (float) ($item->cogs ?? 0));
+    }
+
+    private function orderNet($order): float
+    {
+        $items = $order->relationLoaded('items') ? $order->items : collect();
+        $itemNet = $items->isNotEmpty() ? $this->itemsNet($items) : 0;
+        $stored = (float) ($order->total_amount ?? 0);
+        $subtotal = (float) ($order->subtotal ?? 0);
+
+        if ($itemNet > 0) {
+            return $itemNet;
+        }
+
+        if ($stored > 0) {
+            return $stored;
+        }
+
+        return max($subtotal - (float) ($order->discount_amount ?? 0) + (float) ($order->tax_amount ?? 0), 0);
+    }
+
+    private function paymentAmountRows(Collection $orders): Collection
+    {
+        return $orders->flatMap(function ($order) {
+            $payments = $order->relationLoaded('payments') ? $order->payments : collect();
+
+            return $payments
+                ->filter(fn ($payment) => in_array($payment->status, $this->completedPaymentStatuses, true))
+                ->flatMap(function ($payment) {
+                    $splits = $payment->relationLoaded('paymentSplits') ? $payment->paymentSplits : collect();
+
+                    if ($splits->isNotEmpty()) {
+                        return $splits
+                            ->filter(fn ($split) => in_array($split->status, $this->completedPaymentStatuses, true))
+                            ->map(function ($split) use ($payment) {
+                                return [
+                                    'label' => optional($split->paymentMethod)->name ?: optional($split->paymentMethod)->code ?: 'Unknown',
+                                    'type' => optional($split->paymentMethod)->type ?: optional($payment->paymentMethod)->type ?: $payment->payment_type,
+                                    'amount' => (float) ($split->amount ?? 0),
+                                ];
+                            });
+                    }
+
+                    return collect([[
+                        'label' => optional($payment->paymentMethod)->name ?: optional($payment->paymentMethod)->code ?: ($payment->payment_type ?: 'Unknown'),
+                        'type' => optional($payment->paymentMethod)->type ?: $payment->payment_type,
+                        'amount' => (float) ($payment->amount ?? 0),
+                    ]]);
+                });
+        });
+    }
+
     public function commandCenter(Request $request)
     {
         [$from, $to] = $this->resolveDateRange($request);
@@ -26,7 +125,7 @@ class BusinessAnalyticsController extends Controller
         $orders = $this->baseOrdersQuery($from, $to, $storeId, $sku)
             ->with(['items' => function($q) use ($sku) {
                 if ($sku) $q->where('product_sku', $sku);
-            }, 'items.product.category', 'customer', 'store'])
+            }, 'items.product.category', 'customer', 'store', 'payments.paymentMethod', 'payments.paymentSplits.paymentMethod'])
             ->get();
             
         $returns = $this->baseReturnsQuery($from, $to, $storeId)->get();
@@ -35,6 +134,11 @@ class BusinessAnalyticsController extends Controller
         $inventoryBatches = $this->baseInventoryQuery($storeId)->with(['product', 'store'])->get();
 
         $orderItems = $orders->flatMap->items;
+        $grossSales = $sku ? $this->itemsGross($orderItems) : (float) $orders->sum(fn ($order) => $this->itemsGross($order->items));
+        $netSales = $sku ? $this->itemsNet($orderItems) : (float) $orders->sum(fn ($order) => $this->orderNet($order));
+        $totalDiscount = $sku ? (float) $orderItems->sum('discount_amount') : (float) $orders->sum('discount_amount');
+        $totalCogs = $this->itemsCost($orderItems);
+        $grossProfit = $netSales - $totalCogs;
         
         $salesTrend = $this->buildSalesTrend($orders, $from, $to, $request->query('interval', 'day'), $sku);
         $topProducts = $this->buildTopProducts($orderItems, $inventoryBatches, $request);
@@ -44,35 +148,37 @@ class BusinessAnalyticsController extends Controller
         $kpis = [
             'total_orders' => $orders->count(),
             'total_units' => (int) $orderItems->sum('quantity'),
-            'gross_sales' => round((float) ($sku ? $orderItems->sum(fn($i) => $i->quantity * $i->unit_price) : $orders->sum('subtotal')), 2),
-            'net_sales' => round((float) ($sku ? $orderItems->sum('total_amount') : $orders->sum('total_amount')), 2),
-            'total_discount' => round((float) ($sku ? $orderItems->sum('discount_amount') : $orders->sum('discount_amount')), 2),
-            'avg_order_value' => round((float) ($orders->count() ? ($sku ? $orderItems->sum('total_amount') : $orders->sum('total_amount')) / $orders->count() : 0), 2),
-            'gross_profit' => round((float) ($orderItems->sum('total_amount') - $orderItems->sum('cogs')), 2),
-            'margin_pct' => round((float) (($orderItems->sum('total_amount') > 0) ? (($orderItems->sum('total_amount') - $orderItems->sum('cogs')) / $orderItems->sum('total_amount')) * 100 : 0), 2),
+            'gross_sales' => round($grossSales, 2),
+            'net_sales' => round($netSales, 2),
+            'total_discount' => round($totalDiscount, 2),
+            'avg_order_value' => round((float) ($orders->count() ? $netSales / $orders->count() : 0), 2),
+            'gross_profit' => round($grossProfit, 2),
+            'margin_pct' => round((float) ($netSales > 0 ? ($grossProfit / $netSales) * 100 : 0), 2),
             'return_count' => $returns->count(),
             'refund_amount' => round((float) $refunds->sum('refund_amount'), 2),
             'inventory_value' => round((float) $inventoryBatches->sum(fn ($b) => ((float) $b->cost_price) * ((int) $b->quantity)), 2),
             'low_stock_count' => $inventoryBatches->filter(fn ($b) => (int) $b->quantity > 0 && (int) $b->quantity <= 5)->count(),
             'out_of_stock_count' => $inventoryBatches->filter(fn ($b) => (int) $b->quantity <= 0)->count(),
             'repeat_customers' => $orders->pluck('customer_id')->filter()->countBy()->filter(fn ($count) => $count > 1)->count(),
-            'repeat_customer_rate' => round((float) ($orders->pluck('customer_id')->filter()->count() ? ($orders->pluck('customer_id')->filter()->countBy()->filter(fn ($count) => $count > 1)->count() / $orders->pluck('customer_id')->filter()->unique()->count()) * 100 : 0), 2),
+            'repeat_customer_rate' => round((float) ($orders->pluck('customer_id')->filter()->unique()->count() ? ($orders->pluck('customer_id')->filter()->countBy()->filter(fn ($count) => $count > 1)->count() / $orders->pluck('customer_id')->filter()->unique()->count()) * 100 : 0), 2),
         ];
 
         $categoryPerformance = $orderItems
             ->groupBy(fn ($item) => $item->product?->category_id ?? 'uncategorized')
             ->map(function (Collection $items, $categoryId) {
                 $category = optional(optional($items->first())->product)->category;
-                $name = $category ? $category->name : ($categoryId === 'uncategorized' ? 'Uncategorized' : 'Category ' . $categoryId);
-                return ['label' => $name, 'value' => round((float) $items->sum('total_amount'), 2)];
+                $name = $category ? $category->title : ($categoryId === 'uncategorized' ? 'Uncategorized' : 'Category ' . $categoryId);
+                return ['label' => $name, 'value' => round((float) $this->itemsNet($items), 2)];
             })
             ->sortByDesc('value')
             ->values()
             ->take(8);
 
-        $paymentMethodMix = $orders
-            ->groupBy(fn ($order) => $order->payment_method ?: 'unknown')
-            ->map(fn ($group, $label) => ['label' => (string) $label, 'value' => round((float) $group->sum('total_amount'), 2)])
+        $paymentRows = $this->paymentAmountRows($orders)
+            ->reject(fn ($row) => in_array($row['type'], $this->internalPaymentTypes, true));
+        $paymentMethodMix = $paymentRows
+            ->groupBy('label')
+            ->map(fn ($rows, $label) => ['label' => (string) $label, 'value' => round((float) collect($rows)->sum('amount'), 2)])
             ->sortByDesc('value')
             ->values();
 
@@ -244,7 +350,10 @@ class BusinessAnalyticsController extends Controller
 
     private function baseOrdersQuery(Carbon $from, Carbon $to, $storeId = null, $sku = null)
     {
-        $query = Order::query()->whereBetween('order_date', [$from, $to]);
+        $query = Order::query()
+            ->whereBetween('order_date', [$from, $to])
+            ->whereNull('deleted_at')
+            ->whereNotIn('status', $this->excludedOrderStatuses);
         if ($storeId) {
             $query->where('store_id', $storeId);
         }
@@ -328,8 +437,8 @@ class BusinessAnalyticsController extends Controller
             $dates->push([
                 'date' => $label,
                 'orders' => $periodOrders->count(),
-                'net_sales' => round((float) ($sku ? $items->sum('total_amount') : $periodOrders->sum('total_amount')), 2),
-                'gross_profit' => round((float) ($items->sum('total_amount') - $items->sum('cogs')), 2),
+                'net_sales' => round((float) ($sku ? $this->itemsNet($items) : $periodOrders->sum(fn ($order) => $this->orderNet($order))), 2),
+                'gross_profit' => round((float) ($this->itemsNet($items) - $this->itemsCost($items)), 2),
             ]);
 
             $curr = $next;
@@ -371,8 +480,8 @@ class BusinessAnalyticsController extends Controller
                     'name' => (string) ($first->product_name ?: optional($first->product)->name ?: 'Unknown Product'),
                     'sku' => (string) ($first->product_sku ?: optional($first->product)->sku ?: ''),
                     'units' => (int) $productItems->sum('quantity'),
-                    'revenue' => round((float) $productItems->sum('total_amount'), 2),
-                    'gross_profit' => round((float) ($productItems->sum('total_amount') - $productItems->sum('cogs')), 2),
+                    'revenue' => round((float) $this->itemsNet($productItems), 2),
+                    'gross_profit' => round((float) ($this->itemsNet($productItems) - $this->itemsCost($productItems)), 2),
                     'stock_on_hand' => (int) ($stockByProduct[$productId] ?? 0),
                 ];
             })
@@ -383,7 +492,7 @@ class BusinessAnalyticsController extends Controller
 
     private function buildStockWatchlist(Collection $inventoryBatches, Collection $items): Collection
     {
-        $revenue30ByProduct = $items->groupBy('product_id')->map(fn ($rows) => round((float) $rows->sum('total_amount'), 2));
+        $revenue30ByProduct = $items->groupBy('product_id')->map(fn ($rows) => round((float) $this->itemsNet($rows), 2));
 
         return $inventoryBatches
             ->groupBy('product_id')
@@ -422,8 +531,8 @@ class BusinessAnalyticsController extends Controller
             ->groupBy('store_id')
             ->map(function (Collection $storeOrders, $storeId) use ($stores, $expenseByStore, $sku) {
                 $items = $storeOrders->flatMap->items;
-                $sales = (float) ($sku ? $items->sum('total_amount') : $storeOrders->sum('total_amount'));
-                $profitBeforeExpense = (float) ($items->sum('total_amount') - $items->sum('cogs'));
+                $sales = (float) ($sku ? $this->itemsNet($items) : $storeOrders->sum(fn ($order) => $this->orderNet($order)));
+                $profitBeforeExpense = (float) ($this->itemsNet($items) - $this->itemsCost($items));
                 $netProfit = $profitBeforeExpense - (float) ($sku ? 0 : ($expenseByStore[$storeId] ?? 0));
                 return [
                     'store_id' => (int) $storeId,

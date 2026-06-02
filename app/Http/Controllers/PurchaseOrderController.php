@@ -509,4 +509,264 @@ class PurchaseOrderController extends Controller
             ], 500);
         }
     }
+
+    /**
+     * Export a single purchase order as CSV.
+     *
+     * The reporting page expects this endpoint. Totals are recalculated per row so
+     * old purchase order items with stale/zero total_cost still export correctly.
+     */
+    public function exportCsv(Request $request, $id)
+    {
+        $po = PurchaseOrder::with([
+            'vendor',
+            'store',
+            'createdBy',
+            'approvedBy',
+            'receivedBy',
+            'items.product.category',
+            'items.productBatch',
+        ])->findOrFail($id);
+
+        $filename = 'purchase-order-' . ($po->po_number ?: $po->id) . '-' . now()->format('Ymd-His') . '.csv';
+
+        return response()->streamDownload(function () use ($po) {
+            $out = fopen('php://output', 'w');
+            fwrite($out, "\xEF\xBB\xBF");
+
+            fputcsv($out, ['Purchase Order Summary']);
+            fputcsv($out, ['PO Number', $po->po_number]);
+            fputcsv($out, ['Status', $po->status]);
+            fputcsv($out, ['Vendor', optional($po->vendor)->name ?? 'Unknown Vendor']);
+            fputcsv($out, ['Warehouse / Store', optional($po->store)->name ?? 'Unknown Store']);
+            fputcsv($out, ['Order Date', optional($po->order_date)->format('Y-m-d')]);
+            fputcsv($out, ['Expected Delivery Date', optional($po->expected_delivery_date)->format('Y-m-d')]);
+            fputcsv($out, ['Actual Delivery Date', optional($po->actual_delivery_date)->format('Y-m-d')]);
+            fputcsv($out, ['Payment Status', $po->payment_status]);
+            fputcsv($out, ['Created By', optional($po->createdBy)->name]);
+            fputcsv($out, ['Approved By', optional($po->approvedBy)->name]);
+            fputcsv($out, ['Received By', optional($po->receivedBy)->name]);
+            fputcsv($out, []);
+
+            fputcsv($out, [
+                'PO Number',
+                'PO Status',
+                'Vendor',
+                'Warehouse',
+                'Order Date',
+                'Expected Delivery Date',
+                'Actual Delivery Date',
+                'Payment Status',
+                'Product ID',
+                'Product Name',
+                'SKU',
+                'Category',
+                'Quantity Ordered',
+                'Quantity Received',
+                'Quantity Pending',
+                'Unit Cost',
+                'Unit Sell Price',
+                'Item Discount',
+                'Item Tax',
+                'Item Total Cost',
+                'Batch Number',
+                'Linked Batch ID',
+                'Receive Status',
+                'Notes',
+            ]);
+
+            $totalOrdered = 0;
+            $totalReceived = 0;
+            $totalPending = 0;
+            $totalItemCost = 0;
+
+            foreach ($po->items as $item) {
+                $product = $item->product;
+                $batch = $item->productBatch;
+                $qtyOrdered = (float) ($item->quantity_ordered ?? 0);
+                $qtyReceived = (float) ($item->quantity_received ?? 0);
+                $qtyPending = (float) ($item->quantity_pending ?? max($qtyOrdered - $qtyReceived, 0));
+                $itemTotal = (float) ($item->total_cost ?? 0);
+
+                if ($itemTotal <= 0 && $qtyOrdered > 0) {
+                    $itemTotal = max(($qtyOrdered * (float) ($item->unit_cost ?? 0)) - (float) ($item->discount_amount ?? 0) + (float) ($item->tax_amount ?? 0), 0);
+                }
+
+                $totalOrdered += $qtyOrdered;
+                $totalReceived += $qtyReceived;
+                $totalPending += $qtyPending;
+                $totalItemCost += $itemTotal;
+
+                fputcsv($out, [
+                    $po->po_number,
+                    $po->status,
+                    optional($po->vendor)->name ?? 'Unknown Vendor',
+                    optional($po->store)->name ?? 'Unknown Store',
+                    optional($po->order_date)->format('Y-m-d'),
+                    optional($po->expected_delivery_date)->format('Y-m-d'),
+                    optional($po->actual_delivery_date)->format('Y-m-d'),
+                    $po->payment_status,
+                    $item->product_id,
+                    $item->product_name ?: optional($product)->name,
+                    $item->product_sku ?: optional($product)->sku,
+                    optional(optional($product)->category)->title ?? 'Uncategorized',
+                    $qtyOrdered,
+                    $qtyReceived,
+                    $qtyPending,
+                    number_format((float) ($item->unit_cost ?? 0), 2, '.', ''),
+                    number_format((float) ($item->unit_sell_price ?? optional($batch)->sell_price ?? 0), 2, '.', ''),
+                    number_format((float) ($item->discount_amount ?? 0), 2, '.', ''),
+                    number_format((float) ($item->tax_amount ?? 0), 2, '.', ''),
+                    number_format($itemTotal, 2, '.', ''),
+                    $item->batch_number ?: optional($batch)->batch_number,
+                    $item->product_batch_id,
+                    $item->receive_status,
+                    $item->notes,
+                ]);
+            }
+
+            fputcsv($out, []);
+            fputcsv($out, [
+                'TOTAL', '', '', '', '', '', '', '', '', '', '', '',
+                $totalOrdered,
+                $totalReceived,
+                $totalPending,
+                '', '', '', '',
+                number_format($totalItemCost, 2, '.', ''),
+                '', '', '', '',
+            ]);
+
+            fputcsv($out, []);
+            fputcsv($out, ['PO Subtotal', number_format((float) ($po->subtotal ?: $totalItemCost), 2, '.', '')]);
+            fputcsv($out, ['PO Discount', number_format((float) ($po->discount_amount ?? 0), 2, '.', '')]);
+            fputcsv($out, ['PO Tax', number_format((float) ($po->tax_amount ?? 0), 2, '.', '')]);
+            fputcsv($out, ['Shipping Cost', number_format((float) ($po->shipping_cost ?? 0), 2, '.', '')]);
+            fputcsv($out, ['Other Charges', number_format((float) ($po->other_charges ?? 0), 2, '.', '')]);
+            fputcsv($out, ['PO Total', number_format((float) ($po->total_amount ?: ($totalItemCost - (float) ($po->discount_amount ?? 0) + (float) ($po->tax_amount ?? 0) + (float) ($po->shipping_cost ?? 0) + (float) ($po->other_charges ?? 0))), 2, '.', '')]);
+            fputcsv($out, ['Paid Amount', number_format((float) ($po->paid_amount ?? 0), 2, '.', '')]);
+            fputcsv($out, ['Outstanding Amount', number_format((float) ($po->outstanding_amount ?? max((float) ($po->total_amount ?? 0) - (float) ($po->paid_amount ?? 0), 0)), 2, '.', '')]);
+
+            fclose($out);
+        }, $filename, ['Content-Type' => 'text/csv; charset=UTF-8']);
+    }
+
+    /**
+     * Export all barcodes linked to a purchase order as CSV.
+     *
+     * If an item was received but no barcode rows exist for the linked batch, the
+     * export includes a visible missing-barcode row. This helps catch receiving
+     * issues that otherwise look like a successful empty report.
+     */
+    public function exportBarcodesCsv(Request $request, $id)
+    {
+        $po = PurchaseOrder::with([
+            'vendor',
+            'store',
+            'items.product.category',
+            'items.productBatch',
+        ])->findOrFail($id);
+
+        $filename = 'purchase-order-barcodes-' . ($po->po_number ?: $po->id) . '-' . now()->format('Ymd-His') . '.csv';
+
+        return response()->streamDownload(function () use ($po) {
+            $out = fopen('php://output', 'w');
+            fwrite($out, "\xEF\xBB\xBF");
+
+            fputcsv($out, [
+                'PO Number',
+                'PO Status',
+                'Vendor',
+                'Warehouse',
+                'Product ID',
+                'Product Name',
+                'SKU',
+                'Category',
+                'PO Item ID',
+                'Batch ID',
+                'Batch Number',
+                'Barcode ID',
+                'Barcode',
+                'Current Store',
+                'Current Status',
+                'Is Active',
+                'Is Defective',
+                'Generated At',
+                'Location Updated At',
+                'Quantity Ordered',
+                'Quantity Received',
+                'Report Note',
+            ]);
+
+            foreach ($po->items as $item) {
+                $product = $item->product;
+                $batch = $item->productBatch;
+                $barcodes = collect();
+
+                if ($item->product_batch_id) {
+                    $barcodes = ProductBarcode::with(['currentStore'])
+                        ->where('batch_id', $item->product_batch_id)
+                        ->orderBy('id')
+                        ->get();
+                }
+
+                if ($barcodes->isEmpty()) {
+                    fputcsv($out, [
+                        $po->po_number,
+                        $po->status,
+                        optional($po->vendor)->name ?? 'Unknown Vendor',
+                        optional($po->store)->name ?? 'Unknown Store',
+                        $item->product_id,
+                        $item->product_name ?: optional($product)->name,
+                        $item->product_sku ?: optional($product)->sku,
+                        optional(optional($product)->category)->title ?? 'Uncategorized',
+                        $item->id,
+                        $item->product_batch_id,
+                        $item->batch_number ?: optional($batch)->batch_number,
+                        '',
+                        '',
+                        optional($po->store)->name ?? 'Unknown Store',
+                        'missing_barcode_rows',
+                        '',
+                        '',
+                        '',
+                        '',
+                        (float) ($item->quantity_ordered ?? 0),
+                        (float) ($item->quantity_received ?? 0),
+                        $item->product_batch_id ? 'No barcodes found for this received batch' : 'PO item is not linked to a product batch yet',
+                    ]);
+                    continue;
+                }
+
+                foreach ($barcodes as $barcode) {
+                    fputcsv($out, [
+                        $po->po_number,
+                        $po->status,
+                        optional($po->vendor)->name ?? 'Unknown Vendor',
+                        optional($po->store)->name ?? 'Unknown Store',
+                        $item->product_id,
+                        $item->product_name ?: optional($product)->name,
+                        $item->product_sku ?: optional($product)->sku,
+                        optional(optional($product)->category)->title ?? 'Uncategorized',
+                        $item->id,
+                        $item->product_batch_id,
+                        $item->batch_number ?: optional($batch)->batch_number,
+                        $barcode->id,
+                        "\t" . $barcode->barcode,
+                        optional($barcode->currentStore)->name ?? optional($po->store)->name,
+                        $barcode->current_status,
+                        $barcode->is_active ? 'Yes' : 'No',
+                        $barcode->is_defective ? 'Yes' : 'No',
+                        optional($barcode->generated_at)->format('Y-m-d H:i:s'),
+                        optional($barcode->location_updated_at)->format('Y-m-d H:i:s'),
+                        (float) ($item->quantity_ordered ?? 0),
+                        (float) ($item->quantity_received ?? 0),
+                        '',
+                    ]);
+                }
+            }
+
+            fclose($out);
+        }, $filename, ['Content-Type' => 'text/csv; charset=UTF-8']);
+    }
+
 }

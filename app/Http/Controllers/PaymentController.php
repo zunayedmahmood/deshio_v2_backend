@@ -5,11 +5,13 @@ namespace App\Http\Controllers;
 use App\Models\Order;
 use App\Models\OrderPayment;
 use App\Models\PaymentMethod;
+use App\Models\Shipment;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
+use Carbon\Carbon;
 
 class PaymentController extends Controller
 {
@@ -738,4 +740,273 @@ class PaymentController extends Controller
             ],
         ]);
     }
+
+    /**
+     * Import Pathao paid invoice CSV and record COD settlements safely.
+     *
+     * POST /api/payments/pathao-paid-invoice-csv
+     * multipart/form-data: csv=<file>
+     */
+    public function importPathaoPaidInvoiceCsv(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'csv' => 'required|file|mimes:csv,txt|max:10240',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $file = $request->file('csv');
+        $handle = fopen($file->getRealPath(), 'r');
+        if (!$handle) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Could not read uploaded CSV file.',
+            ], 422);
+        }
+
+        $rawHeader = fgetcsv($handle);
+        if (!$rawHeader) {
+            fclose($handle);
+            return response()->json([
+                'success' => false,
+                'message' => 'CSV file is empty.',
+            ], 422);
+        }
+
+        $headers = array_map(fn ($h) => $this->normalizeCsvHeader((string) $h), $rawHeader);
+        $merchantIdx = $this->firstHeaderIndex($headers, ['merchant_order_id', 'merchantorderid', 'order_id', 'order_number']);
+        $amountIdx = $this->firstHeaderIndex($headers, ['collectable_amount', 'collectible_amount', 'amount_to_collect', 'cod_amount', 'amount', 'paid_amount']);
+        $consignmentIdx = $this->firstHeaderIndex($headers, ['consignment_id', 'pathao_consignment_id', 'consignment']);
+        $invoiceIdx = $this->firstHeaderIndex($headers, ['invoice_id', 'pathao_invoice_id', 'invoice']);
+        $paidDateIdx = $this->firstHeaderIndex($headers, ['paid_date', 'payment_date', 'settlement_date', 'invoice_date', 'date']);
+
+        if ($merchantIdx === null || $amountIdx === null) {
+            fclose($handle);
+            return response()->json([
+                'success' => false,
+                'message' => 'CSV must contain Merchant_Order_ID/order number and Collectable_Amount/amount columns.',
+                'detected_headers' => $rawHeader,
+            ], 422);
+        }
+
+        $paymentMethod = $this->getOrCreatePathaoPaymentMethod();
+        $summary = [
+            'processed' => 0,
+            'created' => 0,
+            'skipped' => 0,
+            'failed' => 0,
+            'rows' => [],
+        ];
+
+        $rowNumber = 1;
+        while (($row = fgetcsv($handle)) !== false) {
+            $rowNumber++;
+            $summary['processed']++;
+
+            $merchantOrderId = trim((string) ($row[$merchantIdx] ?? ''));
+            $amount = $this->parseMoney($row[$amountIdx] ?? null);
+            $consignmentId = $consignmentIdx !== null ? trim((string) ($row[$consignmentIdx] ?? '')) : '';
+            $invoiceId = $invoiceIdx !== null ? trim((string) ($row[$invoiceIdx] ?? '')) : '';
+            $paidDate = $paidDateIdx !== null ? $this->parseCsvDate($row[$paidDateIdx] ?? null) : now()->toDateString();
+
+            if ($merchantOrderId === '' || $amount <= 0) {
+                $summary['failed']++;
+                $summary['rows'][] = $this->pathaoCsvRowResult($rowNumber, $merchantOrderId, false, 'Missing order ID or invalid amount.');
+                continue;
+            }
+
+            try {
+                DB::beginTransaction();
+
+                $order = Order::with(['customer', 'store', 'payments', 'shipments'])
+                    ->where('order_number', $merchantOrderId)
+                    ->first();
+
+                if (!$order && ctype_digit($merchantOrderId)) {
+                    $order = Order::with(['customer', 'store', 'payments', 'shipments'])->find((int) $merchantOrderId);
+                }
+
+                if (!$order) {
+                    throw new \Exception('Order not found.');
+                }
+
+                if (in_array($order->status, ['cancelled', 'refunded', 'returned'], true)) {
+                    throw new \Exception("Order status is {$order->status}; payment import blocked.");
+                }
+
+                $shipmentQuery = Shipment::where('order_id', $order->id)->whereNotNull('pathao_consignment_id');
+                if ($consignmentId !== '') {
+                    $shipmentQuery->where('pathao_consignment_id', $consignmentId);
+                }
+                $pathaoShipment = $shipmentQuery->latest()->first();
+
+                if (!$pathaoShipment) {
+                    throw new \Exception($consignmentId !== ''
+                        ? 'No matching Pathao consignment found for this order.'
+                        : 'Order has no Pathao consignment. Import blocked to avoid paying a non-Pathao order.');
+                }
+
+                $externalReference = 'PATHAO-PAID-INVOICE-' . ($consignmentId ?: $pathaoShipment->pathao_consignment_id) . '-' . ($invoiceId ?: 'NOINVOICE');
+                $duplicateQuery = OrderPayment::where('external_reference', $externalReference);
+                if ($consignmentId !== '') {
+                    $duplicateQuery->orWhere(function ($q) use ($consignmentId, $invoiceId) {
+                        $q->where('transaction_reference', $consignmentId);
+                        if ($invoiceId !== '') {
+                            $q->where('external_reference', 'like', '%' . $invoiceId . '%');
+                        }
+                    });
+                }
+                $alreadyImported = $duplicateQuery->exists();
+
+                if ($alreadyImported) {
+                    DB::rollBack();
+                    $summary['skipped']++;
+                    $summary['rows'][] = $this->pathaoCsvRowResult($rowNumber, $order->order_number, true, 'Already imported earlier.', 'skipped');
+                    continue;
+                }
+
+                $remainingAmount = max(0, (float) $order->getRemainingAmount());
+                if ($remainingAmount <= 0) {
+                    DB::rollBack();
+                    $summary['skipped']++;
+                    $summary['rows'][] = $this->pathaoCsvRowResult($rowNumber, $order->order_number, true, 'Order already fully paid.', 'skipped');
+                    continue;
+                }
+
+                if ($amount - $remainingAmount > 0.01) {
+                    throw new \Exception("CSV amount {$amount} exceeds remaining balance {$remainingAmount}.");
+                }
+
+                $paymentType = $amount + 0.01 >= $remainingAmount
+                    ? ((float) $order->getTotalPaidAmount() > 0 ? 'final' : 'full')
+                    : 'partial';
+
+                $payment = OrderPayment::create([
+                    'order_id' => $order->id,
+                    'payment_method_id' => $paymentMethod->id,
+                    'customer_id' => $order->customer_id,
+                    'store_id' => $order->store_id,
+                    'processed_by' => auth()->id(),
+                    'amount' => $amount,
+                    'fee_amount' => 0,
+                    'net_amount' => $amount,
+                    'is_partial_payment' => $paymentType !== 'full',
+                    'payment_type' => $paymentType,
+                    'payment_received_date' => $paidDate,
+                    'order_balance_before' => $remainingAmount,
+                    'order_balance_after' => max(0, $remainingAmount - $amount),
+                    'status' => 'pending',
+                    'transaction_reference' => $consignmentId ?: $pathaoShipment->pathao_consignment_id,
+                    'external_reference' => $externalReference,
+                    'payment_data' => [
+                        'source' => 'pathao_paid_invoice_csv',
+                        'invoice_id' => $invoiceId,
+                        'csv_row' => $rowNumber,
+                    ],
+                    'metadata' => [
+                        'pathao_consignment_id' => $pathaoShipment->pathao_consignment_id,
+                        'uploaded_filename' => $file->getClientOriginalName(),
+                        'raw_row' => array_combine($headers, array_pad($row, count($headers), null)),
+                    ],
+                    'notes' => 'Imported from Pathao paid invoice CSV.',
+                ]);
+
+                if (!$order->processPayment($payment, $payment->transaction_reference, $payment->external_reference)) {
+                    throw new \Exception('Payment record was created but could not be completed.');
+                }
+
+                DB::commit();
+                $summary['created']++;
+                $summary['rows'][] = $this->pathaoCsvRowResult($rowNumber, $order->order_number, true, 'Payment imported.', 'created', $payment->id);
+            } catch (\Exception $e) {
+                DB::rollBack();
+                $summary['failed']++;
+                $summary['rows'][] = $this->pathaoCsvRowResult($rowNumber, $merchantOrderId, false, $e->getMessage());
+            }
+        }
+        fclose($handle);
+
+        return response()->json([
+            'success' => true,
+            'message' => "Pathao CSV import complete. Created {$summary['created']}, skipped {$summary['skipped']}, failed {$summary['failed']}.",
+            'data' => $summary,
+        ]);
+    }
+
+    protected function normalizeCsvHeader(string $header): string
+    {
+        $header = preg_replace('/^\xEF\xBB\xBF/', '', $header);
+        $header = strtolower(trim($header));
+        $header = preg_replace('/[^a-z0-9]+/', '_', $header);
+        return trim($header, '_');
+    }
+
+    protected function firstHeaderIndex(array $headers, array $candidates): ?int
+    {
+        foreach ($candidates as $candidate) {
+            $idx = array_search($candidate, $headers, true);
+            if ($idx !== false) {
+                return (int) $idx;
+            }
+        }
+        return null;
+    }
+
+    protected function parseMoney($value): float
+    {
+        $clean = preg_replace('/[^0-9.\-]/', '', (string) $value);
+        return $clean === '' ? 0.0 : round((float) $clean, 2);
+    }
+
+    protected function parseCsvDate($value): string
+    {
+        $value = trim((string) $value);
+        if ($value === '') {
+            return now()->toDateString();
+        }
+
+        try {
+            return Carbon::parse($value)->toDateString();
+        } catch (\Exception $e) {
+            return now()->toDateString();
+        }
+    }
+
+    protected function getOrCreatePathaoPaymentMethod(): PaymentMethod
+    {
+        return PaymentMethod::firstOrCreate(
+            ['code' => 'pathao_cod'],
+            [
+                'name' => 'Pathao COD Settlement',
+                'description' => 'COD settlement received from Pathao paid invoice CSV.',
+                'type' => 'online_banking',
+                'allowed_customer_types' => ['social_commerce', 'ecommerce'],
+                'is_active' => true,
+                'requires_reference' => true,
+                'supports_partial' => true,
+                'fixed_fee' => 0,
+                'percentage_fee' => 0,
+                'sort_order' => 50,
+            ]
+        );
+    }
+
+    protected function pathaoCsvRowResult(int $rowNumber, ?string $orderNumber, bool $success, string $message, string $status = null, ?int $paymentId = null): array
+    {
+        return [
+            'row' => $rowNumber,
+            'order_number' => $orderNumber,
+            'success' => $success,
+            'status' => $status ?: ($success ? 'ok' : 'failed'),
+            'message' => $message,
+            'payment_id' => $paymentId,
+        ];
+    }
+
 }

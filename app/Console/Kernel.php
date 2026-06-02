@@ -27,6 +27,14 @@ class Kernel extends ConsoleKernel
             app(\App\Http\Controllers\RecycleBinController::class)->autoCleanup();
         })->dailyAt('02:00')->name('recycle-bin-cleanup');
 
+        // Pathao bulk sender: keeps queued batches moving even if the orders page is closed.
+        // The command itself spaces attempts so Pathao stays under 20 orders/minute.
+        $schedule->command('pathao:bulk-tick --max=19')
+            ->everyMinute()
+            ->name('pathao-bulk-tick')
+            ->withoutOverlapping()
+            ->appendOutputTo(storage_path('logs/pathao-bulk-tick.log'));
+
         // Daily branch report — generates yesterday's per-branch CSV at 1 AM
         // Files land in storage/app/reports/  (one CSV per branch)
         $schedule->command('report:daily-branch')

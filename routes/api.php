@@ -1258,6 +1258,7 @@ Route::middleware('auth:api')->group(function () {
         Route::get('/methods', [PaymentController::class, 'getMethodsByCustomerType']);
         Route::get('/overdue', [PaymentController::class, 'getOverduePayments']);
         Route::get('/stats', [PaymentController::class, 'getPaymentStats']);
+        Route::post('/pathao-paid-invoice-csv', [PaymentController::class, 'importPathaoPaidInvoiceCsv']);
     });
 
     // Order payment routes

@@ -125,13 +125,14 @@ class PathaoBulkBatch extends Model
     /**
      * Record result for a single shipment
      */
-    public function recordShipmentResult(int $shipmentId, bool $success, string $message, ?string $consignmentId = null)
+    public function recordShipmentResult(int $shipmentId, bool $success, string $message, ?string $consignmentId = null, ?string $userMessage = null)
     {
         $results = $this->results ?? [];
         
         $results[$shipmentId] = [
             'success' => $success,
             'message' => $message,
+            'user_message' => $userMessage ?: $message,
             'consignment_id' => $consignmentId,
             'processed_at' => now()->toISOString(),
         ];
@@ -219,7 +220,9 @@ class PathaoBulkBatch extends Model
                 'shipment_number' => $shipment?->shipment_number,
                 'order_number' => $shipment?->order?->order_number,
                 'success' => $result['success'],
-                'message' => $result['message'],
+                'message' => $result['user_message'] ?? $result['message'],
+                'user_message' => $result['user_message'] ?? $result['message'],
+                'raw_message' => $result['message'],
                 'consignment_id' => $result['consignment_id'] ?? null,
                 'processed_at' => $result['processed_at'],
             ];

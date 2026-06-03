@@ -236,6 +236,96 @@ class OrderController extends Controller
         ]);
     }
 
+    private function checkStoreCanFulfillRequestedItems(int $storeId, array $items): array
+    {
+        $required = [];
+        $productIds = [];
+
+        foreach ($items as $item) {
+            $productId = (int) ($item['product_id'] ?? 0);
+            if ($productId <= 0) {
+                continue;
+            }
+
+            $quantity = max(1, (int) ($item['quantity'] ?? 1));
+            $productIds[] = $productId;
+
+            if (!isset($required[$productId])) {
+                $required[$productId] = [
+                    'product_id' => $productId,
+                    'product_name' => 'Product #' . $productId,
+                    'required_quantity' => 0,
+                ];
+            }
+
+            $required[$productId]['required_quantity'] += $quantity;
+        }
+
+        if (empty($required)) {
+            return ['can_fulfill' => true, 'items' => []];
+        }
+
+        $products = Product::whereIn('id', array_values(array_unique($productIds)))->get()->keyBy('id');
+        $batches = ProductBatch::whereIn('product_id', array_keys($required))
+            ->where('store_id', $storeId)
+            ->where('availability', true)
+            ->where('quantity', '>', 0)
+            ->where(function ($query) {
+                $query->whereNull('expiry_date')
+                    ->orWhere('expiry_date', '>', now());
+            })
+            ->get()
+            ->groupBy('product_id');
+
+        $deductedStatuses = ['confirmed', 'delivered', 'cancelled', 'returned', 'refunded'];
+        $assignedByProduct = DB::table('order_items')
+            ->join('orders', 'order_items.order_id', '=', 'orders.id')
+            ->whereIn('order_items.product_id', array_keys($required))
+            ->where('orders.store_id', $storeId)
+            ->whereNotIn('orders.status', $deductedStatuses)
+            ->whereNull('orders.deleted_at')
+            ->select('order_items.product_id', DB::raw('SUM(order_items.quantity) as total_assigned'))
+            ->groupBy('order_items.product_id')
+            ->get()
+            ->keyBy('product_id');
+
+        $reservedProducts = ReservedProduct::whereIn('product_id', array_keys($required))->get()->keyBy('product_id');
+
+        $canFulfillOrder = true;
+        $rows = [];
+
+        foreach ($required as $productId => $row) {
+            $product = $products->get($productId);
+            $physicalQuantity = (int) ($batches->get($productId, collect())->sum('quantity'));
+            $assignedQuantity = (int) ($assignedByProduct->get($productId)->total_assigned ?? 0);
+            $freePhysicalQuantity = max(0, $physicalQuantity - $assignedQuantity);
+            $globalAvailable = (int) ($reservedProducts->get($productId)->available_inventory ?? 0);
+            $availableQuantity = min($freePhysicalQuantity, $globalAvailable);
+            $canFulfillProduct = $availableQuantity >= (int) $row['required_quantity'];
+
+            if (!$canFulfillProduct) {
+                $canFulfillOrder = false;
+            }
+
+            $rows[] = [
+                'product_id' => (int) $productId,
+                'product_name' => $product?->name ?? $row['product_name'],
+                'required_quantity' => (int) $row['required_quantity'],
+                'physical_quantity' => $physicalQuantity,
+                'assigned_quantity' => $assignedQuantity,
+                'free_physical_quantity' => $freePhysicalQuantity,
+                'global_available' => $globalAvailable,
+                'available_quantity' => $availableQuantity,
+                'can_fulfill' => $canFulfillProduct,
+            ];
+        }
+
+        return [
+            'can_fulfill' => $canFulfillOrder,
+            'items' => $rows,
+        ];
+    }
+
     /**
      * Create new order
      * Handles all 3 sales channels: counter, social_commerce, ecommerce
@@ -282,6 +372,7 @@ class OrderController extends Controller
             'customer.email' => 'nullable|email',
             'customer.address' => 'nullable|string',
             'store_id' => 'nullable|exists:stores,id',  // Required for counter, optional for social_commerce/ecommerce
+            'store_assignment_mode' => 'nullable|string|in:auto,manual,assign_now,assign_later,pending_assignment',
             'salesman_id' => 'nullable|exists:employees,id',  // Manual salesman entry for POS
             'items' => 'nullable|array',
             'items.*.product_id' => 'required|exists:products,id',
@@ -327,6 +418,8 @@ class OrderController extends Controller
         try {
             // Determine store_id based on order type
             $storeId = $request->store_id;
+            $manualStoreAssignment = false;
+            $assignmentMode = (string) $request->input('store_assignment_mode', 'auto');
             
             // For counter/POS orders: require store_id (from employee's store or explicitly provided)
             if ($request->order_type === 'counter') {
@@ -340,10 +433,32 @@ class OrderController extends Controller
                 }
             }
             
-            // Social-commerce/e-commerce orders must enter the store-assignment workflow.
-            // Ignore any submitted store_id so these orders are created unassigned.
+            // Social-commerce/e-commerce normally enter the store-assignment workflow.
+            // Manual assignment is allowed only when the selected store can fulfill the full product cart.
             if (in_array($request->order_type, ['social_commerce', 'ecommerce'])) {
-                $storeId = null;
+                $requestedStoreId = $request->filled('store_id') ? (int) $request->store_id : null;
+                $manualStoreAssignment = $requestedStoreId && in_array($assignmentMode, ['manual', 'assign_now'], true);
+
+                if ($manualStoreAssignment) {
+                    $store = Store::where('id', $requestedStoreId)->where('is_active', true)->first();
+                    if (!$store) {
+                        throw new \Exception('Selected store is inactive or not found. Choose another store or use auto assignment.');
+                    }
+
+                    $availability = $this->checkStoreCanFulfillRequestedItems($requestedStoreId, (array) $request->input('items', []));
+                    if (!$availability['can_fulfill']) {
+                        $blocking = collect($availability['items'])
+                            ->filter(fn ($row) => empty($row['can_fulfill']))
+                            ->map(fn ($row) => $row['product_name'] . ' required ' . $row['required_quantity'] . ', available ' . $row['available_quantity'])
+                            ->implode('; ');
+                        throw new \Exception('Selected store cannot fulfill the full order. ' . ($blocking ?: 'Use auto assignment instead.'));
+                    }
+
+                    $storeId = $requestedStoreId;
+                } else {
+                    $storeId = null;
+                    $manualStoreAssignment = false;
+                }
             }
             
             // Get or create customer
@@ -433,6 +548,8 @@ class OrderController extends Controller
             // their own status so they do not enter package workflows.
             if ($isServiceOnlySocialOrder) {
                 $initialStatus = 'service_only';
+            } elseif ($manualStoreAssignment && in_array($request->order_type, ['social_commerce', 'ecommerce']) && $hasProductItems) {
+                $initialStatus = 'assigned_to_store';
             } elseif (in_array($request->order_type, ['social_commerce', 'ecommerce'])) {
                 $initialStatus = 'pending_assignment';
             } else {
@@ -454,6 +571,11 @@ class OrderController extends Controller
                 'created_by' => $actorId,
                 'salesman_id' => $salesmanId,
                 'order_date' => now(),
+                'metadata' => $manualStoreAssignment ? [
+                    'store_assignment_mode' => 'manual',
+                    'manual_store_assigned_at' => now()->toISOString(),
+                    'manual_store_assigned_by' => $actorId,
+                ] : null,
             ]);
 
             // Save shipping address to customer_addresses table if provided
@@ -601,6 +723,7 @@ class OrderController extends Controller
                     'product_id' => $product->id,
                     'product_batch_id' => $batch?->id,  // Nullable for pre-orders
                     'product_barcode_id' => $barcodeId,  // NEW: Store barcode if provided
+                    'store_id' => $storeId,
                     'product_name' => $product->name,
                     'product_sku' => $product->sku,
                     'quantity' => $quantity,

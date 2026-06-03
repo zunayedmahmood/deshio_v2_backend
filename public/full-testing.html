@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deshio Full Testing</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --card: #172033;
+      --muted: #94a3b8;
+      --text: #e5e7eb;
+      --line: rgba(148, 163, 184, .25);
+      --blue: #3b82f6;
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #eab308;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top left, rgba(59, 130, 246, .18), transparent 35%), var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 28px;
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; }
+    .hero { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; margin-bottom: 22px; }
+    h1 { font-size: 32px; margin: 0 0 8px; }
+    p { color: var(--muted); line-height: 1.55; }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+    .card {
+      grid-column: span 12;
+      background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.24);
+    }
+    @media (min-width: 980px) { .span-5 { grid-column: span 5; } .span-7 { grid-column: span 7; } }
+    label { display: block; font-size: 12px; font-weight: 700; color: #cbd5e1; margin: 0 0 6px; text-transform: uppercase; letter-spacing: .06em; }
+    input, select {
+      width: 100%; border: 1px solid var(--line); border-radius: 12px; background: rgba(15, 23, 42, .78);
+      color: var(--text); padding: 11px 12px; outline: none;
+    }
+    input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(59,130,246,.18); }
+    .fields { display: grid; grid-template-columns: repeat(1, minmax(0, 1fr)); gap: 12px; }
+    @media (min-width: 760px) { .fields { grid-template-columns: 2fr 1.2fr 1.2fr; } }
+    button, a.button {
+      border: 0; border-radius: 12px; padding: 11px 14px; color: white; background: var(--blue);
+      font-weight: 800; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 8px;
+    }
+    button.secondary, a.secondary { background: rgba(148, 163, 184, .18); color: #e2e8f0; border: 1px solid var(--line); }
+    button.green { background: var(--green); }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
+    .status { padding: 10px 12px; border-radius: 12px; background: rgba(15, 23, 42, .7); border: 1px solid var(--line); color: #cbd5e1; font-size: 14px; }
+    .ok { color: #86efac; } .bad { color: #fca5a5; } .warn { color: #fde68a; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 5px 9px; font-size: 12px; font-weight: 800; }
+    .pill.ok { background: rgba(34,197,94,.13); border: 1px solid rgba(34,197,94,.35); }
+    .pill.bad { background: rgba(239,68,68,.13); border: 1px solid rgba(239,68,68,.35); }
+    .pill.info { color: #bfdbfe; background: rgba(59,130,246,.13); border: 1px solid rgba(59,130,246,.35); }
+    .tests { display: grid; gap: 10px; margin-top: 14px; }
+    .test-row { padding: 12px; border: 1px solid var(--line); background: rgba(15, 23, 42, .42); border-radius: 14px; }
+    .test-head { display:flex; align-items:center; justify-content:space-between; gap: 12px; }
+    .test-head strong { color: white; }
+    .test-row p { margin: 8px 0 0; font-size: 13px; }
+    pre {
+      white-space: pre-wrap; word-break: break-word; max-height: 340px; overflow: auto;
+      background: #020617; border: 1px solid var(--line); border-radius: 14px; padding: 14px; color: #dbeafe;
+    }
+    .checklist { margin: 10px 0 0; padding-left: 18px; color: var(--muted); }
+    .checklist li { margin: 6px 0; }
+    .mini { font-size: 12px; color: var(--muted); }
+    .toggle { display:flex; align-items:center; gap: 8px; color: #cbd5e1; font-size: 14px; }
+    .toggle input { width: auto; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <div>
+        <h1>Deshio Full Testing</h1>
+        <p>Login once, then run dedicated diagnostic cards. Each card uses the real backend endpoints and shows expected vs actual results in a QA-friendly way.</p>
+      </div>
+      <span id="authBadge" class="pill info">Not logged in</span>
+    </div>
+
+    <div class="grid">
+      <section class="card span-12">
+        <h2>Connection & Login</h2>
+        <div class="fields">
+          <div>
+            <label for="backendUrl">Backend base URL</label>
+            <input id="backendUrl" value="http://localhost:8000" />
+          </div>
+          <div>
+            <label for="email">Admin Gmail / email</label>
+            <input id="email" type="email" placeholder="admin@example.com" />
+          </div>
+          <div>
+            <label for="password">Password</label>
+            <input id="password" type="password" placeholder="••••••••" />
+          </div>
+        </div>
+        <div class="actions">
+          <button id="loginBtn">Login</button>
+          <button id="clearBtn" class="secondary">Clear saved token</button>
+          <span id="loginStatus" class="status">Ready.</span>
+        </div>
+      </section>
+
+      <section class="card span-7">
+        <div class="test-head">
+          <div>
+            <h2>Bulk Store Assignment Page Test</h2>
+            <p>This card validates the new sidebar page and backend behavior for assigning one, many, or all selected <code>pending_assignment</code> orders to a selected store.</p>
+          </div>
+          <span class="pill info">Dedicated</span>
+        </div>
+        <ul class="checklist">
+          <li>Validates missing store and empty order selection errors.</li>
+          <li>Rejects orders that are not <code>pending_assignment</code>.</li>
+          <li>Rejects insufficient inventory and over-capacity selections.</li>
+          <li>Assigns single and multiple orders to one store.</li>
+          <li>Confirms successful orders become <code>assigned_to_store</code>.</li>
+          <li>Confirms order-level and item-level <code>store_id</code> are synced.</li>
+          <li>Confirms physical batch stock is not deducted during assignment.</li>
+          <li>Confirms assigned orders disappear from the pending assignment page data.</li>
+          <li>Live page API probe checks stores, pending orders, item summaries, and fulfillment matrix data.</li>
+        </ul>
+
+        <div class="actions">
+          <button id="runProbeBtn" class="secondary">Run page API probe</button>
+          <span id="probeStatus" class="status">Probe waiting.</span>
+        </div>
+        <div id="probeSummary" class="actions"></div>
+        <div id="probeTests" class="tests"></div>
+
+        <div class="actions">
+          <button id="runBulkBtn" class="green">Run bulk assignment card</button>
+          <label class="toggle"><input id="cleanup" type="checkbox" checked /> Cleanup test data after run</label>
+          <span id="bulkStatus" class="status">Waiting.</span>
+        </div>
+        <div id="bulkSummary" class="actions"></div>
+        <div id="bulkTests" class="tests"></div>
+      </section>
+
+      <section class="card span-5">
+        <h2>Frontend Page Opener</h2>
+        <p>After deploying the frontend files, open the new page and visually verify the card-style order list, top store selector, select-one/select-many/select-all controls, and sidebar entry.</p>
+        <label for="frontendUrl">Frontend base URL</label>
+        <input id="frontendUrl" value="http://localhost:3000" />
+        <div class="actions">
+          <a id="openBulkPage" class="button secondary" href="http://localhost:3000/bulk-store-assignment" target="_blank" rel="noopener">Open /bulk-store-assignment</a>
+        </div>
+        <p class="mini">The automated card tests the backend behavior. The opener helps QA check the browser page itself.</p>
+      </section>
+
+      <section class="card span-12">
+        <h2>Raw Output</h2>
+        <pre id="rawOutput">[]</pre>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    let authToken = localStorage.getItem('deshioFullTestingToken') || '';
+    const results = [];
+
+    const $ = (id) => document.getElementById(id);
+    const baseUrl = () => $('backendUrl').value.trim().replace(/\/$/, '');
+
+    function setAuthBadge() {
+      $('authBadge').className = authToken ? 'pill ok' : 'pill info';
+      $('authBadge').textContent = authToken ? 'Logged in token available' : 'Not logged in';
+    }
+
+    function pushResult(label, data) {
+      results.push({ label, at: new Date().toISOString(), data });
+      $('rawOutput').textContent = JSON.stringify(results, null, 2);
+    }
+
+    async function readJson(res) {
+      const text = await res.text();
+      try { return JSON.parse(text); } catch (e) { return { raw: text }; }
+    }
+
+    function setBusy(button, busy, text) {
+      button.disabled = busy;
+      if (text) button.textContent = text;
+    }
+
+    async function login() {
+      $('loginStatus').textContent = 'Logging in...';
+      setBusy($('loginBtn'), true, 'Logging in...');
+      try {
+        const res = await fetch(`${baseUrl()}/api/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify({
+            email: $('email').value.trim(),
+            password: $('password').value,
+          }),
+        });
+        const body = await readJson(res);
+        pushResult('Login', { status: res.status, ok: res.ok, body });
+        if (!res.ok || !body.access_token) throw new Error(body.error || body.message || 'Login failed');
+        authToken = body.access_token;
+        localStorage.setItem('deshioFullTestingToken', authToken);
+        setAuthBadge();
+        $('loginStatus').innerHTML = '<span class="ok">Logged in.</span>';
+        return true;
+      } catch (error) {
+        authToken = '';
+        localStorage.removeItem('deshioFullTestingToken');
+        setAuthBadge();
+        $('loginStatus').innerHTML = `<span class="bad">${error.message}</span>`;
+        return false;
+      } finally {
+        setBusy($('loginBtn'), false, 'Login');
+      }
+    }
+
+    async function ensureLogin() {
+      if (authToken) return true;
+      return login();
+    }
+
+
+    function authHeaders() {
+      return {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Authorization': `Bearer ${authToken}`,
+      };
+    }
+
+    function buildSummary(tests) {
+      const total = tests.length;
+      const passed = tests.filter((test) => test.passed).length;
+      return { total, passed, failed: total - passed };
+    }
+
+    function renderSummary(targetId, success, summary) {
+      $(targetId).innerHTML = `
+        <span class="pill ${success ? 'ok' : 'bad'}">${success ? 'Passed' : 'Failed'}</span>
+        <span class="pill info">Total: ${summary.total || 0}</span>
+        <span class="pill ok">Passed: ${summary.passed || 0}</span>
+        <span class="pill bad">Failed: ${summary.failed || 0}</span>
+      `;
+    }
+
+    function renderTests(targetId, tests) {
+      $(targetId).innerHTML = (tests || []).map((test) => `
+        <div class="test-row">
+          <div class="test-head">
+            <strong>${escapeHtml(test.name)}</strong>
+            <span class="pill ${test.passed ? 'ok' : 'bad'}">${test.passed ? 'PASS' : 'FAIL'}</span>
+          </div>
+          <p><strong>Expected:</strong> ${escapeHtml(test.expected || '')}</p>
+          <details>
+            <summary class="mini">Actual result details</summary>
+            <pre>${escapeHtml(JSON.stringify(test.actual, null, 2))}</pre>
+          </details>
+        </div>
+      `).join('');
+    }
+
+    function addProbeTest(tests, name, passed, expected, actual) {
+      tests.push({ name, passed, expected, actual });
+    }
+
+    async function runPageApiProbe() {
+      const ok = await ensureLogin();
+      if (!ok) return;
+
+      $('probeStatus').textContent = 'Running page API probe...';
+      $('probeTests').innerHTML = '';
+      $('probeSummary').innerHTML = '';
+      setBusy($('runProbeBtn'), true, 'Running...');
+
+      const tests = [];
+      try {
+        const res = await fetch(`${baseUrl()}/api/order-management/bulk-pending-assignment?per_page=20&sort_order=asc`, {
+          method: 'GET',
+          headers: authHeaders(),
+        });
+        const body = await readJson(res);
+        const data = body?.data || {};
+        const orders = Array.isArray(data.orders) ? data.orders : [];
+        const stores = Array.isArray(data.stores) ? data.stores : [];
+        const pagination = data.pagination || {};
+        const firstOrder = orders[0] || null;
+        const firstStoreSummary = firstOrder?.available_stores_summary?.[0] || null;
+
+        addProbeTest(
+          tests,
+          'Bulk assignment page API is reachable',
+          res.ok && body?.success === true,
+          'Endpoint should return HTTP 200 with success=true',
+          { status: res.status, success: body?.success, message: body?.message }
+        );
+
+        addProbeTest(
+          tests,
+          'Payload includes page essentials',
+          Array.isArray(data.orders) && Array.isArray(data.stores) && typeof pagination === 'object',
+          'Payload should include orders[], stores[], and pagination metadata',
+          { order_count: orders.length, store_count: stores.length, pagination }
+        );
+
+        addProbeTest(
+          tests,
+          'Only unassigned pending online orders are listed',
+          orders.every((order) => order.status === 'pending_assignment'
+            && (order.store_id === null || order.store_id === undefined || order.store_id === '')
+            && ['ecommerce', 'social_commerce'].includes(order.order_type)),
+          'Rows must be pending_assignment ecommerce/social_commerce orders without store_id',
+          orders.slice(0, 10).map((order) => ({ id: order.id, order_number: order.order_number, status: order.status, store_id: order.store_id, order_type: order.order_type }))
+        );
+
+        addProbeTest(
+          tests,
+          'Order cards have item summaries and fulfillment matrix fields',
+          orders.length === 0 || orders.every((order) => Array.isArray(order.items_summary)
+            && Array.isArray(order.available_stores_summary)
+            && Object.prototype.hasOwnProperty.call(order, 'best_fulfillment_store')),
+          'Each order should expose what was ordered and which stores can fulfill it',
+          firstOrder ? { order_number: firstOrder.order_number, items_summary: firstOrder.items_summary, stores_checked: firstOrder.available_stores_summary?.length || 0 } : { note: 'No current pending_assignment orders; endpoint shape still checked.' }
+        );
+
+        addProbeTest(
+          tests,
+          'Fulfillment rows support UI blocking logic',
+          !firstStoreSummary || (
+            typeof firstStoreSummary.store_id !== 'undefined'
+            && typeof firstStoreSummary.store_name !== 'undefined'
+            && typeof firstStoreSummary.can_fulfill_entire_order === 'boolean'
+            && Array.isArray(firstStoreSummary.inventory_details)
+          ),
+          'Rows should include store id/name, can_fulfill_entire_order, and inventory_details',
+          firstStoreSummary || { note: 'No store summary available in current data.' }
+        );
+
+        addProbeTest(
+          tests,
+          'Store selector has active stores',
+          stores.length > 0 && stores.every((store) => store.id && store.name && store.is_active !== false),
+          'Top dropdown should get at least one active store with id/name',
+          stores.slice(0, 10).map((store) => ({ id: store.id, name: store.name, is_active: store.is_active }))
+        );
+
+        const summary = buildSummary(tests);
+        const success = summary.failed === 0;
+        renderSummary('probeSummary', success, summary);
+        renderTests('probeTests', tests);
+        pushResult('Bulk Store Assignment Page API Probe', { status: res.status, ok: res.ok, summary, tests, body });
+        $('probeStatus').innerHTML = success ? '<span class="ok">Probe passed.</span>' : '<span class="bad">Probe failed.</span>';
+      } catch (error) {
+        renderSummary('probeSummary', false, { total: 1, passed: 0, failed: 1 });
+        renderTests('probeTests', [{ name: 'Page API probe crashed', passed: false, expected: 'Probe should complete without runtime/network errors', actual: { message: error.message } }]);
+        pushResult('Bulk Store Assignment Page API Probe Error', { message: error.message });
+        $('probeStatus').innerHTML = `<span class="bad">${escapeHtml(error.message)}</span>`;
+      } finally {
+        setBusy($('runProbeBtn'), false, 'Run page API probe');
+      }
+    }
+
+    function renderBulkResult(body) {
+      const summary = body?.data?.summary || {};
+      $('bulkSummary').innerHTML = `
+        <span class="pill ${body.success ? 'ok' : 'bad'}">${body.success ? 'Passed' : 'Failed'}</span>
+        <span class="pill info">Total: ${summary.total || 0}</span>
+        <span class="pill ok">Passed: ${summary.passed || 0}</span>
+        <span class="pill bad">Failed: ${summary.failed || 0}</span>
+      `;
+
+      const tests = body?.data?.tests || [];
+      $('bulkTests').innerHTML = tests.map((test) => `
+        <div class="test-row">
+          <div class="test-head">
+            <strong>${escapeHtml(test.name)}</strong>
+            <span class="pill ${test.passed ? 'ok' : 'bad'}">${test.passed ? 'PASS' : 'FAIL'}</span>
+          </div>
+          <p><strong>Expected:</strong> ${escapeHtml(test.expected || '')}</p>
+          <details>
+            <summary class="mini">Actual result details</summary>
+            <pre>${escapeHtml(JSON.stringify(test.actual, null, 2))}</pre>
+          </details>
+        </div>
+      `).join('');
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }
+
+    async function runBulkAssignmentTest() {
+      const ok = await ensureLogin();
+      if (!ok) return;
+
+      $('bulkStatus').textContent = 'Running diagnostic...';
+      $('bulkTests').innerHTML = '';
+      $('bulkSummary').innerHTML = '';
+      setBusy($('runBulkBtn'), true, 'Running...');
+
+      try {
+        const res = await fetch(`${baseUrl()}/api/bulk-store-assignment-test/run`, {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({ cleanup: $('cleanup').checked }),
+        });
+        const body = await readJson(res);
+        pushResult('Bulk Store Assignment Test', { status: res.status, ok: res.ok, body });
+        renderBulkResult(body);
+        $('bulkStatus').innerHTML = body.success
+          ? '<span class="ok">Diagnostic passed.</span>'
+          : '<span class="bad">Diagnostic failed. Check failed rows.</span>';
+      } catch (error) {
+        pushResult('Bulk Store Assignment Test Error', { message: error.message });
+        $('bulkStatus').innerHTML = `<span class="bad">${error.message}</span>`;
+      } finally {
+        setBusy($('runBulkBtn'), false, 'Run bulk assignment card');
+      }
+    }
+
+    function updateFrontendLink() {
+      const url = $('frontendUrl').value.trim().replace(/\/$/, '') || 'http://localhost:3000';
+      $('openBulkPage').href = `${url}/bulk-store-assignment`;
+    }
+
+    $('loginBtn').addEventListener('click', login);
+    $('clearBtn').addEventListener('click', () => {
+      authToken = '';
+      localStorage.removeItem('deshioFullTestingToken');
+      setAuthBadge();
+      $('loginStatus').textContent = 'Saved token cleared.';
+    });
+    $('runProbeBtn').addEventListener('click', runPageApiProbe);
+    $('runBulkBtn').addEventListener('click', runBulkAssignmentTest);
+    $('frontendUrl').addEventListener('input', updateFrontendLink);
+
+    setAuthBadge();
+    updateFrontendLink();
+  </script>
+</body>
+</html>

@@ -297,6 +297,7 @@ Route::middleware('auth:api')->group(function () {
     Route::post('/refresh', [AuthController::class, 'refresh']);
     Route::get('/me', [AuthController::class, 'me']);
     Route::post('/barcode-mapping-test/run', [\App\Http\Controllers\BarcodeMappingTestController::class, 'run']);
+    Route::post('/bulk-store-assignment-test/run', [\App\Http\Controllers\BulkStoreAssignmentTestController::class, 'run']);
 });
 
 // Protected routes
@@ -368,12 +369,21 @@ Route::middleware('auth:api')->group(function () {
     Route::prefix('order-management')->group(function () {
         // Get orders pending store assignment
         Route::get('/pending-assignment', [\App\Http\Controllers\OrderManagementController::class, 'getPendingAssignmentOrders']);
+
+        // Bulk page data: pending_assignment orders + selected-store fulfillment matrix
+        Route::get('/bulk-pending-assignment', [\App\Http\Controllers\OrderManagementController::class, 'getBulkPendingAssignmentOrders']);
+
+        // Check store availability for a social-commerce cart before order creation
+        Route::post('/cart-store-availability', [\App\Http\Controllers\OrderManagementController::class, 'getCartStoreAvailability']);
         
         // Get available stores for an order based on inventory
         Route::get('/orders/{orderId}/available-stores', [\App\Http\Controllers\OrderManagementController::class, 'getAvailableStores']);
         
         // Assign order to a specific store
         Route::post('/orders/{orderId}/assign-store', [\App\Http\Controllers\OrderManagementController::class, 'assignOrderToStore']);
+
+        // Bulk assign selected pending_assignment orders to one store and move them to assigned_to_store
+        Route::post('/orders/bulk-assign-store-pending', [\App\Http\Controllers\OrderManagementController::class, 'bulkAssignOrdersToStorePending']);
 
         // Revert order assignment back to pending_assignment
         Route::post('/orders/{orderId}/revert-assignment', [\App\Http\Controllers\OrderManagementController::class, 'revertAssignment']);

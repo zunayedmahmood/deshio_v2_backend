@@ -997,7 +997,14 @@ class ProductReturnController extends Controller
         }
 
         if (!empty($orderItem->product_batch_id) && (int) $barcode->batch_id !== (int) $orderItem->product_batch_id) {
-            throw new \Exception("Barcode {$barcode->barcode} does not match the sold batch for {$orderItem->product_name}.");
+            $deletedBatchId = \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)
+                ->value('deleted_product_batch_id')
+                ?: \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)
+                    ->value('deleted_product_batch_id');
+
+            if ((int) $deletedBatchId !== (int) $orderItem->product_batch_id) {
+                throw new \Exception("Barcode {$barcode->barcode} does not match the sold batch for {$orderItem->product_name}.");
+            }
         }
 
         if (!in_array($barcode->current_status, ['with_customer', 'sold'], true)) {
@@ -1055,6 +1062,7 @@ class ProductReturnController extends Controller
             foreach ($barcodes as $barcode) {
                 $oldStatus = $barcode->current_status;
                 \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
+                    \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->delete();
 
                 // Single atomic update for all barcode fields
                 $barcode->update([
@@ -1162,6 +1170,7 @@ class ProductReturnController extends Controller
                         $barcode->refresh();
                     } else {
                         \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
+                    \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->delete();
                     }
 
                     $barcode->update([
@@ -1179,6 +1188,7 @@ class ProductReturnController extends Controller
                             'po_deleted_before_return' => true,
                             'batch_deleted_before_return' => true,
                             'deleted_purchase_order_reference_cleared' => true,
+                            'batch_deleted_reference_cleared' => true,
                         ]),
                     ]);
 

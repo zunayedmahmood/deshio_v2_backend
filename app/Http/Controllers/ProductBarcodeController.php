@@ -53,7 +53,10 @@ class ProductBarcodeController extends Controller
             ], 404);
         }
 
-        if ($request->filled('store_id')) {
+        $deletedPoLink = $scanResult['barcode']->deletedPurchaseOrderLink ?? null;
+        $deletedBatchLink = $scanResult['barcode']->batchDeletedLink ?? null;
+
+        if (!$deletedPoLink && !$deletedBatchLink && $request->filled('store_id')) {
             $selectedStoreId = (int) $request->store_id;
             $productName = $scanResult['product']->name ?? 'Product';
             $batchStoreId = $scanResult['current_batch']->store_id ?? null;
@@ -68,7 +71,14 @@ class ProductBarcodeController extends Controller
             }
         }
 
-        $deletedPoLink = $scanResult['barcode']->deletedPurchaseOrderLink ?? null;
+        $saleBlockReason = null;
+        if ($deletedPoLink) {
+            $saleBlockReason = 'This barcode belongs to a deleted purchase order. It cannot be sold in POS or Online Packing. Use Lookup return/exchange first.';
+        } elseif ($deletedBatchLink) {
+            $saleBlockReason = 'This barcode belongs to a deleted batch. It cannot be sold in POS or Online Packing. Use Lookup return/exchange first.';
+        } elseif (!$scanResult['is_available']) {
+            $saleBlockReason = 'This barcode is not available for sale. It may already be sold, inactive, defective, or outside sellable stock status.';
+        }
 
         return response()->json([
             'success' => true,
@@ -105,13 +115,13 @@ class ProductBarcodeController extends Controller
                     'sell_price' => number_format((float)$scanResult['current_batch']->sell_price, 2),
                     'status' => $scanResult['current_batch']->status,
                     'expiry_date' => $scanResult['current_batch']->expiry_date ? date('Y-m-d', strtotime($scanResult['current_batch']->expiry_date)) : null,
-                ] : ($deletedPoLink ? [
+                ] : (($deletedPoLink || $deletedBatchLink) ? [
                     'id' => null,
                     'batch_number' => 'Batch deleted',
                     'deleted' => true,
-                    'deleted_product_batch_id' => $deletedPoLink->deleted_product_batch_id,
-                    'deleted_batch_number' => $deletedPoLink->deleted_batch_number,
-                    'store_id' => null,
+                    'deleted_product_batch_id' => $deletedBatchLink?->deleted_product_batch_id ?? $deletedPoLink?->deleted_product_batch_id,
+                    'deleted_batch_number' => $deletedBatchLink?->deleted_batch_number ?? $deletedPoLink?->deleted_batch_number,
+                    'store_id' => $deletedBatchLink?->store_id,
                     'quantity' => null,
                     'cost_price' => null,
                     'sell_price' => null,
@@ -125,6 +135,18 @@ class ProductBarcodeController extends Controller
                     'deleted_po_number' => $deletedPoLink->deleted_po_number,
                     'deleted_at' => $deletedPoLink->deleted_at?->format('Y-m-d H:i:s'),
                 ] : null,
+                'deleted_batch' => $deletedBatchLink ? [
+                    'deleted' => true,
+                    'deleted_product_batch_id' => $deletedBatchLink->deleted_product_batch_id,
+                    'deleted_batch_number' => $deletedBatchLink->deleted_batch_number,
+                    'purchase_order_id' => $deletedBatchLink->purchase_order_id,
+                    'purchase_order_number' => $deletedBatchLink->purchase_order_number,
+                    'store_id' => $deletedBatchLink->store_id,
+                    'store_name' => $deletedBatchLink->store_name,
+                    'deleted_at' => $deletedBatchLink->deleted_at?->format('Y-m-d H:i:s'),
+                ] : null,
+                'sale_block_reason' => $saleBlockReason,
+                'unavailable_reason' => $saleBlockReason,
                 'is_available' => $scanResult['is_available'],
                 'quantity_available' => $scanResult['quantity_available'],
                 'last_movement' => $scanResult['last_movement'] ? [

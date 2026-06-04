@@ -732,7 +732,11 @@ class PurchaseOrderController extends Controller
                         '',
                         (float) ($item->quantity_ordered ?? 0),
                         (float) ($item->quantity_received ?? 0),
-                        $item->product_batch_id ? 'No barcodes found for this received batch' : 'PO item is not linked to a product batch yet',
+                        $item->product_batch_id
+                            ? 'No barcodes found for this received batch'
+                            : (((int) ($item->quantity_received ?? 0) > 0 && !empty($item->batch_number))
+                                ? 'This received batch was deleted from Product > Batch. Barcodes were preserved in batch_deleted_barcodes and blocked from sale.'
+                                : 'PO item is not linked to a product batch yet'),
                     ]);
                     continue;
                 }

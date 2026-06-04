@@ -5,6 +5,9 @@ namespace App\Http\Controllers;
 use App\Models\Product;
 use App\Models\ProductBatch;
 use App\Models\ProductBarcode;
+use App\Models\PurchaseOrderItem;
+use App\Models\BatchDeletedBarcode;
+use App\Models\MasterInventory;
 use App\Models\Store;
 use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
@@ -592,13 +595,18 @@ class ProductBatchController extends Controller
     }
 
     /**
-     * Delete/deactivate a batch
-     * 
+     * Delete a single batch while preserving barcode identities.
+     *
+     * This mirrors the purchase-order deletion safety rule: the physical barcode
+     * rows are kept, detached from the deleted batch, and written to
+     * batch_deleted_barcodes so POS/online packing cannot sell them again.
+     * Lookup/return/exchange can still find the barcode history.
+     *
      * DELETE /api/batches/{id}
      */
     public function destroy($id)
     {
-        $batch = ProductBatch::find($id);
+        $batch = ProductBatch::with(['product', 'store'])->find($id);
 
         if (!$batch) {
             return response()->json([
@@ -607,23 +615,66 @@ class ProductBatchController extends Controller
             ], 404);
         }
 
-        // Check if batch has been used in any dispatches or movements
-        $hasMovements = $batch->getMovementCount() > 0;
+        DB::beginTransaction();
+        try {
+            $productId = $batch->product_id;
+            $batchNumber = $batch->batch_number;
+            $storeId = $batch->store_id;
+            $storeName = $batch->store?->name;
 
-        if ($hasMovements) {
+            $poItem = PurchaseOrderItem::with('purchaseOrder')
+                ->where('product_batch_id', $batch->id)
+                ->first();
+
+            $barcodes = ProductBarcode::where('batch_id', $batch->id)
+                ->get(['id', 'batch_id', 'product_id']);
+
+            foreach ($barcodes as $barcode) {
+                BatchDeletedBarcode::updateOrCreate(
+                    ['product_barcode_id' => $barcode->id],
+                    [
+                        'deleted_product_batch_id' => $batch->id,
+                        'deleted_batch_number' => $batchNumber,
+                        'product_id' => $barcode->product_id ?: $productId,
+                        'store_id' => $storeId,
+                        'store_name' => $storeName,
+                        'purchase_order_id' => $poItem?->purchase_order_id,
+                        'purchase_order_number' => $poItem?->purchaseOrder?->po_number,
+                        'deleted_by' => auth()->id(),
+                        'deleted_at' => now(),
+                    ]
+                );
+            }
+
+            // product_barcodes.batch_id uses a cascading FK in existing installs.
+            // Detach first so deleting product_batches does not delete barcodes.
+            ProductBarcode::where('batch_id', $batch->id)->update(['batch_id' => null]);
+
+            $batch->delete();
+
+            DB::commit();
+
+            if (method_exists(MasterInventory::class, 'syncProductInventory')) {
+                MasterInventory::syncProductInventory($productId);
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Batch deleted. Its barcodes were preserved and blocked from POS/online packing sale. Use Lookup return/exchange if a customer brings one back.',
+                'data' => [
+                    'deleted_batch_id' => (int) $id,
+                    'deleted_batch_number' => $batchNumber,
+                    'barcodes_logged' => $barcodes->count(),
+                ],
+            ]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+
             return response()->json([
                 'success' => false,
-                'message' => 'Cannot delete batch with movement history. Consider deactivating it instead.'
-            ], 422);
+                'message' => 'Failed to delete batch: ' . $e->getMessage()
+            ], 500);
         }
-
-        // Deactivate instead of delete to preserve data integrity
-        $batch->update(['is_active' => false]);
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Batch deactivated successfully'
-        ]);
     }
 
     /**

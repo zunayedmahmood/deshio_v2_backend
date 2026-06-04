@@ -47,7 +47,8 @@ class LookupController extends Controller
             'batch.store',
             'currentStore',
             'defectiveRecord.identifiedBy',
-            'deletedPurchaseOrderLink'
+            'deletedPurchaseOrderLink',
+            'batchDeletedLink'
         ])->where('barcode', $request->barcode)->first();
 
         if (!$barcodeRecord) {
@@ -58,6 +59,7 @@ class LookupController extends Controller
         }
 
         $deletedPoLink = $barcodeRecord->deletedPurchaseOrderLink;
+        $deletedBatchLink = $barcodeRecord->batchDeletedLink;
 
         // 1. Product Information
         $productInfo = [
@@ -120,18 +122,23 @@ class LookupController extends Controller
                     'store_code' => $barcodeRecord->batch->store->store_code,
                 ] : null,
             ];
-        } elseif ($deletedPoLink) {
+        } elseif ($deletedPoLink || $deletedBatchLink) {
             $batchInfo = [
                 'id' => null,
                 'batch_number' => 'Batch deleted',
                 'deleted' => true,
-                'deleted_product_batch_id' => $deletedPoLink->deleted_product_batch_id,
-                'deleted_batch_number' => $deletedPoLink->deleted_batch_number,
+                'source' => $deletedBatchLink ? 'batch_deleted_barcodes' : 'deleted_purchase_order_barcodes',
+                'deleted_product_batch_id' => $deletedBatchLink?->deleted_product_batch_id ?? $deletedPoLink?->deleted_product_batch_id,
+                'deleted_batch_number' => $deletedBatchLink?->deleted_batch_number ?? $deletedPoLink?->deleted_batch_number,
                 'cost_price' => null,
                 'sell_price' => null,
                 'manufactured_date' => null,
                 'expiry_date' => null,
-                'original_store' => null,
+                'original_store' => $deletedBatchLink && ($deletedBatchLink->store_id || $deletedBatchLink->store_name) ? [
+                    'id' => $deletedBatchLink->store_id,
+                    'name' => $deletedBatchLink->store_name,
+                    'store_code' => null,
+                ] : null,
             ];
         }
 
@@ -158,7 +165,7 @@ class LookupController extends Controller
         }
 
         // If no batch link, try finding PO by product_id (most recent received PO for this product)
-        if (!$poItem && !$deletedPoLink) {
+        if (!$poItem && !$deletedPoLink && !$deletedBatchLink) {
             $poItem = PurchaseOrderItem::with(['purchaseOrder.vendor', 'purchaseOrder.store', 'purchaseOrder.createdBy'])
                 ->where('product_id', $barcodeRecord->product_id)
                 ->whereHas('purchaseOrder', function($q) {
@@ -253,6 +260,34 @@ class LookupController extends Controller
                 'deleted_at' => $deletedPoLink->deleted_at?->format('Y-m-d H:i:s'),
                 'item_details' => [
                     'receive_status' => 'deleted',
+                    'unit_cost' => null,
+                    'unit_sell_price' => null,
+                    'total_cost' => null,
+                ],
+            ];
+        } elseif ($deletedBatchLink) {
+            $purchaseOrderOrigin = [
+                'po_number' => $deletedBatchLink->purchase_order_number ?: 'Batch deleted',
+                'received_date' => null,
+                'source' => 'deleted_batch',
+                'deleted' => true,
+                'deleted_product_batch_id' => $deletedBatchLink->deleted_product_batch_id,
+                'deleted_batch_number' => $deletedBatchLink->deleted_batch_number,
+                'purchase_order_id' => $deletedBatchLink->purchase_order_id,
+                'purchase_order_number' => $deletedBatchLink->purchase_order_number,
+            ];
+
+            $purchaseOrderDetails = [
+                'id' => $deletedBatchLink->purchase_order_id,
+                'po_number' => $deletedBatchLink->purchase_order_number ?: 'No PO / batch deleted',
+                'status' => 'batch_deleted',
+                'payment_status' => null,
+                'deleted' => true,
+                'deleted_product_batch_id' => $deletedBatchLink->deleted_product_batch_id,
+                'deleted_batch_number' => $deletedBatchLink->deleted_batch_number,
+                'deleted_at' => $deletedBatchLink->deleted_at?->format('Y-m-d H:i:s'),
+                'item_details' => [
+                    'receive_status' => 'batch_deleted',
                     'unit_cost' => null,
                     'unit_sell_price' => null,
                     'total_cost' => null,
@@ -453,6 +488,16 @@ class LookupController extends Controller
                 'batch' => $batchInfo,
                 'purchase_order_origin' => $purchaseOrderOrigin,
                 'purchase_order' => $purchaseOrderDetails,  // NEW: Full PO details
+                'deleted_batch' => $deletedBatchLink ? [
+                    'deleted' => true,
+                    'deleted_product_batch_id' => $deletedBatchLink->deleted_product_batch_id,
+                    'deleted_batch_number' => $deletedBatchLink->deleted_batch_number,
+                    'purchase_order_id' => $deletedBatchLink->purchase_order_id,
+                    'purchase_order_number' => $deletedBatchLink->purchase_order_number,
+                    'store_id' => $deletedBatchLink->store_id,
+                    'store_name' => $deletedBatchLink->store_name,
+                    'deleted_at' => $deletedBatchLink->deleted_at?->format('Y-m-d H:i:s'),
+                ] : null,
                 'vendor' => $vendorDetails,                  // NEW: Full vendor details
                 'lifecycle' => $lifecycle,
                 'activity_history' => $activityHistory,
@@ -466,7 +511,8 @@ class LookupController extends Controller
                     'has_purchase_order' => $purchaseOrderDetails !== null,
                     'has_vendor_info' => $vendorDetails !== null,
                     'is_purchase_order_deleted' => (bool) $deletedPoLink,
-                    'is_batch_deleted' => (bool) ($deletedPoLink && !$barcodeRecord->batch),
+                    'is_batch_deleted' => (bool) (($deletedPoLink || $deletedBatchLink) && !$barcodeRecord->batch),
+                    'is_deleted_by_batch_delete' => (bool) $deletedBatchLink,
                 ],
             ]
         ]);

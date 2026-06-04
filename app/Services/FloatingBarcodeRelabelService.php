@@ -8,6 +8,7 @@ use App\Models\ProductBarcode;
 use App\Models\ProductBarcodeRelabel;
 use App\Models\ProductBatch;
 use App\Models\DeletedPurchaseOrderBarcode;
+use App\Models\BatchDeletedBarcode;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\ValidationException;
@@ -41,6 +42,12 @@ class FloatingBarcodeRelabelService
             if (!empty($data['known_original_barcode_id']) && DeletedPurchaseOrderBarcode::where('product_barcode_id', $data['known_original_barcode_id'])->exists()) {
                 throw ValidationException::withMessages([
                     'known_original_barcode_id' => ['This barcode belongs to a deleted purchase order. Return or exchange it first before relabelling.'],
+                ]);
+            }
+
+            if (!empty($data['known_original_barcode_id']) && BatchDeletedBarcode::where('product_barcode_id', $data['known_original_barcode_id'])->exists()) {
+                throw ValidationException::withMessages([
+                    'known_original_barcode_id' => ['This barcode belongs to a deleted batch. Return or exchange it first before relabelling.'],
                 ]);
             }
 
@@ -119,7 +126,11 @@ class FloatingBarcodeRelabelService
     public function validateBarcodeCanBeSold(ProductBarcode $barcode, ?Order $order = null, ?int $ignoreOrderItemId = null): void
     {
         if (DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->exists()) {
-            throw new \Exception("Barcode {$barcode->barcode} belongs to a deleted purchase order. Return/exchange it first, then relabel before selling.");
+            throw new \Exception("Barcode {$barcode->barcode} belongs to a deleted purchase order. It cannot be sold in POS or Online Packing. Use Lookup return/exchange first.");
+        }
+
+        if (BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->exists()) {
+            throw new \Exception("Barcode {$barcode->barcode} belongs to a deleted batch. It cannot be sold in POS or Online Packing. Use Lookup return/exchange first.");
         }
 
         if (!$barcode->is_active) {
@@ -226,6 +237,11 @@ class FloatingBarcodeRelabelService
             $deletedPoLink->delete();
         }
 
+        $deletedBatchLink = BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->first();
+        if ($deletedBatchLink) {
+            $deletedBatchLink->delete();
+        }
+
         $metadata = array_merge($barcode->location_metadata ?? [], [
             'returned_to_stock_via' => 'order_edit',
             'order_number' => $order->order_number,
@@ -233,6 +249,7 @@ class FloatingBarcodeRelabelService
             'return_date' => now()->toISOString(),
             'returned_by' => auth()->id(),
             'deleted_purchase_order_reference_cleared' => (bool) $deletedPoLink,
+            'batch_deleted_reference_cleared' => (bool) $deletedBatchLink,
         ]);
 
         $barcode->update([

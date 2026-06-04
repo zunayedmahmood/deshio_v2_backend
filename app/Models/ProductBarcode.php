@@ -115,6 +115,11 @@ class ProductBarcode extends Model
         return $this->hasOne(DeletedPurchaseOrderBarcode::class, 'product_barcode_id');
     }
 
+    public function batchDeletedLink(): \Illuminate\Database\Eloquent\Relations\HasOne
+    {
+        return $this->hasOne(BatchDeletedBarcode::class, 'product_barcode_id');
+    }
+
     public function orderItems(): HasMany
     {
         return $this->hasMany(OrderItem::class, 'product_barcode_id');
@@ -188,7 +193,8 @@ class ProductBarcode extends Model
         return $query->where('is_active', true)
                     ->where('is_defective', false)
                     ->whereIn('current_status', FloatingBarcodeRelabelService::SELLABLE_STATUSES)
-                    ->whereDoesntHave('deletedPurchaseOrderLink');
+                    ->whereDoesntHave('deletedPurchaseOrderLink')
+                    ->whereDoesntHave('batchDeletedLink');
     }
 
     // ============================================
@@ -310,6 +316,7 @@ class ProductBarcode extends Model
     public function markReturned($returnId, $reason = null)
     {
         DeletedPurchaseOrderBarcode::where('product_barcode_id', $this->id)->delete();
+        BatchDeletedBarcode::where('product_barcode_id', $this->id)->delete();
 
         $this->update([
             'is_active' => true,  // Reactivate for resale
@@ -320,6 +327,7 @@ class ProductBarcode extends Model
                 'return_id' => $returnId,
                 'return_reason' => $reason,
                 'deleted_purchase_order_reference_cleared' => true,
+                'batch_deleted_reference_cleared' => true,
             ]),
         ]);
 
@@ -365,6 +373,10 @@ class ProductBarcode extends Model
             ? $this->deletedPurchaseOrderLink
             : $this->deletedPurchaseOrderLink()->first();
 
+        $deletedBatchLink = $this->relationLoaded('batchDeletedLink')
+            ? $this->batchDeletedLink
+            : $this->batchDeletedLink()->first();
+
         $deletedPoInfo = $deletedPoLink ? [
             'deleted' => true,
             'deleted_purchase_order_id' => $deletedPoLink->deleted_purchase_order_id,
@@ -372,6 +384,17 @@ class ProductBarcode extends Model
             'deleted_po_number' => $deletedPoLink->deleted_po_number,
             'deleted_batch_number' => $deletedPoLink->deleted_batch_number,
             'deleted_at' => $deletedPoLink->deleted_at?->format('Y-m-d H:i:s'),
+        ] : null;
+
+        $deletedBatchInfo = $deletedBatchLink ? [
+            'deleted' => true,
+            'deleted_product_batch_id' => $deletedBatchLink->deleted_product_batch_id,
+            'deleted_batch_number' => $deletedBatchLink->deleted_batch_number,
+            'purchase_order_id' => $deletedBatchLink->purchase_order_id,
+            'purchase_order_number' => $deletedBatchLink->purchase_order_number,
+            'store_id' => $deletedBatchLink->store_id,
+            'store_name' => $deletedBatchLink->store_name,
+            'deleted_at' => $deletedBatchLink->deleted_at?->format('Y-m-d H:i:s'),
         ] : null;
 
         return [
@@ -382,6 +405,7 @@ class ProductBarcode extends Model
                 'sku' => $this->product->sku ?? null,
             ],
             'deleted_purchase_order' => $deletedPoInfo,
+            'deleted_batch' => $deletedBatchInfo,
             'current_store' => $this->currentStore ? [
                 'id' => $this->currentStore->id,
                 'name' => $this->currentStore->name,
@@ -405,12 +429,12 @@ class ProductBarcode extends Model
                 'cost_price' => $this->batch->cost_price,
                 'sell_price' => $this->batch->sell_price,
                 'selling_price' => $this->batch->sell_price,
-            ] : ($deletedPoLink ? [
+            ] : (($deletedPoLink || $deletedBatchLink) ? [
                 'id' => null,
                 'batch_number' => 'Batch deleted',
                 'deleted' => true,
-                'deleted_product_batch_id' => $deletedPoLink->deleted_product_batch_id,
-                'deleted_batch_number' => $deletedPoLink->deleted_batch_number,
+                'deleted_product_batch_id' => $deletedBatchLink?->deleted_product_batch_id ?? $deletedPoLink?->deleted_product_batch_id,
+                'deleted_batch_number' => $deletedBatchLink?->deleted_batch_number ?? $deletedPoLink?->deleted_batch_number,
                 'quantity' => null,
                 'cost_price' => null,
                 'sell_price' => null,
@@ -428,7 +452,12 @@ class ProductBarcode extends Model
             ? (bool) $this->deletedPurchaseOrderLink
             : $this->deletedPurchaseOrderLink()->exists();
 
+        $hasDeletedBatchLink = $this->relationLoaded('batchDeletedLink')
+            ? (bool) $this->batchDeletedLink
+            : $this->batchDeletedLink()->exists();
+
         return !$hasDeletedPoLink
+            && !$hasDeletedBatchLink
             && $this->is_active 
             && !$this->is_defective 
             && in_array($this->current_status, FloatingBarcodeRelabelService::SELLABLE_STATUSES, true);
@@ -665,7 +694,7 @@ class ProductBarcode extends Model
     public static function scanBarcode($barcode)
     {
         $barcodeRecord = static::where('barcode', $barcode)
-            ->with(['product.category', 'product.vendor', 'batch', 'currentStore', 'deletedPurchaseOrderLink'])
+            ->with(['product.category', 'product.vendor', 'batch', 'currentStore', 'deletedPurchaseOrderLink', 'batchDeletedLink'])
             ->first();
 
         if (!$barcodeRecord) {

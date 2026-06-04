@@ -96,6 +96,27 @@ class OrderController extends Controller
         // Filter by status
         if ($request->filled('status')) {
             $query->where('status', $request->status);
+        } elseif ($request->filled('statuses')) {
+            $statuses = $request->input('statuses');
+            if (is_string($statuses)) {
+                $statuses = explode(',', $statuses);
+            }
+            $statuses = array_values(array_filter(array_map('trim', (array) $statuses)));
+            if (!empty($statuses)) {
+                $query->whereIn('status', $statuses);
+            }
+        }
+
+        // Exact product filter. Used by the Free Reserved Products page to find
+        // old/lost orders that are holding reservation for one selected product
+        // variant without relying on broad order search text.
+        if ($request->filled('product_id')) {
+            $productId = (int) $request->input('product_id');
+            if ($productId > 0) {
+                $query->whereHas('items', function ($itemQuery) use ($productId) {
+                    $itemQuery->where('product_id', $productId);
+                });
+            }
         }
 
         // Filter by payment status

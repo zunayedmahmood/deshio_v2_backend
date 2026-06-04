@@ -103,8 +103,38 @@ class OrderController extends Controller
             $query->where('payment_status', $request->payment_status);
         }
 
-        // Filter by fulfillment status
-        if ($request->filled('fulfillment_status')) {
+        // Dedicated packing queue filter for /social-commerce/package.
+        // The old UI only queried fulfillment_status=pending_fulfillment, which made
+        // assigned_to_store orders disappear whenever an assignment path/legacy row left
+        // fulfillment_status empty. Treat a store-assigned online order with an empty
+        // fulfillment_status as pending fulfillment until it is scanned/fulfilled.
+        if ($request->boolean('packing_queue')) {
+            $query->whereIn('order_type', ['ecommerce', 'social_commerce'])
+                ->whereNotNull('store_id')
+                ->whereNotIn('status', [
+                    'pending_assignment',
+                    'service_only',
+                    'cancelled',
+                    'canceled',
+                    'delivered',
+                    'completed',
+                    'refunded',
+                    'draft',
+                ])
+                ->where(function ($packingQueue) {
+                    $packingQueue->where('fulfillment_status', 'pending_fulfillment')
+                        ->orWhere(function ($emptyFulfillment) {
+                            $emptyFulfillment->whereIn('status', [
+                                    'assigned_to_store',
+                                    'picking',
+                                ])
+                                ->where(function ($q) {
+                                    $q->whereNull('fulfillment_status')
+                                        ->orWhere('fulfillment_status', '');
+                                });
+                        });
+                });
+        } elseif ($request->filled('fulfillment_status')) {
             $query->where('fulfillment_status', $request->fulfillment_status);
         }
 
@@ -2308,6 +2338,11 @@ class OrderController extends Controller
             },
             'status' => $order->status,
             'fulfillment_status' => $order->fulfillment_status,
+            // Keep raw store ids on list responses. The packing page should not depend
+            // only on the nested store relation being present to know an order is assigned.
+            'store_id' => $order->store_id,
+            'assigned_store_id' => $order->store_id,
+            'fulfillment_store_id' => $order->store_id,
             'payment_status' => $order->payment_status,
             'has_service_items' => $order->serviceItems->isNotEmpty(),
             'service_items_count' => $order->serviceItems->count(),

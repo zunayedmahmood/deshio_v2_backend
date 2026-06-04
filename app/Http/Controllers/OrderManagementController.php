@@ -481,7 +481,7 @@ class OrderManagementController extends Controller
                     $order->update([
                         'store_id' => $store->id,
                         'status' => 'assigned_to_store',
-                        'fulfillment_status' => null,
+                        'fulfillment_status' => 'pending_fulfillment',
                         'processed_by' => auth('api')->id(),
                         'metadata' => array_merge($order->metadata ?? [], [
                             'bulk_store_assigned_at' => now()->toISOString(),
@@ -867,6 +867,11 @@ class OrderManagementController extends Controller
                     ]),
                 ]);
 
+                // Keep item-level store assignment consistent with the order-level assignment.
+                // Bulk assignment already did this; single assignment must do the same so
+                // packing/fulfillment and reporting never see a half-assigned order.
+                $order->items()->update(['store_id' => $storeId]);
+
                 DB::commit();
 
                 $order->load(['customer', 'items.product', 'store']);
@@ -971,6 +976,33 @@ class OrderManagementController extends Controller
             $oldStatus = $order->status;
             $oldStoreId = $order->store_id;
             $oldFulfillmentStatus = $order->fulfillment_status;
+
+            // Safety guard: only a clean store-assigned order can be reverted.
+            // Once picking/scanning/batch allocation has started, assignment rollback must
+            // go through a dedicated fulfillment cancellation flow so stock/barcode state
+            // cannot be silently cleared by mistake.
+            if ($order->status !== 'assigned_to_store' || empty($order->store_id)) {
+                DB::rollBack();
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Only clean assigned_to_store orders with a store can be reverted to pending assignment.',
+                ], 422);
+            }
+
+            $hasScannedOrReservedItems = $order->items()
+                ->where(function ($q) {
+                    $q->whereNotNull('product_barcode_id')
+                        ->orWhereNotNull('product_batch_id');
+                })
+                ->exists();
+
+            if ($hasScannedOrReservedItems) {
+                DB::rollBack();
+                return response()->json([
+                    'success' => false,
+                    'message' => 'This order already has barcode/batch activity. Use a fulfillment cancellation flow instead of reverting assignment.',
+                ], 422);
+            }
 
             // 1. Handle stock restoration if order was already "deducted" (e.g. from OrderController@complete)
             // Deducted statuses usually include 'confirmed', 'delivered'

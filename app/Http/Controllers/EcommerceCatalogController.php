@@ -467,7 +467,7 @@ class EcommerceCatalogController extends Controller
                         ->where('product_batches.availability', true);
                 })
                 ->select(DB::raw('MIN(id) as id'))
-                ->groupBy('base_name')
+                ->groupBy('sku')
                 ->inRandomOrder()
                 ->take(20)
                 ->pluck('id');
@@ -488,7 +488,7 @@ class EcommerceCatalogController extends Controller
                             ->where('product_batches.availability', true);
                     })
                     ->select(DB::raw('MIN(id) as id'))
-                    ->groupBy('base_name')
+                    ->groupBy('sku')
                     ->orderBy(DB::raw('MAX(created_at)'), 'desc') // Latest products
                     ->take($fillCount)
                     ->pluck('id');
@@ -502,15 +502,17 @@ class EcommerceCatalogController extends Controller
                 ->whereIn('id', $relatedProductIds)
                 ->get();
 
-            // Get variants (same base_name, different variation_suffix)
+            // Get variants from the same SKU only. Similar base_name must not merge
+            // different product groups on the e-commerce detail page.
             $variants = collect();
-            if ($product->base_name) {
+            if (!empty($product->sku)) {
                 $variants = Product::with(['images', 'batches' => function ($q) {
                         $q->orderBy('sell_price', 'asc');
                     }])
-                    ->where('base_name', $product->base_name)
+                    ->where('sku', $product->sku)
                     ->where('id', '!=', $product->id)
                     ->where('is_archived', false)
+                    ->whereNull('deleted_at')
                     ->get()
                     ->map(function ($variant) {
                         $variantStock = $variant->batches->sum('quantity');

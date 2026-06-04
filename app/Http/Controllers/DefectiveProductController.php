@@ -95,6 +95,10 @@ class DefectiveProductController extends Controller
 
             // Pagination
             $perPage = $request->get('per_page', 15);
+            if ($perPage == -1 || $request->get('all') == true) {
+                $count = $query->count();
+                $perPage = $count > 0 ? $count : 15;
+            }
             $defectiveProducts = $query->paginate($perPage);
 
             return response()->json([

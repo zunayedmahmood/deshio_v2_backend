@@ -117,6 +117,11 @@ class OrderController extends Controller
             }
         }
 
+        // Filter by intended courier
+        if ($request->filled('intended_courier')) {
+            $query->where('intended_courier', $request->intended_courier);
+        }
+
         // Filter unassigned orders (pending store assignment)
         // Includes both ecommerce and social_commerce orders
         if ($request->boolean('pending_assignment')) {
@@ -544,12 +549,15 @@ class OrderController extends Controller
             // Fulfillment begins only after OrderManagementController assigns a store.
             $fulfillmentStatus = null;
 
-            // Product online orders start pending_assignment. Service-only social orders keep
-            // their own status so they do not enter package workflows.
+            // Product online orders start pending_assignment unless a valid manual store is
+            // selected from the cart page. Manually assigned online orders should immediately
+            // enter the store fulfillment workflow, just like orders assigned later from the
+            // Store Assignment page.
             if ($isServiceOnlySocialOrder) {
                 $initialStatus = 'service_only';
             } elseif ($manualStoreAssignment && in_array($request->order_type, ['social_commerce', 'ecommerce']) && $hasProductItems) {
                 $initialStatus = 'assigned_to_store';
+                $fulfillmentStatus = 'pending_fulfillment';
             } elseif (in_array($request->order_type, ['social_commerce', 'ecommerce'])) {
                 $initialStatus = 'pending_assignment';
             } else {

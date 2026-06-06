@@ -736,6 +736,10 @@ class ExchangeController extends Controller
             }
 
             $targetBatch->increment('quantity', (int) $item['quantity']);
+            $targetBatch->forceFill([
+                'availability' => true,
+                'is_active' => true,
+            ])->save();
 
             if ($barcodeIds->isEmpty()) {
                 // Try to find barcodes that were sold from this order/item

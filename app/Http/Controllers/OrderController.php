@@ -327,6 +327,9 @@ class OrderController extends Controller
         }
 
         $products = Product::whereIn('id', array_values(array_unique($productIds)))->get()->keyBy('id');
+        $barcodeTrackedProductIds = $reservationService->barcodeTrackedProductIds(array_keys($required));
+        $sellableBarcodeCounts = $reservationService->sellableBarcodeQuantitiesByStore(array_keys($required), [$storeId]);
+
         $batches = ProductBatch::whereIn('product_id', array_keys($required))
             ->where('store_id', $storeId)
             ->where('availability', true)
@@ -357,7 +360,15 @@ class OrderController extends Controller
 
         foreach ($required as $productId => $row) {
             $product = $products->get($productId);
-            $physicalQuantity = (int) ($batches->get($productId, collect())->sum('quantity'));
+            $batchPhysicalQuantity = (int) ($batches->get($productId, collect())->sum('quantity'));
+            $usesBarcodeAvailability = !empty($barcodeTrackedProductIds[(int) $productId]);
+            $sellableBarcodeQuantity = (int) ($sellableBarcodeCounts[(int) $storeId][(int) $productId] ?? 0);
+
+            // Manual social-commerce assignment must match the actual barcode packing
+            // workflow. For barcode-tracked products, a restored returned barcode at
+            // this store is the sellable unit even if the old batch/store aggregate is
+            // stale or misleading.
+            $physicalQuantity = $usesBarcodeAvailability ? $sellableBarcodeQuantity : $batchPhysicalQuantity;
             $assignedQuantity = (int) ($assignedByProduct->get($productId)->total_assigned ?? 0);
             $freePhysicalQuantity = max(0, $physicalQuantity - $assignedQuantity);
             $globalAvailable = (int) ($reservedProducts->get($productId)->available_inventory ?? 0);
@@ -373,6 +384,9 @@ class OrderController extends Controller
                 'product_name' => $product?->name ?? $row['product_name'],
                 'required_quantity' => (int) $row['required_quantity'],
                 'physical_quantity' => $physicalQuantity,
+                'batch_physical_quantity' => $batchPhysicalQuantity,
+                'sellable_barcode_quantity' => $sellableBarcodeQuantity,
+                'stock_source' => $usesBarcodeAvailability ? 'barcode_lifecycle' : 'batch_quantity',
                 'assigned_quantity' => $assignedQuantity,
                 'free_physical_quantity' => $freePhysicalQuantity,
                 'global_available' => $globalAvailable,

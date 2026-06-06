@@ -1247,6 +1247,8 @@ class ProductReturnController extends Controller
             }
 
             $targetBatch->quantity += (int) $item['quantity'];
+            $targetBatch->availability = true;
+            $targetBatch->is_active = true;
             $targetBatch->save();
 
             if ($barcodeIds->isEmpty()) {

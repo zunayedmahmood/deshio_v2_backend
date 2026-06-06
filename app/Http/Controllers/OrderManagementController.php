@@ -681,6 +681,10 @@ class OrderManagementController extends Controller
             ->get()
             ->keyBy('product_id');
 
+        $reservationService = app(InventoryReservationService::class);
+        $barcodeTrackedProductIds = $reservationService->barcodeTrackedProductIds($productIds);
+        $sellableBarcodeCounts = $reservationService->sellableBarcodeQuantitiesByStore($productIds, $storeIds);
+
         $batches = ProductBatch::whereIn('product_id', $productIds)
             ->whereIn('store_id', $storeIds)
             ->where('availability', true)
@@ -724,7 +728,15 @@ class OrderManagementController extends Controller
             foreach ($requiredProducts as $productId => $requiredMeta) {
                 $requiredQuantity = (int) $requiredMeta['quantity'];
                 $productBatchesInStore = $batches->get($store->id, collect())->get($productId, collect());
-                $totalPhysicalInStore = (int) $productBatchesInStore->sum('quantity');
+                $batchPhysicalInStore = (int) $productBatchesInStore->sum('quantity');
+                $usesBarcodeAvailability = !empty($barcodeTrackedProductIds[(int) $productId]);
+                $sellableBarcodeQuantity = (int) ($sellableBarcodeCounts[(int) $store->id][(int) $productId] ?? 0);
+
+                // Barcode-tracked products should be judged by barcode lifecycle/location,
+                // not only by product_batches.store_id. This fixes low-stock returns where
+                // the barcode is back in the store but the old batch row is stale or not
+                // store-scoped in the way the social-commerce cart expected.
+                $totalPhysicalInStore = $usesBarcodeAvailability ? $sellableBarcodeQuantity : $batchPhysicalInStore;
                 $alreadyAssignedInStore = (int) ($assignedStoreData->get($productId)->total_assigned ?? 0);
                 $extraAssigned = (int) ($extraAssignedByProduct[$productId] ?? 0);
                 $freePhysicalInStore = max(0, $totalPhysicalInStore - $alreadyAssignedInStore - $extraAssigned);
@@ -748,6 +760,9 @@ class OrderManagementController extends Controller
                     'product_sku' => $requiredMeta['product_sku'],
                     'required_quantity' => $requiredQuantity,
                     'physical_quantity' => $totalPhysicalInStore,
+                    'batch_physical_quantity' => $batchPhysicalInStore,
+                    'sellable_barcode_quantity' => $sellableBarcodeQuantity,
+                    'stock_source' => $usesBarcodeAvailability ? 'barcode_lifecycle' : 'batch_quantity',
                     'assigned_quantity' => $alreadyAssignedInStore,
                     'bulk_selected_quantity' => $extraAssigned,
                     'free_physical_quantity' => $freePhysicalInStore,

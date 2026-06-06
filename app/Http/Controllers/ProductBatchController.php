@@ -70,7 +70,28 @@ class ProductBatchController extends Controller
         if ($request->filled('status')) {
             switch ($request->status) {
                 case 'available':
-                    $query->available();
+                    $storeIdForAvailability = $request->filled('store_id') ? (int) $request->store_id : null;
+                    $query->where(function ($availabilityQuery) use ($storeIdForAvailability) {
+                        // Normal batch-level availability.
+                        $availabilityQuery->where(function ($batchQuery) {
+                            $batchQuery->where('availability', true)
+                                ->where('quantity', '>', 0);
+                        })
+                        // Barcode lifecycle availability. This is important after
+                        // lookup returns/exchanges: POS can sell a restored barcode
+                        // when the barcode is active/sellable and the batch quantity
+                        // is back above zero, even if the batch availability flag was
+                        // left stale as false when stock previously hit zero.
+                        ->orWhere(function ($barcodeBackedQuery) use ($storeIdForAvailability) {
+                            $barcodeBackedQuery->where('quantity', '>', 0)
+                                ->whereHas('barcodes', function ($barcodeQuery) use ($storeIdForAvailability) {
+                                    $barcodeQuery->availableForSale();
+                                    if ($storeIdForAvailability) {
+                                        $barcodeQuery->where('current_store_id', $storeIdForAvailability);
+                                    }
+                                });
+                        });
+                    });
                     break;
                 case 'expired':
                     $query->expired();
@@ -88,10 +109,14 @@ class ProductBatchController extends Controller
             }
         }
 
-        // Filter by barcode
+        // Filter by barcode. Match any unit barcode in the batch, not only
+        // the batch's primary barcode_id. Returned/exchanged units often become
+        // sellable again as individual ProductBarcode rows while the batch primary
+        // barcode may be a different unit.
         if ($request->filled('barcode')) {
-            $query->whereHas('barcode', function ($q) use ($request) {
-                $q->where('barcode', $request->barcode);
+            $barcode = trim((string) $request->barcode);
+            $query->whereHas('barcodes', function ($q) use ($barcode) {
+                $q->where('barcode', $barcode);
             });
         }
 
@@ -106,7 +131,7 @@ class ProductBatchController extends Controller
             if ($term !== '') {
                 $query->where(function ($q) use ($term) {
                     $q->where('batch_number', 'like', "%{$term}%")
-                        ->orWhereHas('barcode', function($bq) use ($term) {
+                        ->orWhereHas('barcodes', function($bq) use ($term) {
                             $bq->where('barcode', 'like', "%{$term}%");
                         })
                         ->orWhereHas('product', function ($productQuery) use ($term) {

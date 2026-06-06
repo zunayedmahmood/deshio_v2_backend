@@ -160,6 +160,32 @@
       </section>
 
       <section class="card span-12">
+        <div class="test-head">
+          <div>
+            <h2>Social-Commerce Return / Exchange / Resale Lifecycle Test</h2>
+            <p>This one-click card creates a temporary product and batch in <code>store_id=1</code>, sells two social-commerce orders, packs them with real barcodes, returns one, exchanges the other, resells the restored barcodes, then deletes the product batch and product.</p>
+          </div>
+          <span class="pill info">End-to-end</span>
+        </div>
+        <ul class="checklist">
+          <li>Creates a product and a Store #1 batch with unit barcodes using the product/batch backend routes.</li>
+          <li>Creates two manually store-assigned social-commerce orders using the same order route as the social-commerce Amount Details page.</li>
+          <li>Packs each order through the same barcode fulfillment route used by the online packing page.</li>
+          <li>Completes the orders so barcode status and batch quantity behave like real sold stock.</li>
+          <li>Confirms a sold barcode cannot be packed into another order before return/exchange.</li>
+          <li>Runs Lookup return and Lookup exchange flows, then resells the restored returned/exchanged barcodes in a fresh social-commerce order.</li>
+          <li>Deletes the batch using Product &gt; Batch deletion logic and confirms deleted-batch barcodes cannot be packed.</li>
+          <li>Deletes the product after its batches are gone.</li>
+        </ul>
+        <div class="actions">
+          <button id="runLifecycleBtn" class="green">Run lifecycle test</button>
+          <span id="lifecycleStatus" class="status">Waiting.</span>
+        </div>
+        <div id="lifecycleSummary" class="actions"></div>
+        <div id="lifecycleTests" class="tests"></div>
+      </section>
+
+      <section class="card span-12">
         <h2>Raw Output</h2>
         <pre id="rawOutput">[]</pre>
       </section>
@@ -394,6 +420,64 @@
       `).join('');
     }
 
+    function renderLifecycleResult(body) {
+      const summary = body?.data?.summary || {};
+      $('lifecycleSummary').innerHTML = `
+        <span class="pill ${body.success ? 'ok' : 'bad'}">${body.success ? 'Passed' : 'Completed with failures'}</span>
+        <span class="pill info">Total: ${summary.total || 0}</span>
+        <span class="pill ok">Passed: ${summary.passed || 0}</span>
+        <span class="pill bad">Failed: ${summary.failed || 0}</span>
+      `;
+
+      const tests = body?.data?.tests || [];
+      $('lifecycleTests').innerHTML = tests.map((test) => `
+        <div class="test-row">
+          <div class="test-head">
+            <strong>${escapeHtml(test.name)}</strong>
+            <span class="pill ${test.passed ? 'ok' : 'bad'}">${test.passed ? 'PASS' : 'FAIL'}</span>
+          </div>
+          <p><strong>Doing:</strong> ${escapeHtml(test.what_doing || '')}</p>
+          <p><strong>Tested:</strong> ${escapeHtml(test.what_tested || '')}</p>
+          <p><strong>Should happen:</strong> ${escapeHtml(test.should_happen || test.expected || '')}</p>
+          <p><strong>What happened:</strong> ${escapeHtml(test.dumb_explanation || '')}</p>
+          ${test.route_like ? `<p class="mini"><strong>Route/process used:</strong> ${escapeHtml(test.route_like)}</p>` : ''}
+          <details>
+            <summary class="mini">Raw actual result details</summary>
+            <pre>${escapeHtml(JSON.stringify(test.actual, null, 2))}</pre>
+          </details>
+        </div>
+      `).join('');
+    }
+
+    async function runLifecycleWorkflowTest() {
+      const ok = await ensureLogin();
+      if (!ok) return;
+
+      $('lifecycleStatus').textContent = 'Running lifecycle diagnostic...';
+      $('lifecycleTests').innerHTML = '';
+      $('lifecycleSummary').innerHTML = '';
+      setBusy($('runLifecycleBtn'), true, 'Running...');
+
+      try {
+        const res = await fetch(`${baseUrl()}/api/social-commerce-lifecycle-test/run`, {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({}),
+        });
+        const body = await readJson(res);
+        pushResult('Social Commerce Lifecycle Test', { status: res.status, ok: res.ok, body });
+        renderLifecycleResult(body);
+        $('lifecycleStatus').innerHTML = body.success
+          ? '<span class="ok">Lifecycle diagnostic passed.</span>'
+          : '<span class="bad">Lifecycle completed with failures. Check failed rows.</span>';
+      } catch (error) {
+        pushResult('Social Commerce Lifecycle Test Error', { message: error.message });
+        $('lifecycleStatus').innerHTML = `<span class="bad">${escapeHtml(error.message)}</span>`;
+      } finally {
+        setBusy($('runLifecycleBtn'), false, 'Run lifecycle test');
+      }
+    }
+
     function escapeHtml(value) {
       return String(value)
         .replaceAll('&', '&amp;')
@@ -446,6 +530,7 @@
     });
     $('runProbeBtn').addEventListener('click', runPageApiProbe);
     $('runBulkBtn').addEventListener('click', runBulkAssignmentTest);
+    $('runLifecycleBtn').addEventListener('click', runLifecycleWorkflowTest);
     $('frontendUrl').addEventListener('input', updateFrontendLink);
 
     setAuthBadge();

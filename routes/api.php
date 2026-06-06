@@ -299,6 +299,7 @@ Route::middleware('auth:api')->group(function () {
     Route::post('/barcode-mapping-test/run', [\App\Http\Controllers\BarcodeMappingTestController::class, 'run']);
     Route::post('/bulk-store-assignment-test/run', [\App\Http\Controllers\BulkStoreAssignmentTestController::class, 'run']);
     Route::post('/social-commerce-lifecycle-test/run', [\App\Http\Controllers\SocialCommerceLifecycleTestController::class, 'run']);
+    Route::post('/low-stock-edge-test/run', [\App\Http\Controllers\LowStockEdgeTestController::class, 'run']);
 });
 
 // Protected routes

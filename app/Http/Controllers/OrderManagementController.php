@@ -8,6 +8,7 @@ use App\Models\ProductBatch;
 use App\Models\ReservedProduct;
 use App\Models\ProductBarcode;
 use App\Models\Store;
+use App\Services\InventoryReservationService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
@@ -18,6 +19,34 @@ class OrderManagementController extends Controller
     public function __construct()
     {
         $this->middleware('auth:api'); // Employee authentication
+    }
+
+    /**
+     * Keep social-commerce availability checks in sync with the same live stock
+     * reality that Product List shows.
+     *
+     * Product List computes reserved/available stock live from batches + open
+     * order rows. The social-commerce cart availability path uses the
+     * reserved_products table for the global availability guard. After low-stock
+     * return/exchange workflows, that table can be stale unless we rebuild it
+     * immediately before answering "can this store fulfill this cart?".
+     */
+    private function syncReservationRowsForProducts(array $productIds): void
+    {
+        $productIds = collect($productIds)
+            ->map(fn ($id) => (int) $id)
+            ->filter(fn ($id) => $id > 0)
+            ->unique()
+            ->values();
+
+        if ($productIds->isEmpty()) {
+            return;
+        }
+
+        $service = app(InventoryReservationService::class);
+        foreach ($productIds as $productId) {
+            $service->syncProduct((int) $productId);
+        }
     }
 
     /**
@@ -256,6 +285,7 @@ class OrderManagementController extends Controller
 
             $stores = $storesQuery->get();
             $requiredProducts = $this->requiredProductQuantitiesFromPayload((array) $request->input('items', []));
+            $this->syncReservationRowsForProducts(array_keys($requiredProducts));
             $rows = $this->buildStoreFulfillmentRowsForRequiredProducts($requiredProducts, $stores, [], null, true);
 
             return response()->json([
@@ -641,6 +671,10 @@ class OrderManagementController extends Controller
 
         if (empty($productIds)) {
             return [];
+        }
+
+        if ($respectGlobalAvailability) {
+            $this->syncReservationRowsForProducts($productIds);
         }
 
         $reservedProducts = ReservedProduct::whereIn('product_id', $productIds)

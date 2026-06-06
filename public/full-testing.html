@@ -185,6 +185,30 @@
         <div id="lifecycleTests" class="tests"></div>
       </section>
 
+
+      <section class="card span-12">
+        <div class="test-head">
+          <div>
+            <h2>Low Stock Return / Exchange Addability Edge Test</h2>
+            <p>This card tests the bug where Product List shows returned/exchanged stock again, but social-commerce still says <code>Product not available in this store</code>. It follows the real social-commerce cart availability, order, package, return, and exchange routes.</p>
+          </div>
+          <span class="pill info">Low-stock edge</span>
+        </div>
+        <ul class="checklist">
+          <li>Creates a product with exactly one unit in <code>store_id=1</code>, sells it through social-commerce, then returns it from the Lookup return flow.</li>
+          <li>Confirms the product becomes addable again in social-commerce after return, not only visible in Product List.</li>
+          <li>Intentionally corrupts <code>reserved_products</code> to simulate the old stale-table bug and confirms the real cart availability route self-heals it.</li>
+          <li>Creates a second product with three units, sells one, exchanges it, and confirms restored + remaining stock can still be added/sold through social-commerce.</li>
+          <li>Negative tests confirm sold/replacement barcodes cannot be packed again before they are truly returned/restored.</li>
+          <li>Runs step-by-step and keeps going even when one step fails, so QA can see exactly where the workflow broke.</li>
+        </ul>
+        <div class="actions">
+          <button id="runLowStockEdgeBtn" class="green">Run low stock edge test</button>
+          <span id="lowStockEdgeStatus" class="status">Waiting.</span>
+        </div>
+        <div id="lowStockEdgeSummary" class="actions"></div>
+        <div id="lowStockEdgeTests" class="tests"></div>
+      </section>
       <section class="card span-12">
         <h2>Raw Output</h2>
         <pre id="rawOutput">[]</pre>
@@ -449,6 +473,36 @@
       `).join('');
     }
 
+
+    function renderLowStockEdgeResult(body) {
+      const summary = body?.data?.summary || {};
+      $('lowStockEdgeSummary').innerHTML = `
+        <span class="pill ${body.success ? 'ok' : 'bad'}">${body.success ? 'Passed' : 'Completed with failures'}</span>
+        <span class="pill info">Total: ${summary.total || 0}</span>
+        <span class="pill ok">Passed: ${summary.passed || 0}</span>
+        <span class="pill bad">Failed: ${summary.failed || 0}</span>
+      `;
+
+      const tests = body?.data?.tests || [];
+      $('lowStockEdgeTests').innerHTML = tests.map((test) => `
+        <div class="test-row">
+          <div class="test-head">
+            <strong>${escapeHtml(test.name)}</strong>
+            <span class="pill ${test.passed ? 'ok' : 'bad'}">${test.passed ? 'PASS' : 'FAIL'}</span>
+          </div>
+          <p><strong>Doing:</strong> ${escapeHtml(test.what_doing || '')}</p>
+          <p><strong>Tested:</strong> ${escapeHtml(test.what_tested || '')}</p>
+          <p><strong>Should happen:</strong> ${escapeHtml(test.should_happen || test.expected || '')}</p>
+          <p><strong>What happened:</strong> ${escapeHtml(test.dumb_explanation || '')}</p>
+          ${test.route_like ? `<p class="mini"><strong>Route/process used:</strong> ${escapeHtml(test.route_like)}</p>` : ''}
+          <details>
+            <summary class="mini">Raw actual result details</summary>
+            <pre>${escapeHtml(JSON.stringify(test.actual, null, 2))}</pre>
+          </details>
+        </div>
+      `).join('');
+    }
+
     async function runLifecycleWorkflowTest() {
       const ok = await ensureLogin();
       if (!ok) return;
@@ -475,6 +529,36 @@
         $('lifecycleStatus').innerHTML = `<span class="bad">${escapeHtml(error.message)}</span>`;
       } finally {
         setBusy($('runLifecycleBtn'), false, 'Run lifecycle test');
+      }
+    }
+
+
+    async function runLowStockEdgeTest() {
+      const ok = await ensureLogin();
+      if (!ok) return;
+
+      $('lowStockEdgeStatus').textContent = 'Running low-stock edge diagnostic...';
+      $('lowStockEdgeTests').innerHTML = '';
+      $('lowStockEdgeSummary').innerHTML = '';
+      setBusy($('runLowStockEdgeBtn'), true, 'Running...');
+
+      try {
+        const res = await fetch(`${baseUrl()}/api/low-stock-edge-test/run`, {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({}),
+        });
+        const body = await readJson(res);
+        pushResult('Low Stock Edge Test', { status: res.status, ok: res.ok, body });
+        renderLowStockEdgeResult(body);
+        $('lowStockEdgeStatus').innerHTML = body.success
+          ? '<span class="ok">Low-stock edge diagnostic passed.</span>'
+          : '<span class="bad">Low-stock edge completed with failures. Check failed rows.</span>';
+      } catch (error) {
+        pushResult('Low Stock Edge Test Error', { message: error.message });
+        $('lowStockEdgeStatus').innerHTML = `<span class="bad">${escapeHtml(error.message)}</span>`;
+      } finally {
+        setBusy($('runLowStockEdgeBtn'), false, 'Run low stock edge test');
       }
     }
 
@@ -531,6 +615,7 @@
     $('runProbeBtn').addEventListener('click', runPageApiProbe);
     $('runBulkBtn').addEventListener('click', runBulkAssignmentTest);
     $('runLifecycleBtn').addEventListener('click', runLifecycleWorkflowTest);
+    $('runLowStockEdgeBtn').addEventListener('click', runLowStockEdgeTest);
     $('frontendUrl').addEventListener('input', updateFrontendLink);
 
     setAuthBadge();

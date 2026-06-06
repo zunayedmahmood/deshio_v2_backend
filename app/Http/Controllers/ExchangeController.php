@@ -427,6 +427,16 @@ class ExchangeController extends Controller
 
             DB::commit();
 
+            $affectedProductIds = collect($request->removedProducts)
+                ->pluck('product_id')
+                ->merge(collect($request->replacementProducts)->pluck('product_id'))
+                ->filter()
+                ->unique();
+
+            foreach ($affectedProductIds as $productId) {
+                app(\App\Services\InventoryReservationService::class)->syncProduct((int) $productId);
+            }
+
             return response()->json([
                 'success' => true,
                 'message' => 'Exchange processed successfully.',

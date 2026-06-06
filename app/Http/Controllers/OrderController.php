@@ -321,6 +321,11 @@ class OrderController extends Controller
             return ['can_fulfill' => true, 'items' => []];
         }
 
+        $reservationService = app(InventoryReservationService::class);
+        foreach (array_keys($required) as $productId) {
+            $reservationService->syncProduct((int) $productId);
+        }
+
         $products = Product::whereIn('id', array_values(array_unique($productIds)))->get()->keyBy('id');
         $batches = ProductBatch::whereIn('product_id', array_keys($required))
             ->where('store_id', $storeId)
@@ -701,6 +706,11 @@ class OrderController extends Controller
                         throw new \Exception("Insufficient local stock for {$product->name}. Available: {$batch->quantity}");
                     }
                     
+                    // Keep global reservation row fresh before checking it. This
+                    // avoids low-stock return/exchange drift where Product List
+                    // shows stock but social-commerce still sees stale zero.
+                    app(InventoryReservationService::class)->syncProduct((int) $product->id);
+
                     // NEW LOGIC: Check global reservation table
                     $reservedRecord = \App\Models\ReservedProduct::where('product_id', $product->id)->lockForUpdate()->first();
                     $globalAvailable = $reservedRecord ? $reservedRecord->available_inventory : 0;
@@ -711,6 +721,7 @@ class OrderController extends Controller
                 } elseif (in_array($request->order_type, ['social_commerce', 'ecommerce'])) {
                     // Online orders are unassigned at creation, but they must still respect
                     // global available stock before entering the assignment queue.
+                    app(InventoryReservationService::class)->syncProduct((int) $product->id);
                     $reservedRecord = \App\Models\ReservedProduct::where('product_id', $product->id)->lockForUpdate()->first();
                     $globalAvailable = $reservedRecord ? $reservedRecord->available_inventory : 0;
 
@@ -2105,6 +2116,10 @@ class OrderController extends Controller
                 'status' => 'confirmed',
                 'confirmed_at' => now(),
             ]);
+
+            foreach ($order->items->pluck('product_id')->filter()->unique() as $productId) {
+                app(InventoryReservationService::class)->syncProduct((int) $productId);
+            }
 
             // Update customer purchase stats
             $order->customer->recordPurchase($order->total_amount, $order->id);

@@ -290,6 +290,8 @@ class ProductBatchController extends Controller
 
             DB::commit();
 
+            app(InventoryReservationService::class)->syncProduct((int) $request->product_id);
+
             $response = [
                 'success' => true,
                 'message' => $skipBarcodes 

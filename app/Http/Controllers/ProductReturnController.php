@@ -391,6 +391,10 @@ class ProductReturnController extends Controller
             $return->save();
             DB::commit();
 
+            foreach (collect($returnItems)->pluck('product_id')->filter()->unique() as $productId) {
+                app(\App\Services\InventoryReservationService::class)->syncProduct((int) $productId);
+            }
+
             return response()->json([
                 'success' => true,
                 'message' => 'Return quick-completed successfully',

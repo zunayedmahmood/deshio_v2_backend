@@ -13,6 +13,7 @@ use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
+use App\Services\InventoryReservationService;
 
 class ProductBatchController extends Controller
 {
@@ -675,6 +676,330 @@ class ProductBatchController extends Controller
                 'message' => 'Failed to delete batch: ' . $e->getMessage()
             ], 500);
         }
+    }
+
+
+    /**
+     * Preview the destructive stock reset used by Inventory > Delete Bulk Batch.
+     *
+     * POST /api/batches/delete-bulk-batch/preview
+     */
+    public function previewBulkDeleteRecreate(Request $request)
+    {
+        $this->normalizeBulkDeletePriceInput($request);
+
+        $validator = Validator::make($request->all(), [
+            'product_id' => 'required|exists:products,id',
+            'store_id' => 'required|exists:stores,id',
+            'quantity' => 'required|integer|min:1|max:10000',
+            'cost_price' => 'required|numeric|min:0',
+            'sell_price' => 'required|numeric|min:0',
+        ], [
+            'cost_price.required' => 'Cost price is required before previewing the stock reset.',
+            'sell_price.required' => 'Selling price is required before previewing the stock reset.',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $product = Product::findOrFail($request->product_id);
+        $store = Store::findOrFail($request->store_id);
+        $summary = $this->buildBulkDeleteRecreateSummary($product, $store, (int) $request->quantity, $request);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Preview ready. Confirm only if this stock reset is intentional.',
+            'data' => $summary,
+        ]);
+    }
+
+    /**
+     * Delete all existing batches for a product, log their barcodes as blocked,
+     * then create one fresh batch under the selected store with fresh unit barcodes.
+     *
+     * POST /api/batches/delete-bulk-batch/confirm
+     */
+    public function bulkDeleteRecreate(Request $request)
+    {
+        $this->normalizeBulkDeletePriceInput($request);
+
+        $validator = Validator::make($request->all(), [
+            'product_id' => 'required|exists:products,id',
+            'store_id' => 'required|exists:stores,id',
+            'quantity' => 'required|integer|min:1|max:10000',
+            'cost_price' => 'required|numeric|min:0',
+            'sell_price' => 'required|numeric|min:0',
+            'barcode_type' => 'nullable|string|in:CODE128,EAN13,QR',
+        ], [
+            'cost_price.required' => 'Cost price is required before confirming the stock reset.',
+            'sell_price.required' => 'Selling price is required before confirming the stock reset.',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $productId = (int) $request->product_id;
+        $storeId = (int) $request->store_id;
+        $quantity = (int) $request->quantity;
+
+        DB::beginTransaction();
+        try {
+            $product = Product::lockForUpdate()->findOrFail($productId);
+            $store = Store::findOrFail($storeId);
+
+            $oldBatches = ProductBatch::with(['product', 'store'])
+                ->where('product_id', $productId)
+                ->orderBy('id')
+                ->get();
+
+            $priceSource = $this->resolveBulkBatchPrices($productId, $request);
+            $deletedSummaries = [];
+            $deletedBatches = 0;
+            $deletedUnits = 0;
+            $blockedBarcodes = 0;
+
+            foreach ($oldBatches as $batch) {
+                $deletedUnits += (int) $batch->quantity;
+                $deletedSummaries[] = $this->deleteBatchInsideTransaction($batch);
+                $deletedBatches++;
+                $blockedBarcodes += (int) end($deletedSummaries)['barcodes_logged'];
+            }
+
+            $created = $this->createBatchInsideTransaction([
+                'product_id' => $productId,
+                'store_id' => $storeId,
+                'quantity' => $quantity,
+                'cost_price' => (float) $priceSource['cost_price'],
+                'sell_price' => (float) $priceSource['sell_price'],
+                'barcode_type' => $request->input('barcode_type', 'CODE128'),
+                'notes' => 'Created from Delete Bulk Batch stock reset after deleting previous batches across all stores.',
+            ]);
+
+            DB::commit();
+
+            if (class_exists(InventoryReservationService::class)) {
+                app(InventoryReservationService::class)->syncProduct($productId);
+            }
+
+            if (method_exists(MasterInventory::class, 'syncProductInventory')) {
+                MasterInventory::syncProductInventory($productId);
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => "Stock updated. {$deletedBatches} old batch(es) deleted, {$blockedBarcodes} old barcode(s) blocked, and {$quantity} fresh barcode(s) generated.",
+                'data' => [
+                    'product' => [
+                        'id' => $product->id,
+                        'name' => $product->name,
+                        'sku' => $product->sku,
+                    ],
+                    'store' => [
+                        'id' => $store->id,
+                        'name' => $store->name,
+                    ],
+                    'deleted_batches' => $deletedBatches,
+                    'deleted_units' => $deletedUnits,
+                    'blocked_barcodes' => $blockedBarcodes,
+                    'deleted_batch_details' => $deletedSummaries,
+                    'created_batch' => $this->formatBatchResponse($created['batch']->fresh(['product.images', 'store', 'barcode']), true),
+                    'barcodes_generated' => count($created['barcodes']),
+                    'all_barcodes' => collect($created['barcodes'])->map(function ($bc) {
+                        return [
+                            'id' => $bc->id,
+                            'barcode' => $bc->barcode,
+                            'type' => $bc->type,
+                            'is_primary' => (bool) $bc->is_primary,
+                        ];
+                    })->values(),
+                    'price_source' => $priceSource,
+                ],
+            ], 201);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to update stock: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    private function buildBulkDeleteRecreateSummary(Product $product, Store $store, int $quantity, Request $request): array
+    {
+        $batches = ProductBatch::with('store')
+            ->where('product_id', $product->id)
+            ->orderBy('created_at', 'desc')
+            ->get();
+
+        $batchIds = $batches->pluck('id')->all();
+        $barcodesToBlock = empty($batchIds)
+            ? 0
+            : ProductBarcode::whereIn('batch_id', $batchIds)->count();
+
+        $priceSource = $this->resolveBulkBatchPrices($product->id, $request);
+
+        return [
+            'product' => [
+                'id' => $product->id,
+                'name' => $product->name,
+                'sku' => $product->sku,
+            ],
+            'target_store' => [
+                'id' => $store->id,
+                'name' => $store->name,
+                'type' => $store->is_warehouse ? 'warehouse' : ($store->is_online ? 'online' : 'retail'),
+            ],
+            'new_stock_count' => $quantity,
+            'existing_batches' => $batches->count(),
+            'existing_units' => (int) $batches->sum('quantity'),
+            'barcodes_to_block' => $barcodesToBlock,
+            'old_batches' => $batches->map(function ($batch) {
+                return [
+                    'id' => $batch->id,
+                    'batch_number' => $batch->batch_number,
+                    'store_id' => $batch->store_id,
+                    'store_name' => $batch->store?->name,
+                    'quantity' => (int) $batch->quantity,
+                    'cost_price' => (float) $batch->cost_price,
+                    'sell_price' => (float) $batch->sell_price,
+                    'created_at' => $batch->created_at?->format('Y-m-d H:i:s'),
+                ];
+            })->values(),
+            'new_batch' => [
+                'store_id' => $store->id,
+                'store_name' => $store->name,
+                'quantity' => $quantity,
+                'cost_price' => (float) $priceSource['cost_price'],
+                'sell_price' => (float) $priceSource['sell_price'],
+            ],
+            'price_source' => $priceSource,
+            'warnings' => [
+                'This will permanently delete every current batch for this exact product across every store.',
+                'Old unit barcodes will be recorded in batch_deleted_barcodes and blocked from POS/social-commerce packing.',
+                'Lookup return/exchange will still be able to process those old barcodes.',
+                'Cost price and selling price are required manual inputs for this reset. The backend will not guess prices from older batches.',
+            ],
+        ];
+    }
+
+    private function normalizeBulkDeletePriceInput(Request $request): void
+    {
+        if (!$request->filled('sell_price') && $request->filled('selling_price')) {
+            $request->merge(['sell_price' => $request->input('selling_price')]);
+        }
+    }
+
+    private function resolveBulkBatchPrices(int $productId, Request $request): array
+    {
+        return [
+            'source' => 'manual_input',
+            'source_batch_id' => null,
+            'source_batch_number' => null,
+            'cost_price' => (float) $request->input('cost_price'),
+            'sell_price' => (float) $request->input('sell_price'),
+        ];
+    }
+
+    private function deleteBatchInsideTransaction(ProductBatch $batch): array
+    {
+        $productId = $batch->product_id;
+        $batchNumber = $batch->batch_number;
+        $storeId = $batch->store_id;
+        $storeName = $batch->store?->name;
+
+        $poItem = PurchaseOrderItem::with('purchaseOrder')
+            ->where('product_batch_id', $batch->id)
+            ->first();
+
+        $barcodes = ProductBarcode::where('batch_id', $batch->id)
+            ->get(['id', 'batch_id', 'product_id']);
+
+        foreach ($barcodes as $barcode) {
+            BatchDeletedBarcode::updateOrCreate(
+                ['product_barcode_id' => $barcode->id],
+                [
+                    'deleted_product_batch_id' => $batch->id,
+                    'deleted_batch_number' => $batchNumber,
+                    'product_id' => $barcode->product_id ?: $productId,
+                    'store_id' => $storeId,
+                    'store_name' => $storeName,
+                    'purchase_order_id' => $poItem?->purchase_order_id,
+                    'purchase_order_number' => $poItem?->purchaseOrder?->po_number,
+                    'deleted_by' => auth()->id(),
+                    'deleted_at' => now(),
+                ]
+            );
+        }
+
+        ProductBarcode::where('batch_id', $batch->id)->update(['batch_id' => null]);
+        $batch->delete();
+
+        return [
+            'deleted_batch_id' => (int) $batch->id,
+            'deleted_batch_number' => $batchNumber,
+            'store_id' => $storeId,
+            'store_name' => $storeName,
+            'quantity' => (int) $batch->quantity,
+            'barcodes_logged' => $barcodes->count(),
+        ];
+    }
+
+    private function createBatchInsideTransaction(array $data): array
+    {
+        $batch = ProductBatch::create([
+            'product_id' => $data['product_id'],
+            'store_id' => $data['store_id'],
+            'quantity' => $data['quantity'],
+            'cost_price' => $data['cost_price'],
+            'sell_price' => $data['sell_price'],
+            'tax_percentage' => $data['tax_percentage'] ?? 0,
+            'availability' => true,
+            'manufactured_date' => $data['manufactured_date'] ?? null,
+            'expiry_date' => $data['expiry_date'] ?? null,
+            'notes' => $data['notes'] ?? null,
+            'is_active' => true,
+        ]);
+
+        $store = Store::find($data['store_id']);
+        $initialStatus = $store && $store->is_warehouse ? 'in_warehouse' : 'in_shop';
+        $barcodeType = $data['barcode_type'] ?? 'CODE128';
+        $barcodes = [];
+
+        for ($i = 0; $i < (int) $data['quantity']; $i++) {
+            $barcode = ProductBarcode::create([
+                'product_id' => $data['product_id'],
+                'batch_id' => $batch->id,
+                'type' => $barcodeType,
+                'is_primary' => ($i === 0),
+                'is_active' => true,
+                'generated_at' => now(),
+                'current_store_id' => $data['store_id'],
+                'current_status' => $initialStatus,
+                'location_updated_at' => now(),
+            ]);
+
+            $barcodes[] = $barcode;
+
+            if ($i === 0) {
+                $batch->update(['barcode_id' => $barcode->id]);
+            }
+        }
+
+        return [
+            'batch' => $batch,
+            'barcodes' => $barcodes,
+        ];
     }
 
     /**

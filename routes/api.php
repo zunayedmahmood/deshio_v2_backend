@@ -1449,6 +1449,8 @@ Route::middleware('auth:api')->group(function () {
         Route::get('/low-stock', [ProductBatchController::class, 'getLowStock']);
         Route::get('/expiring-soon', [ProductBatchController::class, 'getExpiringSoon']);
         Route::get('/expired', [ProductBatchController::class, 'getExpired']);
+        Route::post('/delete-bulk-batch/preview', [ProductBatchController::class, 'previewBulkDeleteRecreate']);
+        Route::post('/delete-bulk-batch/confirm', [ProductBatchController::class, 'bulkDeleteRecreate']);
 
         Route::prefix('{id}')->group(function () {
             Route::get('/', [ProductBatchController::class, 'show']);

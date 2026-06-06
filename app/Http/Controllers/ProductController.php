@@ -903,7 +903,7 @@ class ProductController extends Controller
             'active_products' => Product::where('is_archived', false)->count(),
             'archived_products' => Product::where('is_archived', true)->count(),
             'by_category' => Product::where('is_archived', false)
-                ->with('category:id,name')
+                ->with('category:id,title')
                 ->get()
                 ->groupBy('category_id')
                 ->map(function($group) {

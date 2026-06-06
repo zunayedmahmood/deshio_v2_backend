@@ -41,6 +41,26 @@ class Store extends Model
         'opening_hours' => 'array',
     ];
 
+    /**
+     * Backward-compatible computed store type.
+     *
+     * The stores table does not have a physical `store_type` column. Some
+     * lookup/scan responses expose `store_type`, so compute it from the
+     * real schema fields instead of selecting a missing column.
+     */
+    public function getStoreTypeAttribute()
+    {
+        if (!empty($this->attributes['is_warehouse'])) {
+            return 'warehouse';
+        }
+
+        if (!empty($this->attributes['is_online'])) {
+            return 'online';
+        }
+
+        return 'store';
+    }
+
     public function scopeActive($query)
     {
         return $query->where('is_active', true);

@@ -784,7 +784,7 @@ $totalProducts = (int) ($inventorySummary['total_products'] ?? 0);
             $productIds = $slowMoving->pluck('product_id');
             $products = Product::whereIn('id', $productIds)
                 ->select('id', 'name', 'sku', 'category_id')
-                ->with('category:id,name')
+                ->with('category:id,title')
                 ->get()
                 ->keyBy('id');
 

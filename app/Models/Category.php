@@ -192,6 +192,18 @@ class Category extends Model
     /**
      * Get the full URL for the category image
      */
+    /**
+     * Backward-compatible alias used by older product/order/lookup payloads.
+     *
+     * The categories table stores the display label in `title`, not `name`.
+     * Several API payloads still expose `category.name` for the frontend, so
+     * keep that response shape without querying a non-existent SQL column.
+     */
+    public function getNameAttribute()
+    {
+        return $this->attributes['name'] ?? $this->attributes['title'] ?? null;
+    }
+
     public function getImageUrlAttribute()
     {
         return MediaUrl::toPublicUrl($this->image);

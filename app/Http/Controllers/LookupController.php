@@ -537,11 +537,11 @@ class LookupController extends Controller
     {
         $barcodeRecord = ProductBarcode::with([
             'product:id,category_id,vendor_id,sku,name,description,brand',
-            'product.category:id,name',
-            'product.vendor:id,name,company_name',
-            'batch:id,product_id,store_id,batch_number,quantity,cost_price,sell_price,status,manufactured_date,expiry_date',
+            'product.category:id,title',
+            'product.vendor:id,name',
+            'batch:id,product_id,store_id,batch_number,quantity,cost_price,sell_price,availability,is_active,manufactured_date,expiry_date',
             'batch.store:id,name,store_code',
-            'currentStore:id,name,store_code,store_type,address,phone',
+            'currentStore:id,name,store_code,is_warehouse,is_online,address,phone',
             'deletedPurchaseOrderLink',
             'batchDeletedLink',
         ])->where('barcode', $barcode)->first();

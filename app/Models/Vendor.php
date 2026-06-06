@@ -30,6 +30,19 @@ class Vendor extends Model
         'is_active' => 'boolean',
     ];
 
+    /**
+     * Backward-compatible alias used by older lookup/product payloads.
+     *
+     * The vendors table stores the display label in `name`. Some legacy code
+     * still exposes `company_name`, but that column is not present in the
+     * current Deshio schema. Keep the response shape without querying a
+     * non-existent SQL column.
+     */
+    public function getCompanyNameAttribute()
+    {
+        return $this->attributes['company_name'] ?? $this->attributes['name'] ?? null;
+    }
+
     public function scopeActive($query)
     {
         return $query->where('is_active', true);

@@ -40,6 +40,10 @@ class LookupController extends Controller
             ], 422);
         }
 
+        if ($request->boolean('quick') || $request->boolean('scan_only')) {
+            return $this->quickProductLookup($request->barcode);
+        }
+
         // Find the barcode
         $barcodeRecord = ProductBarcode::with([
             'product.category',
@@ -514,6 +518,155 @@ class LookupController extends Controller
                     'is_batch_deleted' => (bool) (($deletedPoLink || $deletedBatchLink) && !$barcodeRecord->batch),
                     'is_deleted_by_batch_delete' => (bool) $deletedBatchLink,
                 ],
+            ]
+        ]);
+    }
+
+
+
+    /**
+     * Lightweight barcode lookup for return/exchange modal scans.
+     *
+     * The normal productLookup() endpoint intentionally builds a full lifecycle
+     * report. That includes activity-log JSON searches, sales/return/dispatch
+     * history, and PO/vendor aggregates. Those are useful for the Lookup page,
+     * but they are far too expensive when a modal only needs to add one scanned
+     * replacement barcode. This quick path returns only the data the modal needs.
+     */
+    private function quickProductLookup(string $barcode)
+    {
+        $barcodeRecord = ProductBarcode::with([
+            'product:id,category_id,vendor_id,sku,name,description,brand',
+            'product.category:id,name',
+            'product.vendor:id,name,company_name',
+            'batch:id,product_id,store_id,batch_number,quantity,cost_price,sell_price,status,manufactured_date,expiry_date',
+            'batch.store:id,name,store_code',
+            'currentStore:id,name,store_code,store_type,address,phone',
+            'deletedPurchaseOrderLink',
+            'batchDeletedLink',
+        ])->where('barcode', $barcode)->first();
+
+        if (!$barcodeRecord) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Barcode not found'
+            ], 404);
+        }
+
+        $deletedPoLink = $barcodeRecord->deletedPurchaseOrderLink;
+        $deletedBatchLink = $barcodeRecord->batchDeletedLink;
+        $isAvailable = $barcodeRecord->isAvailableForSale();
+        $saleBlockReason = null;
+
+        if ($deletedPoLink) {
+            $saleBlockReason = 'This barcode belongs to a deleted purchase order. It cannot be sold or used as an exchange replacement until returned/exchanged from Lookup.';
+        } elseif ($deletedBatchLink) {
+            $saleBlockReason = 'This barcode belongs to a deleted batch. It cannot be sold or used as an exchange replacement until returned/exchanged from Lookup.';
+        } elseif (!$isAvailable) {
+            $saleBlockReason = 'This barcode is not available for sale/exchange replacement. It may already be sold, inactive, defective, or outside sellable stock status.';
+        }
+
+        $batchInfo = null;
+        if ($barcodeRecord->batch) {
+            $batchInfo = [
+                'id' => $barcodeRecord->batch->id,
+                'batch_number' => $barcodeRecord->batch->batch_number,
+                'quantity' => $barcodeRecord->batch->quantity,
+                'cost_price' => $barcodeRecord->batch->cost_price,
+                'sell_price' => $barcodeRecord->batch->sell_price,
+                'selling_price' => $barcodeRecord->batch->sell_price,
+                'status' => $barcodeRecord->batch->status,
+                'manufactured_date' => $barcodeRecord->batch->manufactured_date?->format('Y-m-d'),
+                'expiry_date' => $barcodeRecord->batch->expiry_date?->format('Y-m-d'),
+                'original_store' => $barcodeRecord->batch->store ? [
+                    'id' => $barcodeRecord->batch->store->id,
+                    'name' => $barcodeRecord->batch->store->name,
+                    'store_code' => $barcodeRecord->batch->store->store_code,
+                ] : null,
+            ];
+        } elseif ($deletedPoLink || $deletedBatchLink) {
+            $batchInfo = [
+                'id' => null,
+                'batch_number' => 'Batch deleted',
+                'deleted' => true,
+                'source' => $deletedBatchLink ? 'batch_deleted_barcodes' : 'deleted_purchase_order_barcodes',
+                'deleted_product_batch_id' => $deletedBatchLink?->deleted_product_batch_id ?? $deletedPoLink?->deleted_product_batch_id,
+                'deleted_batch_number' => $deletedBatchLink?->deleted_batch_number ?? $deletedPoLink?->deleted_batch_number,
+                'quantity' => null,
+                'cost_price' => null,
+                'sell_price' => null,
+                'selling_price' => null,
+                'status' => 'deleted',
+            ];
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'lookup_mode' => 'quick',
+                'product' => [
+                    'id' => $barcodeRecord->product->id,
+                    'sku' => $barcodeRecord->product->sku,
+                    'name' => $barcodeRecord->product->name,
+                    'description' => $barcodeRecord->product->description,
+                    'brand' => $barcodeRecord->product->brand,
+                    'category' => $barcodeRecord->product->category ? [
+                        'id' => $barcodeRecord->product->category->id,
+                        'name' => $barcodeRecord->product->category->name,
+                    ] : null,
+                    'vendor' => $barcodeRecord->product->vendor ? [
+                        'id' => $barcodeRecord->product->vendor->id,
+                        'name' => $barcodeRecord->product->vendor->name,
+                        'company_name' => $barcodeRecord->product->vendor->company_name,
+                    ] : null,
+                ],
+                'barcode' => [
+                    'id' => $barcodeRecord->id,
+                    'product_id' => $barcodeRecord->product_id,
+                    'batch_id' => $barcodeRecord->batch_id,
+                    'current_store_id' => $barcodeRecord->current_store_id,
+                    'barcode' => $barcodeRecord->barcode,
+                    'type' => $barcodeRecord->type,
+                    'is_active' => $barcodeRecord->is_active,
+                    'is_defective' => $barcodeRecord->is_defective,
+                    'current_status' => $barcodeRecord->current_status,
+                    'batch' => $batchInfo,
+                ],
+                'barcode_id' => $barcodeRecord->id,
+                'barcode_number' => $barcodeRecord->barcode,
+                'current_status' => $barcodeRecord->current_status,
+                'is_available' => $isAvailable,
+                'is_available_for_sale' => $isAvailable,
+                'sale_block_reason' => $saleBlockReason,
+                'unavailable_reason' => $saleBlockReason,
+                'current_location' => $barcodeRecord->currentStore ? [
+                    'id' => $barcodeRecord->currentStore->id,
+                    'store_id' => $barcodeRecord->currentStore->id,
+                    'name' => $barcodeRecord->currentStore->name,
+                    'store_name' => $barcodeRecord->currentStore->name,
+                    'store_code' => $barcodeRecord->currentStore->store_code,
+                    'store_type' => $barcodeRecord->currentStore->store_type,
+                    'address' => $barcodeRecord->currentStore->address,
+                    'phone' => $barcodeRecord->currentStore->phone,
+                    'batch' => $batchInfo,
+                ] : null,
+                'batch' => $batchInfo,
+                'deleted_purchase_order' => $deletedPoLink ? [
+                    'deleted' => true,
+                    'deleted_purchase_order_id' => $deletedPoLink->deleted_purchase_order_id,
+                    'deleted_po_number' => $deletedPoLink->deleted_po_number,
+                    'deleted_at' => $deletedPoLink->deleted_at?->format('Y-m-d H:i:s'),
+                ] : null,
+                'deleted_batch' => $deletedBatchLink ? [
+                    'deleted' => true,
+                    'deleted_product_batch_id' => $deletedBatchLink->deleted_product_batch_id,
+                    'deleted_batch_number' => $deletedBatchLink->deleted_batch_number,
+                    'purchase_order_id' => $deletedBatchLink->purchase_order_id,
+                    'purchase_order_number' => $deletedBatchLink->purchase_order_number,
+                    'store_id' => $deletedBatchLink->store_id,
+                    'store_name' => $deletedBatchLink->store_name,
+                    'deleted_at' => $deletedBatchLink->deleted_at?->format('Y-m-d H:i:s'),
+                ] : null,
             ]
         ]);
     }

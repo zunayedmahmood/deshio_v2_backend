@@ -720,7 +720,9 @@ class ProductBarcode extends Model
             'current_location' => $currentLocation,
             'current_batch' => $currentBatch,
             'last_movement' => $lastMovement,
-            'location_history' => $barcodeRecord->getLocationHistory(),
+            // Intentionally omit full location_history here. Scanner endpoints only need
+            // current location/batch; full movement history belongs to the dedicated
+            // barcode-tracking history endpoint.
             'is_available' => $barcodeRecord->isAvailableForSale(),
             'quantity_available' => $currentBatch ? $currentBatch->quantity : 0,
         ];

@@ -33,9 +33,21 @@ class ProductBatchController extends Controller
             $query->byProduct($request->product_id);
         }
 
-        // Filter by store
-        if ($request->filled('store_id')) {
-            $query->byStore($request->store_id);
+        $requestedStoreId = $request->filled('store_id') ? (int) $request->store_id : null;
+        $productIdsFilter = [];
+
+        // Filter by store. For barcode-tracked stock, a returned unit can be
+        // physically restored to a store by product_barcodes.current_store_id
+        // even if the batch row was left stale. Include those rows as candidates;
+        // the self-heal below will relink them to a proper active batch.
+        if ($requestedStoreId) {
+            $query->where(function ($storeQuery) use ($requestedStoreId) {
+                $storeQuery->where('store_id', $requestedStoreId)
+                    ->orWhereHas('barcodes', function ($barcodeQuery) use ($requestedStoreId) {
+                        $barcodeQuery->availableForSale()
+                            ->where('current_store_id', $requestedStoreId);
+                    });
+            });
         }
 
         if ($request->filled('product_ids')) {
@@ -43,14 +55,14 @@ class ProductBatchController extends Controller
             if (is_string($ids)) {
                 $ids = preg_split('/,/', $ids);
             }
-            $ids = collect((array) $ids)
+            $productIdsFilter = collect((array) $ids)
                 ->map(fn ($id) => (int) $id)
                 ->filter(fn ($id) => $id > 0)
                 ->unique()
                 ->values()
                 ->all();
-            if (!empty($ids)) {
-                $query->whereIn('product_id', $ids);
+            if (!empty($productIdsFilter)) {
+                $query->whereIn('product_id', $productIdsFilter);
             }
         }
 
@@ -70,7 +82,7 @@ class ProductBatchController extends Controller
         if ($request->filled('status')) {
             switch ($request->status) {
                 case 'available':
-                    $storeIdForAvailability = $request->filled('store_id') ? (int) $request->store_id : null;
+                    $storeIdForAvailability = $requestedStoreId;
                     $query->where(function ($availabilityQuery) use ($storeIdForAvailability) {
                         // Normal batch-level availability.
                         $availabilityQuery->where(function ($batchQuery) {
@@ -144,6 +156,14 @@ class ProductBatchController extends Controller
             }
         }
 
+        if ($requestedStoreId && $request->input('status') === 'available') {
+            app(InventoryReservationService::class)->healSellableBarcodeBatchLinksForStore(
+                $productIdsFilter,
+                [$requestedStoreId],
+                $request->input('search') ?: $request->input('barcode')
+            );
+        }
+
         // Sort
         $sortBy = $request->input('sort_by', 'created_at');
         $sortOrder = $request->input('sort_order', 'desc');
@@ -151,9 +171,21 @@ class ProductBatchController extends Controller
 
         $batches = $query->paginate($request->input('per_page', 20));
 
-        // Format the response
+        // Format the response. When a specific store is requested, expose the
+        // barcode-lifecycle sellable quantity for that store so social-commerce
+        // does not trust stale batch.quantity after low-stock return/exchange.
         $formattedBatches = [];
         foreach ($batches as $batch) {
+            if ($requestedStoreId) {
+                $sellableQuantityForStore = ProductBarcode::where('batch_id', $batch->id)
+                    ->where('current_store_id', $requestedStoreId)
+                    ->availableForSale()
+                    ->count();
+
+                $batch->setAttribute('store_sellable_quantity', $sellableQuantityForStore);
+                $batch->setAttribute('store_available_quantity', $sellableQuantityForStore > 0 ? $sellableQuantityForStore : (int) $batch->quantity);
+            }
+
             $formattedBatches[] = $this->formatBatchResponse($batch);
         }
 
@@ -1050,6 +1082,8 @@ class ProductBatchController extends Controller
                 'name' => $batch->store->name,
             ],
             'quantity' => $batch->quantity,
+            'store_sellable_quantity' => $batch->getAttribute('store_sellable_quantity'),
+            'store_available_quantity' => $batch->getAttribute('store_available_quantity'),
             'cost_price' => number_format((float)$batch->cost_price, 2),
             'sell_price' => number_format((float)$batch->sell_price, 2),
             'profit_margin' => $batch->calculateProfitMargin() . '%',

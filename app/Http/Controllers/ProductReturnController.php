@@ -14,6 +14,7 @@ use App\Models\Setting;
 use App\Traits\DatabaseAgnosticSearch;
 use App\Services\FloatingBarcodeRelabelService;
 use App\Services\OrderBarcodeLifecycleService;
+use App\Services\InventoryReservationService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
@@ -1166,6 +1167,33 @@ class ProductReturnController extends Controller
                     $restoredWithoutBatch = true;
                 }
 
+                $priceSourceBatch = ProductBatch::where('product_id', $item['product_id'])
+                    ->whereNotNull('sell_price')
+                    ->orderByDesc('updated_at')
+                    ->first();
+
+                $targetBatch = ProductBatch::firstOrCreate([
+                    'product_id' => $item['product_id'],
+                    'store_id' => $returnStore,
+                    'batch_number' => 'RTN-RESTORE-P' . (int) $item['product_id'] . '-S' . (int) $returnStore,
+                ], [
+                    'quantity' => 0,
+                    'cost_price' => $priceSourceBatch?->cost_price ?? 0,
+                    'sell_price' => $priceSourceBatch?->sell_price ?? ($item['unit_price'] ?? 0),
+                    'tax_percentage' => $priceSourceBatch?->tax_percentage ?? 0,
+                    'manufactured_date' => $priceSourceBatch?->manufactured_date,
+                    'expiry_date' => $priceSourceBatch?->expiry_date,
+                    'availability' => true,
+                    'is_active' => true,
+                    'notes' => 'Auto-created when a returned barcode had no live batch to rejoin.',
+                ]);
+
+                $targetBatch->forceFill([
+                    'quantity' => max((int) $targetBatch->quantity + (int) $item['quantity'], 1),
+                    'availability' => true,
+                    'is_active' => true,
+                ])->save();
+
                 foreach ($barcodes as $barcode) {
                     $oldStatus = $barcode->current_status;
 
@@ -1174,15 +1202,19 @@ class ProductReturnController extends Controller
                         $barcode->refresh();
                     } else {
                         \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
-                    \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->delete();
+                        \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->delete();
                     }
+
+                    \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
+                    \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->delete();
 
                     $barcode->update([
                         'current_status'      => 'available',
                         'is_active'           => true,
                         'is_defective'        => false,
                         'current_store_id'    => $returnStore,
-                        'batch_id'            => null,
+                        'batch_id'            => $targetBatch->id,
+                        'product_id'          => $targetBatch->product_id,
                         'location_updated_at' => now(),
                         'location_metadata'   => array_merge($barcode->location_metadata ?? [], [
                             'return_id' => $return->id,
@@ -1193,7 +1225,23 @@ class ProductReturnController extends Controller
                             'batch_deleted_before_return' => true,
                             'deleted_purchase_order_reference_cleared' => true,
                             'batch_deleted_reference_cleared' => true,
+                            'restored_batch_id' => $targetBatch->id,
                         ]),
+                    ]);
+
+                    ProductMovement::create([
+                        'product_id' => $item['product_id'],
+                        'product_batch_id' => $targetBatch->id,
+                        'product_barcode_id' => $barcode->id,
+                        'to_store_id' => $returnStore,
+                        'movement_type' => 'return',
+                        'quantity' => 1,
+                        'unit_cost' => $targetBatch->cost_price ?? 0,
+                        'total_cost' => $targetBatch->cost_price ?? 0,
+                        'reference_type' => 'return',
+                        'reference_id' => $return->id,
+                        'notes' => "Product return restored into rescue batch: {$return->return_number}",
+                        'performed_by' => $employee->id,
                     ]);
 
                     Log::info('Barcode restored after return without original batch', [
@@ -1202,6 +1250,7 @@ class ProductReturnController extends Controller
                         'return_id' => $return->id,
                         'old_status' => $oldStatus,
                         'store_id' => $returnStore,
+                        'restored_batch_id' => $targetBatch->id,
                     ]);
 
                     app(OrderBarcodeLifecycleService::class)->detachBarcodeFromOrderItems(
@@ -1215,6 +1264,7 @@ class ProductReturnController extends Controller
                     );
                 }
 
+                app(InventoryReservationService::class)->syncProduct((int) $item['product_id']);
                 continue;
             }
 
@@ -1269,6 +1319,9 @@ class ProductReturnController extends Controller
                     $barcode->refresh();
                 }
 
+                \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
+                \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->delete();
+
                 // Use a single atomic update to restore ALL barcode fields at once.
                 // This avoids split-write issues where current_status and is_active
                 // could end up out of sync if saved in separate calls.
@@ -1277,9 +1330,8 @@ class ProductReturnController extends Controller
                     'is_active'          => true,
                     'is_defective'       => false,
                     'current_store_id'   => $returnStore,
-                    'batch_id'           => ((int) $originalBatch->store_id !== (int) $returnStore)
-                                                ? $targetBatch->id
-                                                : $barcode->batch_id,
+                    'batch_id'           => $targetBatch->id,
+                    'product_id'         => $targetBatch->product_id,
                     'location_updated_at' => now(),
                     'location_metadata'   => array_merge($barcode->location_metadata ?? [], [
                         'return_id'          => $return->id,
@@ -1329,6 +1381,8 @@ class ProductReturnController extends Controller
                     ]
                 );
             }
+
+            app(InventoryReservationService::class)->syncProduct((int) $item['product_id']);
         }
 
         if ($restoredWithoutBatch) {

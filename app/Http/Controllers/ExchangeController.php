@@ -21,6 +21,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
 use App\Services\FloatingBarcodeRelabelService;
 use App\Services\OrderBarcodeLifecycleService;
+use App\Services\InventoryReservationService;
 use Illuminate\Validation\ValidationException;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
@@ -662,6 +663,33 @@ class ExchangeController extends Controller
                         ->limit((int) $item['quantity'])
                         ->get();
 
+                $priceSourceBatch = ProductBatch::where('product_id', $item['product_id'])
+                    ->whereNotNull('sell_price')
+                    ->orderByDesc('updated_at')
+                    ->first();
+
+                $targetBatch = ProductBatch::firstOrCreate([
+                    'product_id' => $item['product_id'],
+                    'store_id' => $returnStore,
+                    'batch_number' => 'RTN-RESTORE-P' . (int) $item['product_id'] . '-S' . (int) $returnStore,
+                ], [
+                    'quantity' => 0,
+                    'cost_price' => $priceSourceBatch?->cost_price ?? 0,
+                    'sell_price' => $priceSourceBatch?->sell_price ?? ($item['unit_price'] ?? 0),
+                    'tax_percentage' => $priceSourceBatch?->tax_percentage ?? 0,
+                    'manufactured_date' => $priceSourceBatch?->manufactured_date,
+                    'expiry_date' => $priceSourceBatch?->expiry_date,
+                    'availability' => true,
+                    'is_active' => true,
+                    'notes' => 'Auto-created when an exchanged returned barcode had no live batch to rejoin.',
+                ]);
+
+                $targetBatch->forceFill([
+                    'quantity' => max((int) $targetBatch->quantity + (int) $item['quantity'], 1),
+                    'availability' => true,
+                    'is_active' => true,
+                ])->save();
+
                 foreach ($barcodes as $barcode) {
                     $oldStatus = $barcode->current_status;
 
@@ -670,11 +698,15 @@ class ExchangeController extends Controller
                         $barcode->refresh();
                     } else {
                         \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
-                    \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->delete();
+                        \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->delete();
                     }
 
+                    \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
+                    \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->delete();
+
                     $barcode->update([
-                        'batch_id'            => null,
+                        'batch_id'            => $targetBatch->id,
+                        'product_id'          => $targetBatch->product_id,
                         'is_active'           => true,
                         'is_defective'        => false,
                         'current_store_id'    => $returnStore,
@@ -690,7 +722,25 @@ class ExchangeController extends Controller
                             'batch_deleted_before_return' => true,
                             'deleted_purchase_order_reference_cleared' => true,
                             'batch_deleted_reference_cleared' => true,
+                            'restored_batch_id' => $targetBatch->id,
                         ]),
+                    ]);
+
+                    ProductMovement::create([
+                        'product_id' => $item['product_id'],
+                        'product_batch_id' => $targetBatch->id,
+                        'product_barcode_id' => $barcode->id,
+                        'to_store_id' => $returnStore,
+                        'movement_type' => 'return',
+                        'quantity' => 1,
+                        'unit_cost' => $targetBatch->cost_price ?? 0,
+                        'total_cost' => $targetBatch->cost_price ?? 0,
+                        'reference_type' => 'return',
+                        'reference_id' => $return->id,
+                        'status_before' => $oldStatus,
+                        'status_after' => 'available',
+                        'notes' => "Exchange return restored into rescue batch #{$return->return_number}",
+                        'performed_by' => $employee->id,
                     ]);
 
                     Log::info('Barcode restored after exchange return without original batch', [
@@ -699,6 +749,7 @@ class ExchangeController extends Controller
                         'return_id' => $return->id,
                         'old_status' => $oldStatus,
                         'store_id' => $returnStore,
+                        'restored_batch_id' => $targetBatch->id,
                     ]);
 
                     app(OrderBarcodeLifecycleService::class)->detachBarcodeFromOrderItems(
@@ -712,6 +763,7 @@ class ExchangeController extends Controller
                     );
                 }
 
+                app(InventoryReservationService::class)->syncProduct((int) $item['product_id']);
                 continue;
             }
 
@@ -760,6 +812,9 @@ class ExchangeController extends Controller
                         $this->relabelService->returnBarcodeFromSold($barcode, $order);
                         $barcode->refresh();
                     }
+
+                    \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
+                    \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->delete();
 
                     // Use a single atomic update to restore ALL barcode fields at once.
                     $barcode->update([
@@ -845,6 +900,8 @@ class ExchangeController extends Controller
                     'performed_by' => $employee->id,
                 ]);
             }
+
+            app(InventoryReservationService::class)->syncProduct((int) $item['product_id']);
         }
     }
 

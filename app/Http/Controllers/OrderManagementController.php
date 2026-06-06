@@ -673,6 +673,9 @@ class OrderManagementController extends Controller
             return [];
         }
 
+        $reservationService = app(InventoryReservationService::class);
+        $reservationService->healSellableBarcodeBatchLinksForStore($productIds, $storeIds, null);
+
         if ($respectGlobalAvailability) {
             $this->syncReservationRowsForProducts($productIds);
         }
@@ -681,7 +684,6 @@ class OrderManagementController extends Controller
             ->get()
             ->keyBy('product_id');
 
-        $reservationService = app(InventoryReservationService::class);
         $barcodeTrackedProductIds = $reservationService->barcodeTrackedProductIds($productIds);
         $sellableBarcodeCounts = $reservationService->sellableBarcodeQuantitiesByStore($productIds, $storeIds);
 

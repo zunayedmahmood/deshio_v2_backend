@@ -304,13 +304,10 @@ class ShipmentController extends Controller
             throw new \Exception('Store not registered with Pathao. Please configure store Pathao details first.');
         }
 
-        // Ensure COD amount is fresh before Pathao payload is created.
-        if ($shipment->cod_amount === null) {
-            $shipment->cod_amount = $order->outstanding_amount !== null
-                ? (float) $order->outstanding_amount
-                : max(0, (float) ($order->total_amount ?? 0) - (float) ($order->paid_amount ?? 0));
-            $shipment->save();
-        }
+        // Ensure Pathao COD is calculated from the current order balance.
+        // Important: an explicit/current zero must stay exactly 0 instead of falling
+        // back to a stale non-zero shipment cod_amount from an older bulk attempt.
+        $amountToCollect = $this->resolvePathaoAmountToCollect($shipment, $order);
 
         $recipientAddress = $this->buildPathaoRecipientAddress($shipment);
         if ($recipientAddress === '') {
@@ -345,7 +342,7 @@ class ShipmentController extends Controller
             'special_instruction' => $shipment->special_instructions ?? '',
             'item_quantity' => (int) $order->items->sum('quantity'),
             'item_weight' => $totalWeight,
-            'amount_to_collect' => (int) round((float) str_replace(',', '', (string) ($shipment->cod_amount ?? 0))),
+            'amount_to_collect' => $amountToCollect,
             'item_description' => $shipment->getPackageDescription(),
         ];
 
@@ -394,6 +391,38 @@ class ShipmentController extends Controller
         ])->save();
 
         return $shipment;
+    }
+
+    /**
+     * Resolve the COD amount that must be sent to Pathao.
+     *
+     * The order's current outstanding_amount is the source of truth because bulk
+     * sends can reuse an existing pending shipment created before a payment was
+     * collected. In PHP, 0 is easy to lose when using truthy/fallback checks, so
+     * this method uses strict null checks and returns a plain integer 0 when the
+     * order is fully paid.
+     */
+    protected function resolvePathaoAmountToCollect(Shipment $shipment, Order $order): int
+    {
+        if ($order->outstanding_amount !== null) {
+            $rawAmount = $order->outstanding_amount;
+        } elseif ($shipment->cod_amount !== null) {
+            $rawAmount = $shipment->cod_amount;
+        } else {
+            $rawAmount = max(
+                0,
+                (float) ($order->total_amount ?? 0) - (float) ($order->paid_amount ?? 0)
+            );
+        }
+
+        $amount = max(0, (int) round((float) str_replace(',', '', (string) $rawAmount)));
+
+        if ((float) ($shipment->cod_amount ?? -1) !== (float) $amount) {
+            $shipment->cod_amount = $amount;
+            $shipment->save();
+        }
+
+        return $amount;
     }
 
     protected function buildPathaoRecipientAddress(Shipment $shipment): string

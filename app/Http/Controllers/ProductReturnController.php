@@ -1229,6 +1229,19 @@ class ProductReturnController extends Controller
                         ]),
                     ]);
 
+
+                    app(InventoryReservationService::class)->restoreReturnedBarcodeToSellableBatch(
+                        $barcode->fresh(),
+                        (int) $returnStore,
+                        $targetBatch,
+                        [
+                            'restore_source' => 'quick_complete_return_deleted_batch',
+                            'return_id' => $return->id,
+                            'return_number' => $return->return_number,
+                            'order_id' => $return->order_id,
+                        ]
+                    );
+
                     ProductMovement::create([
                         'product_id' => $item['product_id'],
                         'product_batch_id' => $targetBatch->id,
@@ -1342,6 +1355,19 @@ class ProductReturnController extends Controller
                         'previous_status'    => $oldStatus,
                     ]),
                 ]);
+
+
+                app(InventoryReservationService::class)->restoreReturnedBarcodeToSellableBatch(
+                    $barcode->fresh(),
+                    (int) $returnStore,
+                    $targetBatch,
+                    [
+                        'restore_source' => 'quick_complete_return_original_batch',
+                        'return_id' => $return->id,
+                        'return_number' => $return->return_number,
+                        'order_id' => $return->order_id,
+                    ]
+                );
 
                 Log::info('Barcode restored after return', [
                     'barcode_id'      => $barcode->id,

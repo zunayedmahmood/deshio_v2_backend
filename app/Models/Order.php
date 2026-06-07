@@ -722,6 +722,13 @@ class Order extends Model
     public function calculateTotals()
     {
         $taxMode = config('app.tax_mode', 'inclusive');
+
+        // Always calculate from fresh DB rows. Several order edit/add-item
+        // endpoints create or delete items after the order model has already
+        // loaded its items relation. Using a stale relation caused rare social-
+        // commerce orders to be recalculated as product subtotal 0, then moved
+        // from pending_assignment to pending with only shipping as total.
+        $this->load(['items', 'serviceItems']);
         
         // 1. Calculate Gross Subtotal (Sum of quantity * unit_price)
         $itemsGrossSubtotal = $this->items->sum(fn($i) => (float) bcmul((string)$i->quantity, (string)$i->unit_price, 2));

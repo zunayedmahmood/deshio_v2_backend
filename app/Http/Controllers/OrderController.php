@@ -55,6 +55,59 @@ class OrderController extends Controller
     }
 
     /**
+     * Keep social-commerce/e-commerce order workflow status consistent while
+     * editing cart lines. Unassigned online orders must remain in
+     * pending_assignment; otherwise they disappear from the assignment page.
+     */
+    private function normalizeEditableOrderWorkflowStatus(Order $order, bool $pendingFulfillmentChange = false): void
+    {
+        $order->loadCount(['items', 'serviceItems']);
+        $productItemCount = (int) ($order->items_count ?? $order->items()->count());
+        $serviceItemCount = (int) ($order->service_items_count ?? $order->serviceItems()->count());
+
+        if (in_array($order->order_type, ['social_commerce', 'ecommerce'], true)) {
+            if (in_array($order->status, ['shipped', 'delivered', 'completed', 'cancelled', 'canceled', 'refunded'], true)) {
+                return;
+            }
+
+            if ($order->order_type === 'social_commerce' && $productItemCount === 0 && $serviceItemCount > 0) {
+                $order->status = 'service_only';
+                $order->fulfillment_status = null;
+                return;
+            }
+
+            if ($order->store_id) {
+                if ($pendingFulfillmentChange || !in_array($order->status, ['picking', 'ready_for_shipment', 'assigned_to_store'], true)) {
+                    $order->status = 'assigned_to_store';
+                }
+                if ($pendingFulfillmentChange || empty($order->fulfillment_status)) {
+                    $order->fulfillment_status = 'pending_fulfillment';
+                    $order->fulfilled_at = null;
+                    $order->fulfilled_by = null;
+                }
+            } else {
+                $order->status = 'pending_assignment';
+                $order->fulfillment_status = null;
+                $order->fulfilled_at = null;
+                $order->fulfilled_by = null;
+            }
+            return;
+        }
+
+        if (in_array($order->status, ['confirmed', 'ready_for_shipment', 'shipped', 'delivered', 'completed', 'cancelled', 'canceled', 'refunded'], true)) {
+            if ($pendingFulfillmentChange && $order->needsFulfillment()) {
+                $order->status = 'pending';
+                $order->fulfillment_status = 'pending_fulfillment';
+                $order->fulfilled_at = null;
+                $order->fulfilled_by = null;
+            }
+            return;
+        }
+
+        $order->status = 'pending';
+    }
+
+    /**
      * List all orders with filters
      * 
      * GET /api/orders?order_type=counter&status=pending&payment_status=partially_paid
@@ -1082,14 +1135,7 @@ class OrderController extends Controller
                 $order->load('items');
                 
                 // Smart status management
-                if (!in_array($order->status, ['confirmed', 'ready_for_shipment', 'shipped', 'delivered', 'completed'])) {
-                    $order->status = 'pending';
-                } else if ($hasPendingFulfillmentChange && $order->needsFulfillment()) {
-                    $order->status = 'pending';
-                    $order->fulfillment_status = 'pending_fulfillment';
-                    $order->fulfilled_at = null;
-                    $order->fulfilled_by = null;
-                }
+                $this->normalizeEditableOrderWorkflowStatus($order, $hasPendingFulfillmentChange);
 
                 foreach ($affectedProductIds->unique()->filter()->values() as $productId) {
                     app(InventoryReservationService::class)->syncProduct((int) $productId);
@@ -1419,12 +1465,7 @@ class OrderController extends Controller
                 $addedItems[] = $orderItem;
             }
 
-            if ($hasProduct && $order->needsFulfillment()) {
-                $order->status = 'pending';
-                $order->fulfillment_status = 'pending_fulfillment';
-            } else if (!in_array($order->status, ['confirmed', 'ready_for_shipment', 'shipped', 'delivered', 'completed'])) {
-                $order->status = 'pending';
-            }
+            $this->normalizeEditableOrderWorkflowStatus($order, $hasProduct);
 
             // Recalculate order totals and rebuild reservation truth for edited product(s)
             $order->calculateTotals();
@@ -1599,12 +1640,8 @@ class OrderController extends Controller
                 Log::warning("Quantity increased for item {$item->id} on confirmed order {$order->id}. Manual inventory reconciliation performed.");
             }
 
-            if ($quantityIncreasedForFulfillment && $order->needsFulfillment()) {
-                $order->status = 'pending';
-                $order->fulfillment_status = 'pending_fulfillment';
-                $order->fulfilled_at = null;
-                $order->fulfilled_by = null;
-                $order->save();
+            if ($quantityIncreasedForFulfillment || $order->needsFulfillment()) {
+                $this->normalizeEditableOrderWorkflowStatus($order, $quantityIncreasedForFulfillment);
             }
 
             $order->calculateTotals();
@@ -1693,9 +1730,7 @@ class OrderController extends Controller
             $item->delete();
             
             // If order was already confirmed, it stays confirmed.
-            if (!in_array($order->status, ['confirmed', 'ready_for_shipment', 'shipped', 'delivered', 'completed'])) {
-                $order->status = 'pending';
-            }
+            $this->normalizeEditableOrderWorkflowStatus($order);
             
             $order->calculateTotals();
 
@@ -1768,10 +1803,7 @@ class OrderController extends Controller
         }
 
         if ($order->needsFulfillment()) {
-            $order->status = 'pending';
-            $order->fulfillment_status = 'pending_fulfillment';
-            $order->fulfilled_at = null;
-            $order->fulfilled_by = null;
+            $this->normalizeEditableOrderWorkflowStatus($order, true);
             $order->save();
         }
 

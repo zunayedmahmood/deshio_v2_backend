@@ -107,6 +107,118 @@ class InventoryReservationService
 
 
     /**
+     * Force a returned/exchanged unit barcode back into a fully sellable state
+     * for one store and one live batch. This is intentionally stricter than
+     * normal barcode status changes because social-commerce search/cart logic is
+     * batch-driven while POS can be barcode-driven.
+     */
+    public function restoreReturnedBarcodeToSellableBatch(
+        ProductBarcode $barcode,
+        int $storeId,
+        ?ProductBatch $preferredBatch = null,
+        array $metadata = []
+    ): ?ProductBatch {
+        if ($storeId <= 0) {
+            return null;
+        }
+
+        return DB::transaction(function () use ($barcode, $storeId, $preferredBatch, $metadata) {
+            $barcode = ProductBarcode::with(['batch'])
+                ->lockForUpdate()
+                ->find($barcode->id);
+
+            if (!$barcode) {
+                return null;
+            }
+
+            $preferredBatch = $preferredBatch
+                ? ProductBatch::lockForUpdate()->find($preferredBatch->id)
+                : null;
+
+            $sourceBatch = $barcode->batch;
+            $productId = (int) ($preferredBatch?->product_id ?: $sourceBatch?->product_id ?: $barcode->product_id);
+            if ($productId <= 0) {
+                return null;
+            }
+
+            if ($preferredBatch && (int) $preferredBatch->product_id === $productId && (int) $preferredBatch->store_id === $storeId) {
+                $targetBatch = $preferredBatch;
+            } elseif ($sourceBatch && (int) $sourceBatch->product_id === $productId && (int) $sourceBatch->store_id === $storeId) {
+                $targetBatch = $sourceBatch;
+            } else {
+                $priceSource = $preferredBatch ?: $sourceBatch ?: ProductBatch::where('product_id', $productId)
+                    ->whereNotNull('sell_price')
+                    ->orderByDesc('updated_at')
+                    ->first();
+
+                $targetBatch = ProductBatch::firstOrCreate([
+                    'product_id' => $productId,
+                    'store_id' => $storeId,
+                    'batch_number' => 'RTN-RESTORE-P' . $productId . '-S' . $storeId,
+                ], [
+                    'quantity' => 0,
+                    'cost_price' => $priceSource?->cost_price ?? 0,
+                    'sell_price' => $priceSource?->sell_price ?? 0,
+                    'tax_percentage' => $priceSource?->tax_percentage ?? 0,
+                    'manufactured_date' => $priceSource?->manufactured_date,
+                    'expiry_date' => $priceSource?->expiry_date,
+                    'availability' => true,
+                    'is_active' => true,
+                    'notes' => 'Auto-created/reused to restore returned barcode stock for POS and social-commerce.',
+                ]);
+            }
+
+            \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
+            \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->delete();
+
+            $targetBatch->forceFill([
+                'availability' => true,
+                'is_active' => true,
+            ])->save();
+
+            $barcode->forceFill([
+                'product_id' => $targetBatch->product_id,
+                'batch_id' => $targetBatch->id,
+                'current_store_id' => $storeId,
+                'current_status' => 'available',
+                'is_active' => true,
+                'is_defective' => false,
+                'location_updated_at' => now(),
+                'location_metadata' => array_merge($barcode->location_metadata ?? [], $metadata, [
+                    'returned_barcode_full_restore' => true,
+                    'restored_batch_id' => $targetBatch->id,
+                    'restored_store_id' => $storeId,
+                    'restored_for_social_commerce_at' => now()->toISOString(),
+                ]),
+            ])->save();
+
+            if (!$targetBatch->barcode_id) {
+                $targetBatch->forceFill(['barcode_id' => $barcode->id])->save();
+            }
+
+            $sellableCount = ProductBarcode::where('batch_id', $targetBatch->id)
+                ->where('current_store_id', $storeId)
+                ->where('is_active', true)
+                ->where('is_defective', false)
+                ->whereIn('current_status', FloatingBarcodeRelabelService::SELLABLE_STATUSES)
+                ->whereDoesntHave('deletedPurchaseOrderLink')
+                ->whereDoesntHave('batchDeletedLink')
+                ->count();
+
+            $targetBatch->forceFill([
+                'quantity' => max((int) $targetBatch->quantity, (int) $sellableCount, 1),
+                'availability' => true,
+                'is_active' => true,
+            ])->save();
+
+            $this->syncProduct((int) $targetBatch->product_id);
+
+            return $targetBatch;
+        });
+    }
+
+
+    /**
      * Self-heal returned/exchanged barcodes that are already sellable by lifecycle,
      * but whose batch row is stale after a stock-out return.
      *
@@ -142,15 +254,22 @@ class InventoryReservationService
         DB::transaction(function () use ($productIds, $storeIds, $term) {
             $query = ProductBarcode::query()
                 ->with(['batch', 'product'])
-                ->whereIn('current_store_id', $storeIds->all())
                 ->where('is_active', true)
                 ->where('is_defective', false)
                 ->whereIn('current_status', FloatingBarcodeRelabelService::SELLABLE_STATUSES)
                 ->whereDoesntHave('deletedPurchaseOrderLink')
                 ->whereDoesntHave('batchDeletedLink')
+                ->where(function ($locationQuery) use ($storeIds) {
+                    $locationQuery->whereIn('current_store_id', $storeIds->all())
+                        ->orWhereHas('batch', function ($batchQuery) use ($storeIds) {
+                            $batchQuery->whereIn('store_id', $storeIds->all());
+                        });
+                })
                 ->where(function ($q) use ($storeIds) {
                     $q->whereNull('batch_id')
                       ->orWhereDoesntHave('batch')
+                      ->orWhereNull('current_store_id')
+                      ->orWhereNotIn('current_store_id', $storeIds->all())
                       ->orWhereHas('batch', function ($batchQuery) use ($storeIds) {
                           $batchQuery->whereNotIn('store_id', $storeIds->all())
                               ->orWhere('is_active', false)
@@ -184,12 +303,17 @@ class InventoryReservationService
             $touchedProductIds = [];
 
             foreach ($barcodes as $barcode) {
-                $storeId = (int) $barcode->current_store_id;
+                $sourceBatch = $barcode->batch;
+                $currentStoreId = (int) $barcode->current_store_id;
+                $batchStoreId = (int) ($sourceBatch?->store_id ?? 0);
+                $storeId = $storeIds->contains($currentStoreId)
+                    ? $currentStoreId
+                    : ($storeIds->contains($batchStoreId) ? $batchStoreId : $currentStoreId);
+
                 if ($storeId <= 0) {
                     continue;
                 }
 
-                $sourceBatch = $barcode->batch;
                 $targetBatch = null;
 
                 if ($sourceBatch && (int) $sourceBatch->store_id === $storeId) {
@@ -221,12 +345,19 @@ class InventoryReservationService
                     continue;
                 }
 
-                if ((int) $barcode->batch_id !== (int) $targetBatch->id || (int) $barcode->product_id !== (int) $targetBatch->product_id) {
+                if (
+                    (int) $barcode->batch_id !== (int) $targetBatch->id
+                    || (int) $barcode->product_id !== (int) $targetBatch->product_id
+                    || (int) $barcode->current_store_id !== (int) $storeId
+                    || !$barcode->is_active
+                    || $barcode->is_defective
+                    || !in_array($barcode->current_status, FloatingBarcodeRelabelService::SELLABLE_STATUSES, true)
+                ) {
                     $barcode->forceFill([
                         'batch_id' => $targetBatch->id,
                         'product_id' => $targetBatch->product_id,
                         'current_store_id' => $storeId,
-                        'current_status' => $barcode->current_status ?: 'available',
+                        'current_status' => 'available',
                         'is_active' => true,
                         'is_defective' => false,
                         'location_updated_at' => now(),
@@ -237,6 +368,10 @@ class InventoryReservationService
                             'relinked_at' => now()->toISOString(),
                         ]),
                     ])->save();
+                }
+
+                if (!$targetBatch->barcode_id) {
+                    $targetBatch->forceFill(['barcode_id' => $barcode->id])->save();
                 }
 
                 $touchedBatchIds[(int) $targetBatch->id] = true;

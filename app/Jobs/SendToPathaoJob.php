@@ -112,17 +112,10 @@ class SendToPathaoJob implements ShouldQueue
         $store = $shipment->store;
         $deliveryAddress = is_array($shipment->delivery_address) ? $shipment->delivery_address : [];
 
-        // Ensure COD amount is set
-        if ($shipment->cod_amount === null) {
-            if ($order->outstanding_amount !== null) {
-                $shipment->cod_amount = (float) $order->outstanding_amount;
-            } else {
-                $total = (float) ($order->total_amount ?? 0);
-                $paid = (float) ($order->paid_amount ?? 0);
-                $shipment->cod_amount = max(0, $total - $paid);
-            }
-            $shipment->save();
-        }
+        // Ensure Pathao COD is calculated from the current order balance.
+        // A current outstanding amount of 0 must be sent as exactly 0, not replaced
+        // by a stale shipment cod_amount from a previous state.
+        $amountToCollect = $this->resolvePathaoAmountToCollect($shipment, $order);
 
         // Build address string with fallbacks (shipment delivery address -> order shipping address)
         $recipientAddress = $this->buildRecipientAddress($shipment);
@@ -161,7 +154,7 @@ class SendToPathaoJob implements ShouldQueue
             'special_instruction' => $shipment->special_instructions ?? '',
             'item_quantity' => (int) $order->items->sum('quantity'),
             'item_weight' => $totalWeight,
-            'amount_to_collect' => (int) round((float) ($shipment->cod_amount ?? 0)),
+            'amount_to_collect' => $amountToCollect,
             'item_description' => $shipment->getPackageDescription(),
         ];
 
@@ -211,6 +204,32 @@ class SendToPathaoJob implements ShouldQueue
             'success' => true,
             'consignment_id' => $data['consignment_id'] ?? null,
         ];
+    }
+
+    /**
+     * Resolve the COD amount that must be sent to Pathao.
+     */
+    protected function resolvePathaoAmountToCollect(Shipment $shipment, $order): int
+    {
+        if ($order->outstanding_amount !== null) {
+            $rawAmount = $order->outstanding_amount;
+        } elseif ($shipment->cod_amount !== null) {
+            $rawAmount = $shipment->cod_amount;
+        } else {
+            $rawAmount = max(
+                0,
+                (float) ($order->total_amount ?? 0) - (float) ($order->paid_amount ?? 0)
+            );
+        }
+
+        $amount = max(0, (int) round((float) str_replace(',', '', (string) $rawAmount)));
+
+        if ((float) ($shipment->cod_amount ?? -1) !== (float) $amount) {
+            $shipment->cod_amount = $amount;
+            $shipment->save();
+        }
+
+        return $amount;
     }
 
     /**

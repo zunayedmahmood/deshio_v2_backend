@@ -156,13 +156,16 @@ class ProductBatchController extends Controller
             }
         }
 
-        if ($requestedStoreId && $request->input('status') === 'available') {
-            app(InventoryReservationService::class)->healSellableBarcodeBatchLinksForStore(
-                $productIdsFilter,
-                [$requestedStoreId],
-                $request->input('search') ?: $request->input('barcode')
-            );
-        }
+        // Before executing the list query, revive any returned unit whose barcode
+        // is already sellable but whose batch row is still stock-out/inactive/stale.
+        // This is needed not only for social-commerce selected-store searches, but
+        // also for Inventory > Batch Price Update, which loads batches by product_id
+        // without a store/status filter.
+        app(InventoryReservationService::class)->reviveSellableBarcodeBackedBatches(
+            $productIdsFilter,
+            $requestedStoreId ? [$requestedStoreId] : [],
+            $request->input('search') ?: $request->input('barcode')
+        );
 
         // Sort
         $sortBy = $request->input('sort_by', 'created_at');
@@ -429,6 +432,9 @@ class ProductBatchController extends Controller
             'is_active',
             'notes'
         ]));
+
+        app(InventoryReservationService::class)->reviveSellableBarcodeBackedBatches([(int) $batch->product_id], [(int) $batch->store_id]);
+        app(InventoryReservationService::class)->syncProduct((int) $batch->product_id);
 
         return response()->json([
             'success' => true,
@@ -1182,6 +1188,11 @@ class ProductBatchController extends Controller
             $newSellPrice = $hasSellPrice ? (float)$request->sell_price : null;
             $newCostPrice = $hasCostPrice ? (float)$request->cost_price : null;
 
+            // Revive returned-barcode backed stock-out batches first so the price
+            // update page can see and update batches that were restored from lookup
+            // return/exchange after reaching zero stock.
+            app(InventoryReservationService::class)->reviveSellableBarcodeBackedBatches($targetProductIds);
+
             // Get all batches for the selected product(s)
             $batches = ProductBatch::whereIn('product_id', $targetProductIds)->with(['store', 'product'])->get();
 
@@ -1234,6 +1245,10 @@ class ProductBatchController extends Controller
                 }
 
                 DB::commit();
+
+                foreach ($targetProductIds as $targetProductId) {
+                    app(InventoryReservationService::class)->syncProduct((int) $targetProductId);
+                }
 
                 return response()->json([
                     'success' => true,

@@ -105,6 +105,242 @@ class InventoryReservationService
             ->all();
     }
 
+    /**
+     * Fully revive every batch that has at least one sellable unit barcode.
+     *
+     * This is broader than the selected-store social-commerce heal. Inventory >
+     * Batch Price Update loads batches by product_id without a status/store
+     * filter, so a returned unit from a previously stock-out batch must revive
+     * the batch row itself: store_id, quantity, availability, is_active, primary
+     * barcode pointer, deleted-link blockers, and product/reserved totals.
+     *
+     * @param array<int> $productIds Empty means all products matching the other filters.
+     * @param array<int> $storeIds Empty means use each barcode's current_store_id / batch store.
+     */
+    public function reviveSellableBarcodeBackedBatches(array $productIds = [], array $storeIds = [], ?string $searchTerm = null): void
+    {
+        $productIds = collect($productIds)
+            ->map(fn ($id) => (int) $id)
+            ->filter(fn ($id) => $id > 0)
+            ->unique()
+            ->values();
+
+        $storeIds = collect($storeIds)
+            ->map(fn ($id) => (int) $id)
+            ->filter(fn ($id) => $id > 0)
+            ->unique()
+            ->values();
+
+        $term = trim((string) ($searchTerm ?? ''));
+
+        // Avoid a full-table opportunistic repair. Every caller should provide
+        // either product ids, a selected store, or the user's search/barcode term.
+        if ($productIds->isEmpty() && $storeIds->isEmpty() && $term === '') {
+            return;
+        }
+
+        DB::transaction(function () use ($productIds, $storeIds, $term) {
+            $query = ProductBarcode::query()
+                ->with(['batch', 'product'])
+                ->where('is_active', true)
+                ->where('is_defective', false)
+                ->whereIn('current_status', FloatingBarcodeRelabelService::SELLABLE_STATUSES)
+                ->whereDoesntHave('deletedPurchaseOrderLink')
+                ->whereDoesntHave('batchDeletedLink');
+
+            if ($productIds->isNotEmpty()) {
+                $query->whereIn('product_id', $productIds->all());
+            }
+
+            if ($storeIds->isNotEmpty()) {
+                $query->where(function ($locationQuery) use ($storeIds) {
+                    $locationQuery->whereIn('current_store_id', $storeIds->all())
+                        ->orWhereHas('batch', function ($batchQuery) use ($storeIds) {
+                            $batchQuery->whereIn('store_id', $storeIds->all());
+                        });
+                });
+            }
+
+            if ($term !== '') {
+                $like = '%' . $term . '%';
+                $query->where(function ($q) use ($like) {
+                    $q->where('barcode', 'like', $like)
+                      ->orWhereHas('product', function ($productQuery) use ($like) {
+                          $productQuery->where('name', 'like', $like)
+                              ->orWhere('base_name', 'like', $like)
+                              ->orWhere('variation_suffix', 'like', $like)
+                              ->orWhere('sku', 'like', $like);
+                      })
+                      ->orWhereHas('batch', function ($batchQuery) use ($like) {
+                          $batchQuery->where('batch_number', 'like', $like);
+                      });
+                });
+            }
+
+            // Only touch rows that are already sellable by barcode lifecycle but
+            // whose batch row can still block social-commerce/batch-price pages.
+            $query->where(function ($q) use ($storeIds) {
+                $q->whereNull('batch_id')
+                  ->orWhereDoesntHave('batch')
+                  ->orWhereHas('batch', function ($batchQuery) use ($storeIds) {
+                      $batchQuery->whereNull('store_id')
+                          ->orWhere('is_active', false)
+                          ->orWhere('availability', false)
+                          ->orWhere('quantity', '<=', 0);
+
+                      if ($storeIds->isNotEmpty()) {
+                          $batchQuery->orWhereNotIn('store_id', $storeIds->all());
+                      }
+                  })
+                  ->orWhere(function ($locationMismatch) use ($storeIds) {
+                      $locationMismatch->whereNotNull('current_store_id')
+                          ->whereHas('batch', function ($batchQuery) use ($storeIds) {
+                              $batchQuery->whereNotNull('store_id')
+                                  ->whereColumn('product_batches.store_id', '!=', 'product_barcodes.current_store_id');
+
+                              if ($storeIds->isNotEmpty()) {
+                                  $batchQuery->whereIn('product_batches.store_id', $storeIds->all());
+                              }
+                          });
+                  });
+            });
+
+            $barcodes = $query->lockForUpdate()->limit(1000)->get();
+            $touchedBatchIds = [];
+            $touchedProductIds = [];
+
+            foreach ($barcodes as $barcode) {
+                $sourceBatch = $barcode->batch;
+                $productId = (int) ($barcode->product_id ?: $sourceBatch?->product_id);
+                $storeId = (int) ($barcode->current_store_id ?: $sourceBatch?->store_id);
+
+                if ($productId <= 0 || $storeId <= 0) {
+                    continue;
+                }
+
+                if ($storeIds->isNotEmpty() && !$storeIds->contains($storeId)) {
+                    continue;
+                }
+
+                $targetBatch = null;
+
+                if ($sourceBatch && (int) $sourceBatch->product_id === $productId && ((int) $sourceBatch->store_id === $storeId || empty($sourceBatch->store_id))) {
+                    $targetBatch = ProductBatch::lockForUpdate()->find($sourceBatch->id);
+                }
+
+                if (!$targetBatch) {
+                    $priceSource = $sourceBatch ?: ProductBatch::where('product_id', $productId)
+                        ->whereNotNull('sell_price')
+                        ->orderByDesc('updated_at')
+                        ->first();
+
+                    $targetBatch = ProductBatch::firstOrCreate([
+                        'product_id' => $productId,
+                        'store_id' => $storeId,
+                        'batch_number' => 'RTN-RESTORE-P' . $productId . '-S' . $storeId,
+                    ], [
+                        'quantity' => 0,
+                        'cost_price' => $priceSource?->cost_price ?? 0,
+                        'sell_price' => $priceSource?->sell_price ?? 0,
+                        'tax_percentage' => $priceSource?->tax_percentage ?? 0,
+                        'manufactured_date' => $priceSource?->manufactured_date,
+                        'expiry_date' => $priceSource?->expiry_date,
+                        'availability' => true,
+                        'is_active' => true,
+                        'notes' => 'Auto-created/reused to revive returned barcode stock for social-commerce and batch price update.',
+                    ]);
+                }
+
+                \App\Models\DeletedPurchaseOrderBarcode::where('product_barcode_id', $barcode->id)->delete();
+                \App\Models\BatchDeletedBarcode::where('product_barcode_id', $barcode->id)->delete();
+
+                $targetBatch->forceFill([
+                    'product_id' => $productId,
+                    'store_id' => $storeId,
+                    'availability' => true,
+                    'is_active' => true,
+                    'barcode_id' => $targetBatch->barcode_id ?: $barcode->id,
+                    'notes' => $this->appendBatchNote(
+                        (string) ($targetBatch->notes ?? ''),
+                        'Returned barcode revived this batch for social-commerce and batch-price-update.'
+                    ),
+                ])->save();
+
+                $barcode->forceFill([
+                    'product_id' => $productId,
+                    'batch_id' => $targetBatch->id,
+                    'current_store_id' => $storeId,
+                    'current_status' => 'available',
+                    'is_active' => true,
+                    'is_defective' => false,
+                    'location_updated_at' => now(),
+                    'location_metadata' => array_merge($barcode->location_metadata ?? [], [
+                        'batch_fully_revived' => true,
+                        'revived_batch_id' => $targetBatch->id,
+                        'revived_store_id' => $storeId,
+                        'revived_for_social_and_batch_price_at' => now()->toISOString(),
+                    ]),
+                ])->save();
+
+                $touchedBatchIds[(int) $targetBatch->id] = true;
+                $touchedProductIds[(int) $productId] = true;
+            }
+
+            foreach (array_keys($touchedBatchIds) as $batchId) {
+                $this->reconcileRevivedBatch((int) $batchId);
+            }
+
+            foreach (array_keys($touchedProductIds) as $productId) {
+                $this->syncProduct((int) $productId);
+            }
+
+            if (!empty($touchedBatchIds)) {
+                Log::info('Sellable barcode-backed batches fully revived', [
+                    'batch_ids' => array_keys($touchedBatchIds),
+                    'product_ids' => array_keys($touchedProductIds),
+                    'store_ids' => $storeIds->all(),
+                ]);
+            }
+        });
+    }
+
+    private function reconcileRevivedBatch(int $batchId): void
+    {
+        $batch = ProductBatch::lockForUpdate()->find($batchId);
+        if (!$batch) {
+            return;
+        }
+
+        $sellableQuery = ProductBarcode::where('batch_id', $batch->id)
+            ->where('product_id', $batch->product_id)
+            ->where('current_store_id', $batch->store_id)
+            ->where('is_active', true)
+            ->where('is_defective', false)
+            ->whereIn('current_status', FloatingBarcodeRelabelService::SELLABLE_STATUSES)
+            ->whereDoesntHave('deletedPurchaseOrderLink')
+            ->whereDoesntHave('batchDeletedLink');
+
+        $sellableCount = (int) (clone $sellableQuery)->count();
+        $primaryBarcodeId = (int) ((clone $sellableQuery)->orderByDesc('is_primary')->orderBy('id')->value('id') ?: 0);
+
+        $batch->forceFill([
+            'quantity' => max((int) $batch->quantity, $sellableCount),
+            'availability' => $sellableCount > 0 || (int) $batch->quantity > 0,
+            'is_active' => true,
+            'barcode_id' => $primaryBarcodeId ?: $batch->barcode_id,
+        ])->save();
+    }
+
+    private function appendBatchNote(string $existing, string $note): string
+    {
+        $line = '[' . now()->format('Y-m-d H:i:s') . '] ' . $note;
+        if (str_contains($existing, $note)) {
+            return $existing;
+        }
+        return trim($existing) === '' ? $line : trim($existing) . "
+" . $line;
+    }
+
 
     /**
      * Force a returned/exchanged unit barcode back into a fully sellable state
@@ -196,20 +432,16 @@ class InventoryReservationService
                 $targetBatch->forceFill(['barcode_id' => $barcode->id])->save();
             }
 
-            $sellableCount = ProductBarcode::where('batch_id', $targetBatch->id)
-                ->where('current_store_id', $storeId)
-                ->where('is_active', true)
-                ->where('is_defective', false)
-                ->whereIn('current_status', FloatingBarcodeRelabelService::SELLABLE_STATUSES)
-                ->whereDoesntHave('deletedPurchaseOrderLink')
-                ->whereDoesntHave('batchDeletedLink')
-                ->count();
+            $this->reconcileRevivedBatch((int) $targetBatch->id);
+            $targetBatch->refresh();
 
-            $targetBatch->forceFill([
-                'quantity' => max((int) $targetBatch->quantity, (int) $sellableCount, 1),
-                'availability' => true,
-                'is_active' => true,
-            ])->save();
+            if ((int) $targetBatch->quantity < 1) {
+                $targetBatch->forceFill([
+                    'quantity' => 1,
+                    'availability' => true,
+                    'is_active' => true,
+                ])->save();
+            }
 
             $this->syncProduct((int) $targetBatch->product_id);
 
@@ -233,185 +465,7 @@ class InventoryReservationService
      */
     public function healSellableBarcodeBatchLinksForStore(array $productIds, array $storeIds, ?string $searchTerm = null): void
     {
-        $storeIds = collect($storeIds)
-            ->map(fn ($id) => (int) $id)
-            ->filter(fn ($id) => $id > 0)
-            ->unique()
-            ->values();
-
-        if ($storeIds->isEmpty()) {
-            return;
-        }
-
-        $productIds = collect($productIds)
-            ->map(fn ($id) => (int) $id)
-            ->filter(fn ($id) => $id > 0)
-            ->unique()
-            ->values();
-
-        $term = trim((string) ($searchTerm ?? ''));
-
-        DB::transaction(function () use ($productIds, $storeIds, $term) {
-            $query = ProductBarcode::query()
-                ->with(['batch', 'product'])
-                ->where('is_active', true)
-                ->where('is_defective', false)
-                ->whereIn('current_status', FloatingBarcodeRelabelService::SELLABLE_STATUSES)
-                ->whereDoesntHave('deletedPurchaseOrderLink')
-                ->whereDoesntHave('batchDeletedLink')
-                ->where(function ($locationQuery) use ($storeIds) {
-                    $locationQuery->whereIn('current_store_id', $storeIds->all())
-                        ->orWhereHas('batch', function ($batchQuery) use ($storeIds) {
-                            $batchQuery->whereIn('store_id', $storeIds->all());
-                        });
-                })
-                ->where(function ($q) use ($storeIds) {
-                    $q->whereNull('batch_id')
-                      ->orWhereDoesntHave('batch')
-                      ->orWhereNull('current_store_id')
-                      ->orWhereNotIn('current_store_id', $storeIds->all())
-                      ->orWhereHas('batch', function ($batchQuery) use ($storeIds) {
-                          $batchQuery->whereNotIn('store_id', $storeIds->all())
-                              ->orWhere('is_active', false)
-                              ->orWhere('availability', false)
-                              ->orWhere('quantity', '<=', 0);
-                      });
-                });
-
-            if ($productIds->isNotEmpty()) {
-                $query->whereIn('product_id', $productIds->all());
-            }
-
-            if ($term !== '') {
-                $like = '%' . $term . '%';
-                $query->where(function ($q) use ($like) {
-                    $q->where('barcode', 'like', $like)
-                      ->orWhereHas('product', function ($productQuery) use ($like) {
-                          $productQuery->where('name', 'like', $like)
-                              ->orWhere('base_name', 'like', $like)
-                              ->orWhere('variation_suffix', 'like', $like)
-                              ->orWhere('sku', 'like', $like);
-                      })
-                      ->orWhereHas('batch', function ($batchQuery) use ($like) {
-                          $batchQuery->where('batch_number', 'like', $like);
-                      });
-                });
-            }
-
-            $barcodes = $query->lockForUpdate()->limit(500)->get();
-            $touchedBatchIds = [];
-            $touchedProductIds = [];
-
-            foreach ($barcodes as $barcode) {
-                $sourceBatch = $barcode->batch;
-                $currentStoreId = (int) $barcode->current_store_id;
-                $batchStoreId = (int) ($sourceBatch?->store_id ?? 0);
-                $storeId = $storeIds->contains($currentStoreId)
-                    ? $currentStoreId
-                    : ($storeIds->contains($batchStoreId) ? $batchStoreId : $currentStoreId);
-
-                if ($storeId <= 0) {
-                    continue;
-                }
-
-                $targetBatch = null;
-
-                if ($sourceBatch && (int) $sourceBatch->store_id === $storeId) {
-                    $targetBatch = $sourceBatch;
-                } else {
-                    $priceSource = $sourceBatch ?: ProductBatch::where('product_id', $barcode->product_id)
-                        ->whereNotNull('sell_price')
-                        ->orderByDesc('updated_at')
-                        ->first();
-
-                    $targetBatch = ProductBatch::firstOrCreate([
-                        'product_id' => $barcode->product_id,
-                        'store_id' => $storeId,
-                        'batch_number' => 'RTN-RESTORE-P' . (int) $barcode->product_id . '-S' . $storeId,
-                    ], [
-                        'quantity' => 0,
-                        'cost_price' => $priceSource?->cost_price ?? 0,
-                        'sell_price' => $priceSource?->sell_price ?? 0,
-                        'tax_percentage' => $priceSource?->tax_percentage ?? 0,
-                        'manufactured_date' => $priceSource?->manufactured_date,
-                        'expiry_date' => $priceSource?->expiry_date,
-                        'availability' => true,
-                        'is_active' => true,
-                        'notes' => 'Auto-created to relink returned barcode stock for social-commerce search.',
-                    ]);
-                }
-
-                if (!$targetBatch) {
-                    continue;
-                }
-
-                if (
-                    (int) $barcode->batch_id !== (int) $targetBatch->id
-                    || (int) $barcode->product_id !== (int) $targetBatch->product_id
-                    || (int) $barcode->current_store_id !== (int) $storeId
-                    || !$barcode->is_active
-                    || $barcode->is_defective
-                    || !in_array($barcode->current_status, FloatingBarcodeRelabelService::SELLABLE_STATUSES, true)
-                ) {
-                    $barcode->forceFill([
-                        'batch_id' => $targetBatch->id,
-                        'product_id' => $targetBatch->product_id,
-                        'current_store_id' => $storeId,
-                        'current_status' => 'available',
-                        'is_active' => true,
-                        'is_defective' => false,
-                        'location_updated_at' => now(),
-                        'location_metadata' => array_merge($barcode->location_metadata ?? [], [
-                            'batch_relinked_for_social_commerce' => true,
-                            'relinked_batch_id' => $targetBatch->id,
-                            'relinked_store_id' => $storeId,
-                            'relinked_at' => now()->toISOString(),
-                        ]),
-                    ])->save();
-                }
-
-                if (!$targetBatch->barcode_id) {
-                    $targetBatch->forceFill(['barcode_id' => $barcode->id])->save();
-                }
-
-                $touchedBatchIds[(int) $targetBatch->id] = true;
-                $touchedProductIds[(int) $targetBatch->product_id] = true;
-            }
-
-            foreach (array_keys($touchedBatchIds) as $batchId) {
-                $batch = ProductBatch::lockForUpdate()->find($batchId);
-                if (!$batch) {
-                    continue;
-                }
-
-                $sellableCount = ProductBarcode::where('batch_id', $batch->id)
-                    ->where('current_store_id', $batch->store_id)
-                    ->where('is_active', true)
-                    ->where('is_defective', false)
-                    ->whereIn('current_status', FloatingBarcodeRelabelService::SELLABLE_STATUSES)
-                    ->whereDoesntHave('deletedPurchaseOrderLink')
-                    ->whereDoesntHave('batchDeletedLink')
-                    ->count();
-
-                $batch->forceFill([
-                    'quantity' => max((int) $batch->quantity, (int) $sellableCount),
-                    'availability' => true,
-                    'is_active' => true,
-                ])->save();
-            }
-
-            foreach (array_keys($touchedProductIds) as $productId) {
-                $this->syncProduct((int) $productId);
-            }
-
-            if (!empty($touchedBatchIds)) {
-                Log::info('Sellable returned barcode batch links self-healed for social-commerce', [
-                    'batch_ids' => array_keys($touchedBatchIds),
-                    'product_ids' => array_keys($touchedProductIds),
-                    'store_ids' => $storeIds->all(),
-                ]);
-            }
-        });
+        $this->reviveSellableBarcodeBackedBatches($productIds, $storeIds, $searchTerm);
     }
 
     /**

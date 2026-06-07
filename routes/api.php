@@ -389,6 +389,9 @@ Route::middleware('auth:api')->group(function () {
 
         // Revert order assignment back to pending_assignment
         Route::post('/orders/{orderId}/revert-assignment', [\App\Http\Controllers\OrderManagementController::class, 'revertAssignment']);
+
+        // Rescue a mistakenly plain pending social/e-commerce order into pending_assignment
+        Route::post('/orders/{orderId}/mark-pending-assignment', [\App\Http\Controllers\OrderManagementController::class, 'markAsPendingAssignment']);
         
         // Mark order as delivered manually
         Route::post('/orders/{orderId}/mark-as-delivered', [\App\Http\Controllers\OrderManagementController::class, 'markAsDelivered']);

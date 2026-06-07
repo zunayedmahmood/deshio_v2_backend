@@ -1129,6 +1129,107 @@ class OrderManagementController extends Controller
     }
 
     /**
+     * Rescue a mistakenly plain pending online order back into pending_assignment.
+     * Used from Orders page for the rare social-commerce/e-commerce orders that
+     * were downgraded by stale edit state before the workflow guard existed.
+     */
+    public function markAsPendingAssignment(Request $request, $orderId)
+    {
+        try {
+            DB::beginTransaction();
+
+            $order = Order::with(['items.product', 'customer'])
+                ->lockForUpdate()
+                ->findOrFail($orderId);
+
+            if (!in_array($order->order_type, ['social_commerce', 'ecommerce'], true)) {
+                DB::rollBack();
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Only social-commerce or e-commerce orders can be moved to pending_assignment.',
+                ], 422);
+            }
+
+            if ($order->status === 'pending_assignment' && empty($order->store_id)) {
+                DB::commit();
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Order is already pending assignment.',
+                    'data' => ['order' => $order->load(['customer', 'items.product'])],
+                ]);
+            }
+
+            if ($order->status !== 'pending') {
+                DB::rollBack();
+                return response()->json([
+                    'success' => false,
+                    'message' => "Only plain pending orders can be rescued with this button. Current status: {$order->status}.",
+                ], 422);
+            }
+
+            if (!empty($order->store_id)) {
+                DB::rollBack();
+                return response()->json([
+                    'success' => false,
+                    'message' => 'This order already has a store. Use Revert Assignment for assigned orders.',
+                ], 422);
+            }
+
+            if ($order->items()->count() < 1) {
+                DB::rollBack();
+                return response()->json([
+                    'success' => false,
+                    'message' => 'This order has no product items, so it cannot enter store assignment.',
+                ], 422);
+            }
+
+            $oldStatus = $order->status;
+            $oldFulfillmentStatus = $order->fulfillment_status;
+
+            // Recalculate from fresh DB rows first; then set assignment workflow.
+            $order->calculateTotals();
+            $order->refresh();
+
+            $order->forceFill([
+                'status' => 'pending_assignment',
+                'store_id' => null,
+                'fulfillment_status' => null,
+                'confirmed_at' => null,
+                'fulfilled_at' => null,
+                'fulfilled_by' => null,
+                'metadata' => array_merge($order->metadata ?? [], [
+                    'rescued_to_pending_assignment_at' => now()->toISOString(),
+                    'rescued_to_pending_assignment_by' => auth('api')->id() ?: auth()->id(),
+                    'rescued_from_status' => $oldStatus,
+                    'rescued_from_fulfillment_status' => $oldFulfillmentStatus,
+                    'rescue_source' => 'orders_page_button',
+                ]),
+            ])->save();
+
+            foreach ($order->items()->pluck('product_id')->filter()->unique() as $productId) {
+                app(InventoryReservationService::class)->syncProduct((int) $productId);
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Order moved to pending_assignment and is now available for store assignment.',
+                'data' => [
+                    'order' => $order->fresh(['customer', 'items.product']),
+                ],
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to move order to pending assignment.',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
      * Mark order as delivered manually
      */
     public function markAsDelivered(Request $request, $orderId)

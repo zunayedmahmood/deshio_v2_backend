@@ -130,7 +130,7 @@ class InventoryReservationService
      * @param array<int> $productIds Empty means all products matching the other filters.
      * @param array<int> $storeIds Empty means use each barcode's current_store_id / batch store.
      */
-    public function reviveSellableBarcodeBackedBatches(array $productIds = [], array $storeIds = [], ?string $searchTerm = null): void
+    public function reviveSellableBarcodeBackedBatches(array $productIds = [], array $storeIds = [], ?string $searchTerm = null, bool $allowFullScan = false): void
     {
         $productIds = collect($productIds)
             ->map(fn ($id) => (int) $id)
@@ -146,13 +146,19 @@ class InventoryReservationService
 
         $term = trim((string) ($searchTerm ?? ''));
 
-        // Avoid a full-table opportunistic repair. Every caller should provide
-        // either product ids, a selected store, or the user's search/barcode term.
-        if ($productIds->isEmpty() && $storeIds->isEmpty() && $term === '') {
+        // Avoid a full-table opportunistic repair during normal requests. The
+        // deployment migration intentionally passes $allowFullScan=true to repair
+        // legacy batches that were already stuck before this code existed.
+        if (!$allowFullScan && $productIds->isEmpty() && $storeIds->isEmpty() && $term === '') {
             return;
         }
 
-        DB::transaction(function () use ($productIds, $storeIds, $term) {
+        $iterations = 0;
+
+        do {
+            $touchedThisPass = 0;
+
+            DB::transaction(function () use ($productIds, $storeIds, $term, &$touchedThisPass) {
             $query = ProductBarcode::query()
                 ->with(['batch', 'product'])
                 ->where('is_active', true)
@@ -295,12 +301,13 @@ class InventoryReservationService
                     ]),
                 ])->save();
 
+                $touchedThisPass++;
                 $touchedBatchIds[(int) $targetBatch->id] = true;
                 $touchedProductIds[(int) $productId] = true;
             }
 
             foreach (array_keys($touchedBatchIds) as $batchId) {
-                $this->reconcileRevivedBatch((int) $batchId);
+                $this->reconcileBatchStockFromBarcodes((int) $batchId);
             }
 
             foreach (array_keys($touchedProductIds) as $productId) {
@@ -314,10 +321,13 @@ class InventoryReservationService
                     'store_ids' => $storeIds->all(),
                 ]);
             }
-        });
+            });
+
+            $iterations++;
+        } while ($allowFullScan && $touchedThisPass > 0 && $iterations < 100);
     }
 
-    private function reconcileRevivedBatch(int $batchId): void
+    public function reconcileBatchStockFromBarcodes(int $batchId): void
     {
         $batch = ProductBatch::lockForUpdate()->find($batchId);
         if (!$batch) {
@@ -333,13 +343,35 @@ class InventoryReservationService
             ->whereDoesntHave('deletedPurchaseOrderLink')
             ->whereDoesntHave('batchDeletedLink');
 
-        $sellableCount = (int) (clone $sellableQuery)->count();
-        $primaryBarcodeId = (int) ((clone $sellableQuery)->orderByDesc('is_primary')->orderBy('id')->value('id') ?: 0);
+        $hasBarcodeIdentities = ProductBarcode::where('batch_id', $batch->id)
+            ->where('product_id', $batch->product_id)
+            ->exists();
+
+        $sellableBarcodes = (clone $sellableQuery)->get(['id', 'is_primary', 'is_replacement', 'replacement_status']);
+        $sellableCount = (int) $sellableBarcodes->count();
+        $nonReplacementSellableCount = (int) $sellableBarcodes
+            ->filter(fn ($barcode) => empty($barcode->is_replacement))
+            ->count();
+
+        // Floating replacement/relabel barcodes are extra scan identities for an
+        // existing physical unit. They must not inflate product_batches.quantity.
+        // If a previously stock-out batch has only a replacement identity left,
+        // keep at least one physical unit so the returned item can be assigned.
+        $reconciledPhysicalQuantity = $hasBarcodeIdentities
+            ? ($nonReplacementSellableCount > 0 ? $nonReplacementSellableCount : ($sellableCount > 0 ? 1 : 0))
+            : max(0, (int) $batch->quantity);
+
+        $primaryBarcodeId = (int) ($sellableBarcodes
+            ->sort(function ($left, $right) {
+                $primaryCompare = ((int) $right->is_primary) <=> ((int) $left->is_primary);
+                return $primaryCompare !== 0 ? $primaryCompare : ((int) $left->id <=> (int) $right->id);
+            })
+            ->first()?->id ?: 0);
 
         $batch->forceFill([
-            'quantity' => max((int) $batch->quantity, $sellableCount),
-            'availability' => $sellableCount > 0 || (int) $batch->quantity > 0,
-            'is_active' => true,
+            'quantity' => $reconciledPhysicalQuantity,
+            'availability' => $hasBarcodeIdentities ? $sellableCount > 0 : $reconciledPhysicalQuantity > 0,
+            'is_active' => $hasBarcodeIdentities ? $sellableCount > 0 : (bool) $batch->is_active,
             'barcode_id' => $primaryBarcodeId ?: $batch->barcode_id,
         ])->save();
     }
@@ -445,7 +477,7 @@ class InventoryReservationService
                 $targetBatch->forceFill(['barcode_id' => $barcode->id])->save();
             }
 
-            $this->reconcileRevivedBatch((int) $targetBatch->id);
+            $this->reconcileBatchStockFromBarcodes((int) $targetBatch->id);
             $targetBatch->refresh();
 
             if ((int) $targetBatch->quantity < 1) {

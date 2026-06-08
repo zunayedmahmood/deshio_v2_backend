@@ -8,6 +8,8 @@ use App\Models\ProductBatch;
 use App\Models\Store;
 use App\Models\Product;
 use App\Models\Employee;
+use App\Models\OrderItem;
+use App\Services\OrderBarcodeLifecycleService;
 use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -328,7 +330,9 @@ class BarcodeLocationController extends Controller
                 'status' => $status,
                 'status_label' => $barcodes->first()->getStatusLabel(),
                 'count' => $barcodes->count(),
-                'barcodes' => $barcodes->map(function ($barcode) {
+                'barcodes' => $barcodes->map(function ($barcode) use ($reservedByBarcodeId) {
+                    $reservedQuantityForBarcode = (int) ($reservedByBarcodeId[(int) $barcode->id] ?? 0);
+
                     return [
                         'id' => $barcode->id,
                         'barcode' => $barcode->barcode,
@@ -391,7 +395,9 @@ class BarcodeLocationController extends Controller
                         'count' => $items->count(),
                     ];
                 })->values(),
-                'barcodes' => $barcodes->map(function ($barcode) {
+                'barcodes' => $barcodes->map(function ($barcode) use ($reservedByBarcodeId) {
+                    $reservedQuantityForBarcode = (int) ($reservedByBarcodeId[(int) $barcode->id] ?? 0);
+
                     return [
                         'id' => $barcode->id,
                         'barcode' => $barcode->barcode,
@@ -901,17 +907,57 @@ class BarcodeLocationController extends Controller
 
         $barcodes = $query->get();
 
+        $barcodeIds = $barcodes
+            ->pluck('id')
+            ->map(fn ($id) => (int) $id)
+            ->filter(fn ($id) => $id > 0)
+            ->values();
+
+        // Reserved units are not a barcode status. They are open order_item locks.
+        // Showing them in the batch lookup stops the confusing case where lookup
+        // showed physical stock 1 + barcode identities 2 + sold 0, but one unit was
+        // actually held by a not-yet-deducted order.
+        $reservedOrderItemRows = OrderItem::query()
+            ->join('orders', 'orders.id', '=', 'order_items.order_id')
+            ->whereNull('orders.deleted_at')
+            ->whereNotIn('orders.status', OrderBarcodeLifecycleService::NON_LOCKING_ORDER_STATUSES)
+            ->where(function ($q) {
+                $q->whereNull('order_items.is_inventory_deducted')
+                    ->orWhere('order_items.is_inventory_deducted', false);
+            })
+            ->where(function ($q) use ($batchId, $barcodeIds) {
+                $q->where('order_items.product_batch_id', $batchId);
+
+                if ($barcodeIds->isNotEmpty()) {
+                    $q->orWhereIn('order_items.product_barcode_id', $barcodeIds->all());
+                }
+            })
+            ->select('order_items.product_barcode_id', DB::raw('COALESCE(SUM(order_items.quantity), 0) as reserved_quantity'))
+            ->groupBy('order_items.product_barcode_id')
+            ->get();
+
+        $reservedByBarcodeId = $reservedOrderItemRows
+            ->filter(fn ($row) => (int) $row->product_barcode_id > 0)
+            ->mapWithKeys(fn ($row) => [(int) $row->product_barcode_id => (int) $row->reserved_quantity]);
+        $reservedQuantity = (int) $reservedOrderItemRows->sum('reserved_quantity');
+
         // Summary: physical stock comes from product_batches.quantity. Barcode identities can be higher
         // when floating relabels exist, so expose both numbers explicitly.
         $saleableBarcodeCount = $barcodes->filter(fn($b) => $b->isAvailableForSale())->count();
+        $soldBarcodeCount = $barcodes
+            ->filter(fn ($b) => in_array($b->current_status, ['with_customer', 'sold'], true))
+            ->count();
+
         $summary = [
             'total_units' => (int)$batch->quantity,
             'physical_stock_quantity' => (int)$batch->quantity,
             'barcode_identities' => $barcodes->count(),
             'active' => $barcodes->where('is_active', true)->count(),
-            'available_for_sale' => min((int)$batch->quantity, $saleableBarcodeCount),
+            'available_for_sale' => max(0, min((int)$batch->quantity, $saleableBarcodeCount) - $reservedQuantity),
             'saleable_barcode_identities' => $saleableBarcodeCount,
-            'sold' => $barcodes->where('current_status', 'with_customer')->count(),
+            'reserved' => $reservedQuantity,
+            'reserved_barcode_identities' => $reservedByBarcodeId->count(),
+            'sold' => $soldBarcodeCount,
             'defective' => $barcodes->where('is_defective', true)->count(),
             'open_replacement_barcodes' => $barcodes->filter(fn($b) => $b->is_replacement && $b->replacement_status === 'open')->count(),
         ];
@@ -957,7 +1003,9 @@ class BarcodeLocationController extends Controller
                     'store_id' => $request->store_id,
                     'available_only' => $request->boolean('available_only'),
                 ],
-                'barcodes' => $barcodes->map(function ($barcode) {
+                'barcodes' => $barcodes->map(function ($barcode) use ($reservedByBarcodeId) {
+                    $reservedQuantityForBarcode = (int) ($reservedByBarcodeId[(int) $barcode->id] ?? 0);
+
                     return [
                         'id' => $barcode->id,
                         'barcode' => $barcode->barcode,
@@ -970,6 +1018,8 @@ class BarcodeLocationController extends Controller
                         'is_active' => $barcode->is_active,
                         'is_defective' => $barcode->is_defective,
                         'is_available_for_sale' => $barcode->isAvailableForSale(),
+                        'is_reserved' => $reservedQuantityForBarcode > 0,
+                        'reserved_quantity' => $reservedQuantityForBarcode,
                         'is_replacement' => $barcode->is_replacement,
                         'replacement_status' => $barcode->replacement_status,
                         'relabel_reason' => $barcode->relabel_reason,

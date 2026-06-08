@@ -119,121 +119,16 @@ class OrderManagementController extends Controller
                 ], 400);
             }
 
-            // Get all active online stores (warehouses can also fulfill if marked is_online = true)
-            $stores = Store::where('is_online', true)->get();
+            // Use the same barcode-aware availability matrix as the assignment
+            // action and bulk-assignment page. The old version of this endpoint
+            // only summed product_batches.quantity, so returned stock from old
+            // stocked-out batches could appear unavailable even when a sellable
+            // barcode was physically back in the selected store.
+            $stores = Store::where('is_active', true)
+                ->orderBy('name')
+                ->get();
 
-            $productIds = $order->items->pluck('product_id')->unique()->toArray();
-
-            // 1. Fetch Global Reserved Inventory View
-            $reservedProducts = ReservedProduct::whereIn('product_id', $productIds)
-                ->get()
-                ->keyBy('product_id');
-
-            // 2. Fetch Physical Inventory View (Per Store/Product)
-            // Filter batches by availability and expiry to match frontend logic
-            $batches = ProductBatch::whereIn('product_id', $productIds)
-                ->where('availability', true)
-                ->where('quantity', '>', 0)
-                ->where(function($query) {
-                    $query->whereNull('expiry_date')
-                        ->orWhere('expiry_date', '>', now());
-                })
-                ->get()
-                ->groupBy(['store_id', 'product_id']);
-
-            // 3. Fetch Already Assigned (But Not Yet Deducted) Orders for these products
-            // Deduction from batches happens when status becomes 'confirmed' or 'delivered' or 'cancelled' etc.
-            // We need to know which quantities are already promised to specific stores.
-            $deductedStatuses = ['confirmed', 'delivered', 'cancelled', 'returned'];
-            $assignedOrders = DB::table('order_items')
-                ->join('orders', 'order_items.order_id', '=', 'orders.id')
-                ->whereIn('order_items.product_id', $productIds)
-                ->whereNotNull('orders.store_id')
-                ->whereNotIn('orders.status', $deductedStatuses)
-                ->whereNull('orders.deleted_at')
-                ->where('orders.id', '!=', $order->id) // Exclude current order if re-assigning
-                ->select('orders.store_id', 'order_items.product_id', DB::raw('SUM(order_items.quantity) as total_assigned'))
-                ->groupBy('orders.store_id', 'order_items.product_id')
-                ->get()
-                ->groupBy('store_id');
-
-            $storeInventory = [];
-
-            foreach ($stores as $store) {
-                $canFulfillEntireOrder = true;
-                $storeData = [
-                    'store_id' => $store->id,
-                    'store_name' => $store->name,
-                    'store_address' => $store->address,
-                    'inventory_details' => [],
-                    'total_items_available' => 0,
-                    'total_items_required' => $order->items->sum('quantity'),
-                ];
-
-                $assignedStoreData = $assignedOrders->get($store->id, collect())->keyBy('product_id');
-
-                foreach ($order->items as $orderItem) {
-                    $productId = $orderItem->product_id;
-                    $requiredQuantity = $orderItem->quantity;
-
-                    // Physical stock in this store for this product
-                    $productBatchesInStore = $batches->get($store->id, collect())->get($productId, collect());
-                    $totalPhysicalInStore = $productBatchesInStore->sum('quantity');
-
-                    // Already assigned to this store (from other pending/processing orders)
-                    $alreadyAssignedInStore = $assignedStoreData->get($productId)->total_assigned ?? 0;
-
-                    // TRUE Available in this store for this specific order
-                    $actuallyAvailableInStore = max(0, $totalPhysicalInStore - $alreadyAssignedInStore);
-
-                    // Global stats from ReservedProduct for context
-                    $globalReserved = $reservedProducts->get($productId);
-                    $globalAvailable = $globalReserved ? $globalReserved->available_inventory : 0;
-
-                    $inventoryDetail = [
-                        'product_id' => $productId,
-                        'product_name' => $orderItem->product_name,
-                        'product_sku' => $orderItem->product_sku,
-                        'required_quantity' => $requiredQuantity,
-                        'physical_quantity' => $totalPhysicalInStore,
-                        'assigned_quantity' => $alreadyAssignedInStore,
-                        'available_quantity' => $actuallyAvailableInStore, // Store-specific true available
-                        'global_available' => $globalAvailable,
-                        'can_fulfill' => $actuallyAvailableInStore >= $requiredQuantity,
-                        'batches' => $productBatchesInStore->map(function($batch) {
-                            return [
-                                'batch_id' => $batch->id,
-                                'batch_number' => $batch->batch_number,
-                                'quantity' => $batch->quantity,
-                                'sell_price' => $batch->sell_price,
-                                'expiry_date' => $batch->expiry_date,
-                            ];
-                        })->values(),
-                    ];
-
-                    $storeData['inventory_details'][] = $inventoryDetail;
-                    $storeData['total_items_available'] += $actuallyAvailableInStore;
-
-                    if ($actuallyAvailableInStore < $requiredQuantity) {
-                        $canFulfillEntireOrder = false;
-                    }
-                }
-
-                $storeData['can_fulfill_entire_order'] = $canFulfillEntireOrder;
-                $storeData['fulfillment_percentage'] = $storeData['total_items_required'] > 0
-                    ? min(100, round(($storeData['total_items_available'] / $storeData['total_items_required']) * 100, 2))
-                    : 0;
-
-                $storeInventory[] = $storeData;
-            }
-
-            // Sort by fulfillment capability (stores that can fulfill entire order first)
-            usort($storeInventory, function($a, $b) {
-                if ($a['can_fulfill_entire_order'] !== $b['can_fulfill_entire_order']) {
-                    return $b['can_fulfill_entire_order'] <=> $a['can_fulfill_entire_order'];
-                }
-                return $b['fulfillment_percentage'] <=> $a['fulfillment_percentage'];
-            });
+            $storeInventory = $this->buildStoreFulfillmentRowsForOrder($order, $stores);
 
             return response()->json([
                 'success' => true,
@@ -713,7 +608,12 @@ class OrderManagementController extends Controller
         }
 
         $assignedOrders = $assignedQuery
-            ->select('orders.store_id', 'order_items.product_id', DB::raw('SUM(order_items.quantity) as total_assigned'))
+            ->select(
+                'orders.store_id',
+                'order_items.product_id',
+                DB::raw('SUM(order_items.quantity) as total_assigned'),
+                DB::raw('SUM(CASE WHEN order_items.product_barcode_id IS NULL THEN order_items.quantity ELSE 0 END) as unbarcoded_assigned')
+            )
             ->groupBy('orders.store_id', 'order_items.product_id')
             ->get()
             ->groupBy('store_id');
@@ -739,9 +639,20 @@ class OrderManagementController extends Controller
                 // the barcode is back in the store but the old batch row is stale or not
                 // store-scoped in the way the social-commerce cart expected.
                 $totalPhysicalInStore = $usesBarcodeAvailability ? $sellableBarcodeQuantity : $batchPhysicalInStore;
-                $alreadyAssignedInStore = (int) ($assignedStoreData->get($productId)->total_assigned ?? 0);
+                $assignedRow = $assignedStoreData->get($productId);
+                $alreadyAssignedInStore = (int) ($assignedRow->total_assigned ?? 0);
+                $unbarcodedAssignedInStore = (int) ($assignedRow->unbarcoded_assigned ?? 0);
                 $extraAssigned = (int) ($extraAssignedByProduct[$productId] ?? 0);
-                $freePhysicalInStore = max(0, $totalPhysicalInStore - $alreadyAssignedInStore - $extraAssigned);
+
+                // sellableBarcodeQuantitiesByStore() already excludes barcodes held by
+                // open order_items. For barcode-tracked products, subtract only open
+                // store assignments that have not yet locked a specific barcode. This
+                // avoids double-subtracting the same reserved unit and fixes the
+                // stock 2 / reserved 1 / cannot assign case.
+                $assignedQuantityToSubtract = $usesBarcodeAvailability
+                    ? $unbarcodedAssignedInStore
+                    : $alreadyAssignedInStore;
+                $freePhysicalInStore = max(0, $totalPhysicalInStore - $assignedQuantityToSubtract - $extraAssigned);
                 $globalReserved = $reservedProducts->get($productId);
                 $globalAvailable = $globalReserved ? (int) $globalReserved->available_inventory : 0;
                 $actuallyAvailableInStore = $respectGlobalAvailability
@@ -766,6 +677,8 @@ class OrderManagementController extends Controller
                     'sellable_barcode_quantity' => $sellableBarcodeQuantity,
                     'stock_source' => $usesBarcodeAvailability ? 'barcode_lifecycle' : 'batch_quantity',
                     'assigned_quantity' => $alreadyAssignedInStore,
+                    'unbarcoded_assigned_quantity' => $unbarcodedAssignedInStore,
+                    'assigned_quantity_subtracted' => $assignedQuantityToSubtract,
                     'bulk_selected_quantity' => $extraAssigned,
                     'free_physical_quantity' => $freePhysicalInStore,
                     'available_quantity' => $actuallyAvailableInStore,
@@ -845,57 +758,43 @@ class OrderManagementController extends Controller
             $storeId = $request->store_id;
             $store = Store::findOrFail($storeId);
 
-            // Double check TRUE inventory availability at the moment of assignment
-            // This prevents race conditions or overlapping assignments
-            $productIds = $order->items->pluck('product_id')->unique()->toArray();
-            
-            // 1. Current Physical Stock
-            $physicalStock = ProductBatch::whereIn('product_id', $productIds)
-                ->where('store_id', $storeId)
-                ->where('availability', true)
-                ->where('quantity', '>', 0)
-                ->where(function($query) {
-                    $query->whereNull('expiry_date')
-                        ->orWhere('expiry_date', '>', now());
-                })
-                ->select('product_id', DB::raw('SUM(quantity) as total'))
-                ->groupBy('product_id')
-                ->get()
-                ->keyBy('product_id');
+            // Double check TRUE inventory availability at the moment of assignment.
+            // Keep this in the exact same barcode-aware path used by the store
+            // assignment matrix. This avoids the old batch-only false negative
+            // where Product List/Lookup showed stock, but assignment still failed.
+            $availabilityRows = $this->buildStoreFulfillmentRowsForOrder($order, collect([$store]));
+            $storeAvailability = $availabilityRows[0] ?? null;
 
-            // 2. Current Assigned (Promised) Quantities
-            $deductedStatuses = ['confirmed', 'delivered', 'cancelled', 'returned'];
-            $assignedQuantityMap = DB::table('order_items')
-                ->join('orders', 'order_items.order_id', '=', 'orders.id')
-                ->whereIn('order_items.product_id', $productIds)
-                ->where('orders.store_id', $storeId)
-                ->whereNotIn('orders.status', $deductedStatuses)
-                ->whereNull('orders.deleted_at')
-                ->where('orders.id', '!=', $order->id)
-                ->select('order_items.product_id', DB::raw('SUM(order_items.quantity) as total'))
-                ->groupBy('order_items.product_id')
-                ->get()
-                ->keyBy('product_id');
+            if (!$storeAvailability || empty($storeAvailability['can_fulfill_entire_order'])) {
+                $blockingProducts = collect($storeAvailability['inventory_details'] ?? [])
+                    ->filter(fn ($detail) => empty($detail['can_fulfill']))
+                    ->map(function ($detail) {
+                        return [
+                            'product_id' => $detail['product_id'] ?? null,
+                            'product_name' => $detail['product_name'] ?? 'Unknown Product',
+                            'required' => $detail['required_quantity'] ?? 0,
+                            'physical_quantity' => $detail['physical_quantity'] ?? 0,
+                            'batch_physical_quantity' => $detail['batch_physical_quantity'] ?? 0,
+                            'sellable_barcode_quantity' => $detail['sellable_barcode_quantity'] ?? 0,
+                            'assigned_to_other_orders' => $detail['assigned_quantity'] ?? 0,
+                            'unbarcoded_assigned_to_other_orders' => $detail['unbarcoded_assigned_quantity'] ?? 0,
+                            'assigned_quantity_subtracted' => $detail['assigned_quantity_subtracted'] ?? 0,
+                            'actually_free' => $detail['available_quantity'] ?? 0,
+                            'stock_source' => $detail['stock_source'] ?? null,
+                        ];
+                    })
+                    ->values();
 
-            foreach ($order->items as $orderItem) {
-                $pid = $orderItem->product_id;
-                $pStock = $physicalStock->get($pid)->total ?? 0;
-                $aStock = $assignedQuantityMap->get($pid)->total ?? 0;
-                $actualAvailable = max(0, $pStock - $aStock);
-
-                if ($actualAvailable < $orderItem->quantity) {
-                    return response()->json([
-                        'success' => false,
-                        'message' => "Insufficient real-time inventory for '{$orderItem->product_name}' at {$store->name} due to other recent assignments.",
-                        'data' => [
-                            'product' => $orderItem->product_name,
-                            'required' => $orderItem->quantity,
-                            'physically_present' => $pStock,
-                            'assigned_to_other_orders' => $aStock,
-                            'actually_free' => $actualAvailable,
-                        ],
-                    ], 400);
-                }
+                return response()->json([
+                    'success' => false,
+                    'message' => "Insufficient real-time inventory at {$store->name}. The availability check is barcode-aware; see blocking_products for the exact reason.",
+                    'data' => [
+                        'store_id' => $store->id,
+                        'store_name' => $store->name,
+                        'fulfillment_percentage' => $storeAvailability['fulfillment_percentage'] ?? 0,
+                        'blocking_products' => $blockingProducts,
+                    ],
+                ], 400);
             }
 
             DB::beginTransaction();

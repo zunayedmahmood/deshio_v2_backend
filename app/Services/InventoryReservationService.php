@@ -14,6 +14,28 @@ use Illuminate\Support\Facades\DB;
 
 class InventoryReservationService
 {
+    public const NON_RESERVED_BARCODE_STATUSES = [
+        'sold',
+        'with_customer',
+        'defective',
+        'disposed',
+        'vendor_return',
+    ];
+
+    /**
+     * Every status that can still hold product reservation.
+     * Keep this single source aligned with Product List and Free Reserved Product page.
+     *
+     * @return array<int, string>
+     */
+    public function liveReservationStatuses(): array
+    {
+        return array_values(array_unique(array_merge(
+            Order::RESERVATION_STATUSES,
+            ['confirmed']
+        )));
+    }
+
     /**
      * Physical stock used by product list/reservation availability.
      * Keep this aligned with ProductController::productListComputedSelects().
@@ -31,10 +53,7 @@ class InventoryReservationService
      */
     public function liveReservedQuantity(int $productId): int
     {
-        $reservationStatuses = array_values(array_unique(array_merge(
-            Order::RESERVATION_STATUSES,
-            ['confirmed']
-        )));
+        $reservationStatuses = $this->liveReservationStatuses();
 
         return (int) OrderItem::query()
             ->join('orders', 'orders.id', '=', 'order_items.order_id')
@@ -59,13 +78,7 @@ class InventoryReservationService
                 $q->whereNull('order_items.product_barcode_id')
                   ->orWhereNull('product_barcodes.id')
                   ->orWhereNull('product_barcodes.current_status')
-                  ->orWhereNotIn('product_barcodes.current_status', [
-                      'sold',
-                      'with_customer',
-                      'defective',
-                      'disposed',
-                      'vendor_return',
-                  ]);
+                  ->orWhereNotIn('product_barcodes.current_status', self::NON_RESERVED_BARCODE_STATUSES);
             })
             ->where(function ($q) {
                 $q->whereNull('order_items.product_options')
@@ -588,12 +601,17 @@ class InventoryReservationService
 
     public function reserve(int $productId, int $quantity): ReservedProduct
     {
-        return $this->adjustReserved($productId, abs($quantity));
+        // Avoid accumulated drift from duplicate observer paths. The database
+        // order_items rows are the source of truth for reservation quantity.
+        return $this->syncProduct($productId);
     }
 
     public function release(int $productId, int $quantity): ReservedProduct
     {
-        return $this->adjustReserved($productId, -abs($quantity));
+        // Rebuild from live order_items instead of subtracting a guessed delta.
+        // This fixes cases where Product List showed 3 reserved but only 1 live
+        // order line actually existed for the product.
+        return $this->syncProduct($productId);
     }
 
     /**

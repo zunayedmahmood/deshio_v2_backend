@@ -54,6 +54,92 @@ class OrderController extends Controller
         }
     }
 
+    private function truthyRequestFlag(Request $request, string $key): bool
+    {
+        if (!$request->has($key)) {
+            return false;
+        }
+
+        return filter_var($request->input($key), FILTER_VALIDATE_BOOLEAN);
+    }
+
+    /**
+     * Same live reservation rules used by InventoryReservationService and Product List.
+     * The Free Reserved Products page must use this, not a hand-picked list of
+     * only pending/pending_assignment statuses.
+     */
+    private function applyLiveReservationItemFilter($itemQuery, int $productId): void
+    {
+        $itemQuery->where('product_id', $productId)
+            ->where(function ($q) {
+                $q->whereNull('is_inventory_deducted')
+                  ->orWhere('is_inventory_deducted', false);
+            })
+            ->where(function ($q) {
+                $q->whereNull('product_options')
+                  ->orWhereNull('product_options->_barcode_restocked_to_inventory')
+                  ->orWhere('product_options->_barcode_restocked_to_inventory', false);
+            })
+            ->where(function ($q) {
+                $q->whereNull('product_barcode_id')
+                  ->orWhereDoesntHave('barcode')
+                  ->orWhereHas('barcode', function ($barcodeQuery) {
+                      $barcodeQuery->whereNull('current_status')
+                          ->orWhereNotIn('current_status', InventoryReservationService::NON_RESERVED_BARCODE_STATUSES);
+                  });
+            });
+    }
+
+    private function applyLiveReservationOrderFilter($query, int $productId): void
+    {
+        $reservationService = app(InventoryReservationService::class);
+
+        $query->whereIn('status', $reservationService->liveReservationStatuses())
+            ->where(function ($q) {
+                $q->whereNull('order_type')
+                  ->orWhere('order_type', '!=', 'preorder');
+            })
+            ->whereHas('items', function ($itemQuery) use ($productId) {
+                $this->applyLiveReservationItemFilter($itemQuery, $productId);
+            });
+    }
+
+    private function itemStillHoldsReservationForRequestedProduct($item, int $productId): bool
+    {
+        if ((int) ($item->product_id ?? 0) !== $productId) {
+            return false;
+        }
+
+        if ((bool) ($item->is_inventory_deducted ?? false)) {
+            return false;
+        }
+
+        $options = $item->product_options ?? null;
+        if (is_string($options)) {
+            $decoded = json_decode($options, true);
+            $options = is_array($decoded) ? $decoded : null;
+        }
+        if (is_array($options) && !empty($options['_barcode_restocked_to_inventory'])) {
+            return false;
+        }
+
+        $barcodeStatus = $item->barcode?->current_status;
+        if ($barcodeStatus !== null && in_array($barcodeStatus, InventoryReservationService::NON_RESERVED_BARCODE_STATUSES, true)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private function reservedQuantityForRequestedProduct(Order $order, int $productId): int
+    {
+        $order->loadMissing('items.barcode');
+
+        return (int) $order->items
+            ->filter(fn ($item) => $this->itemStillHoldsReservationForRequestedProduct($item, $productId))
+            ->sum(fn ($item) => (int) ($item->quantity ?? 0));
+    }
+
     /**
      * Keep social-commerce/e-commerce order workflow status consistent while
      * editing cart lines. Unassigned online orders must remain in
@@ -120,9 +206,17 @@ class OrderController extends Controller
             'salesman',
             'items.product',
             'items.batch',
+            'items.barcode',
             'serviceItems.service',
             'payments.paymentMethod',
         ]);
+
+        $productFilterId = (int) $request->input('product_id', 0);
+        $reservationHolderMode = $productFilterId > 0 && (
+            $this->truthyRequestFlag($request, 'reservation_holders')
+            || $this->truthyRequestFlag($request, 'reserved_product_orders')
+            || $this->truthyRequestFlag($request, 'live_reservations')
+        );
 
         // Filter by order type (counter, social_commerce, ecommerce)
         if ($request->filled('order_type')) {
@@ -161,13 +255,16 @@ class OrderController extends Controller
         }
 
         // Exact product filter. Used by the Free Reserved Products page to find
-        // old/lost orders that are holding reservation for one selected product
-        // variant without relying on broad order search text.
-        if ($request->filled('product_id')) {
-            $productId = (int) $request->input('product_id');
-            if ($productId > 0) {
-                $query->whereHas('items', function ($itemQuery) use ($productId) {
-                    $itemQuery->where('product_id', $productId);
+        // orders holding reservation for one selected product variant.
+        // In reservation-holder mode this must mirror Product List reserved qty,
+        // including assigned/picking/ready/confirmed-not-deducted lines and
+        // excluding already sold/with-customer/restocked barcode lines.
+        if ($productFilterId > 0) {
+            if ($reservationHolderMode) {
+                $this->applyLiveReservationOrderFilter($query, $productFilterId);
+            } else {
+                $query->whereHas('items', function ($itemQuery) use ($productFilterId) {
+                    $itemQuery->where('product_id', $productFilterId);
                 });
             }
         }
@@ -285,11 +382,29 @@ class OrderController extends Controller
         $sortOrder = $request->input("sort_order", "desc");
         $query->orderBy($sortBy, $sortOrder);
 
+        $reservationSummary = null;
+        if ($reservationHolderMode && $productFilterId > 0) {
+            $reservationService = app(InventoryReservationService::class);
+            $syncedRow = $reservationService->syncProduct($productFilterId);
+            $reservationSummary = [
+                'product_id' => $productFilterId,
+                'reserved_quantity_total' => (int) $syncedRow->reserved_inventory,
+                'total_inventory' => (int) $syncedRow->total_inventory,
+                'available_inventory' => (int) $syncedRow->available_inventory,
+                'statuses' => $reservationService->liveReservationStatuses(),
+            ];
+        }
+
         $orders = $query->paginate($request->input('per_page', 20));
 
         $formattedOrders = [];
         foreach ($orders as $order) {
-            $formattedOrders[] = $this->formatOrderResponse($order);
+            $formatted = $this->formatOrderResponse($order, $productFilterId > 0);
+            if ($productFilterId > 0) {
+                $formatted['requested_product_id'] = $productFilterId;
+                $formatted['requested_product_reserved_quantity'] = $this->reservedQuantityForRequestedProduct($order, $productFilterId);
+            }
+            $formattedOrders[] = $formatted;
         }
 
         return response()->json([
@@ -297,6 +412,7 @@ class OrderController extends Controller
             'data' => [
                 'current_page' => $orders->currentPage(),
                 'data' => $formattedOrders,
+                'reservation_summary' => $reservationSummary,
                 'first_page_url' => $orders->url(1),
                 'from' => $orders->firstItem(),
                 'last_page' => $orders->lastPage(),

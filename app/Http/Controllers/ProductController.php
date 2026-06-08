@@ -88,8 +88,17 @@ class ProductController extends Controller
             ['confirmed']
         )));
 
+        $nonReservedBarcodeStatuses = [
+            'sold',
+            'with_customer',
+            'defective',
+            'disposed',
+            'vendor_return',
+        ];
+
         $liveReservedSubquery = \DB::table('order_items')
             ->join('orders', 'orders.id', '=', 'order_items.order_id')
+            ->leftJoin('product_barcodes', 'product_barcodes.id', '=', 'order_items.product_barcode_id')
             ->selectRaw('COALESCE(SUM(order_items.quantity), 0)')
             ->whereColumn('order_items.product_id', 'products.id')
             ->whereNull('orders.deleted_at')
@@ -101,6 +110,12 @@ class ProductController extends Controller
             ->where(function ($q) {
                 $q->whereNull('order_items.is_inventory_deducted')
                   ->orWhere('order_items.is_inventory_deducted', false);
+            })
+            ->where(function ($q) use ($nonReservedBarcodeStatuses) {
+                $q->whereNull('order_items.product_barcode_id')
+                  ->orWhereNull('product_barcodes.id')
+                  ->orWhereNull('product_barcodes.current_status')
+                  ->orWhereNotIn('product_barcodes.current_status', $nonReservedBarcodeStatuses);
             })
             ->where(function ($q) {
                 $q->whereNull('order_items.product_options')

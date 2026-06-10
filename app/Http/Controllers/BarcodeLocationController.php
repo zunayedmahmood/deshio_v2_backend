@@ -10,6 +10,7 @@ use App\Models\Product;
 use App\Models\Employee;
 use App\Models\OrderItem;
 use App\Services\OrderBarcodeLifecycleService;
+use App\Services\InventoryReservationService;
 use App\Traits\DatabaseAgnosticSearch;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -886,6 +887,13 @@ class BarcodeLocationController extends Controller
                 'message' => 'Batch not found'
             ], 404);
         }
+
+        // Batch lookup should not show a stale batch quantity when barcode
+        // lifecycle says more/less sellable units exist. Reconcile before
+        // computing the summary so cases like "Barcode IDs 2, Physical Stock 1"
+        // are corrected when they are caused by stale product_batches.quantity.
+        app(InventoryReservationService::class)->reconcileBatchStockFromBarcodes((int) $batch->id);
+        $batch->refresh()->load('product');
 
         $query = ProductBarcode::where('batch_id', $batchId)
             ->with(['currentStore', 'product']);

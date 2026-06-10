@@ -530,7 +530,7 @@ class InventoryReservationService
      *
      * @return array<int, array<int, int>> store_id => [product_id => qty]
      */
-    public function sellableBarcodeQuantitiesByStore(array $productIds, array $storeIds): array
+    public function sellableBarcodeQuantitiesByStore(array $productIds, array $storeIds, ?int $excludeOrderId = null): array
     {
         $productIds = collect($productIds)
             ->map(fn ($id) => (int) $id)
@@ -568,7 +568,15 @@ class InventoryReservationService
             })
             ->whereDoesntHave('deletedPurchaseOrderLink')
             ->whereDoesntHave('batchDeletedLink')
-            ->whereDoesntHave('orderItems', function ($q) {
+            ->whereDoesntHave('orderItems', function ($q) use ($excludeOrderId) {
+                // A pending_assignment order may already hold a specific barcode as its
+                // reservation. While checking that same order for store assignment, that
+                // barcode must count as available for the order itself; only barcode
+                // locks from other still-open orders should block this availability row.
+                if ($excludeOrderId) {
+                    $q->where('order_items.order_id', '!=', $excludeOrderId);
+                }
+
                 $q->whereHas('order', function ($orderQuery) {
                     $orderQuery->whereNotIn('status', OrderBarcodeLifecycleService::NON_LOCKING_ORDER_STATUSES);
                 });

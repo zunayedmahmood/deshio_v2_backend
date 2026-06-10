@@ -580,7 +580,7 @@ class OrderManagementController extends Controller
             ->keyBy('product_id');
 
         $barcodeTrackedProductIds = $reservationService->barcodeTrackedProductIds($productIds);
-        $sellableBarcodeCounts = $reservationService->sellableBarcodeQuantitiesByStore($productIds, $storeIds);
+        $sellableBarcodeCounts = $reservationService->sellableBarcodeQuantitiesByStore($productIds, $storeIds, $excludeOrderId);
 
         $batches = ProductBatch::whereIn('product_id', $productIds)
             ->whereIn('store_id', $storeIds)

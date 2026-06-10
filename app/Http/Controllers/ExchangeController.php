@@ -108,12 +108,8 @@ class ExchangeController extends Controller
                 $originalOrder = Order::findOrFail($request->order_id);
                 $this->assertOrderCanReturnOrExchange($originalOrder);
 
-                $existingReturn = ProductReturn::where('order_id', $originalOrder->id)
-                    ->whereNotIn('status', ['rejected', 'cancelled'])
-                    ->first();
-                if ($existingReturn) {
-                    throw new \Exception("A return request (#{$existingReturn->return_number}) already exists for this order.");
-                }
+                // Multiple partial returns/exchanges are allowed for the same order.
+                // Item-level validation below blocks only quantities/barcodes already under return.
             }
 
             $storeId = $request->exchangeAtStoreId;
@@ -132,6 +128,8 @@ class ExchangeController extends Controller
             $returnNumber = $this->generateReturnNumber();
             $totalReturnValue = 0;
             $returnItems = [];
+            $requestedQtyByOrderItem = [];
+            $requestedBarcodeIds = [];
 
             foreach ($request->removedProducts as $item) {
                 $orderItem = null;
@@ -142,10 +140,27 @@ class ExchangeController extends Controller
                     if ($originalOrder && (int) $orderItem->order_id !== (int) $originalOrder->id) {
                         throw new \Exception("Removed item {$item['order_item_id']} does not belong to order {$originalOrder->order_number}.");
                     }
+
+                    $alreadyReturned = $this->getReturnedQuantity((int) $orderItem->id);
+                    $requestedSoFar = (int) ($requestedQtyByOrderItem[$orderItem->id] ?? 0);
+                    $availableForReturn = max(0, (int) $orderItem->quantity - $alreadyReturned - $requestedSoFar);
+                    if ((int) $item['quantity'] > $availableForReturn) {
+                        throw new \Exception("Cannot exchange {$item['quantity']} unit(s) of {$orderItem->product_name}. {$alreadyReturned} already returned/under return; {$availableForReturn} still available on this order item.");
+                    }
+                    $requestedQtyByOrderItem[$orderItem->id] = $requestedSoFar + (int) $item['quantity'];
+
                     $batchId = $batchId ?: $orderItem->product_batch_id;
                 }
 
                 $barcodeId = $item['barcode_id'] ?? $item['product_barcode_id'] ?? null;
+                if ($barcodeId) {
+                    $barcodeId = (int) $barcodeId;
+                    if (in_array($barcodeId, $requestedBarcodeIds, true)) {
+                        throw new \Exception('The same barcode was selected more than once in this exchange request. Scan each sold unit only once.');
+                    }
+                    $requestedBarcodeIds[] = $barcodeId;
+                }
+
                 $returnedBarcodeIds = [];
                 $returnedBarcodes = [];
                 if ($barcodeId && $orderItem && $originalOrder) {
@@ -160,6 +175,10 @@ class ExchangeController extends Controller
                     }
                     if (!in_array($barcode->current_status, ['with_customer', 'sold'], true)) {
                         throw new \Exception("Barcode {$barcode->barcode} is not currently with the customer.");
+                    }
+                    $existingReturn = $this->findActiveReturnUsingBarcode((int) $barcode->id);
+                    if ($existingReturn) {
+                        throw new \Exception("Barcode {$barcode->barcode} is already included in return #{$existingReturn->return_number} ({$existingReturn->status}).");
                     }
                     $batchId = $batchId ?: $barcode->batch_id;
                     $returnedBarcodeIds = [$barcode->id];
@@ -596,6 +615,60 @@ class ExchangeController extends Controller
         return ['total_tax' => round($taxAmount, 2)];
     }
 
+    private function activeReturnStatuses(): array
+    {
+        return ['pending', 'approved', 'processing', 'processed', 'completed', 'refunded'];
+    }
+
+    private function getReturnedQuantity(int $orderItemId): int
+    {
+        $returns = ProductReturn::whereIn('status', $this->activeReturnStatuses())->get(['id', 'return_items']);
+        $totalReturned = 0;
+
+        foreach ($returns as $return) {
+            foreach ($return->return_items ?? [] as $item) {
+                if ((int) ($item['order_item_id'] ?? 0) === (int) $orderItemId) {
+                    $totalReturned += (int) ($item['quantity'] ?? 0);
+                }
+            }
+        }
+
+        return $totalReturned;
+    }
+
+    private function findActiveReturnUsingBarcode(int $barcodeId, ?int $orderId = null): ?ProductReturn
+    {
+        $query = ProductReturn::query()
+            ->whereIn('status', $this->activeReturnStatuses());
+
+        if ($orderId) {
+            $query->where('order_id', $orderId);
+        }
+
+        foreach ($query->get(['id', 'return_number', 'status', 'return_items']) as $return) {
+            foreach ($return->return_items ?? [] as $item) {
+                $ids = collect($item['returned_barcode_ids'] ?? [])
+                    ->merge([$item['product_barcode_id'] ?? null, $item['barcode_id'] ?? null])
+                    ->filter()
+                    ->map(fn ($id) => (int) $id);
+
+                if ($ids->contains((int) $barcodeId)) {
+                    return $return;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function assertBarcodeNotAlreadyInActiveReturn(int $barcodeId, Order $order): void
+    {
+        $existingReturn = $this->findActiveReturnUsingBarcode($barcodeId, (int) $order->id);
+        if ($existingReturn) {
+            throw new \Exception("Barcode is already included in return #{$existingReturn->return_number} ({$existingReturn->status}). Scan another unit from this order.");
+        }
+    }
+
     private function getExactReturnableBarcodeForOrderItem(Order $order, OrderItem $orderItem, int $barcodeId, int $quantity): ProductBarcode
     {
         if ($quantity !== 1) {
@@ -626,6 +699,8 @@ class ExchangeController extends Controller
         if ($barcode->is_defective) {
             throw new \Exception("Barcode {$barcode->barcode} is already marked defective.");
         }
+
+        $this->assertBarcodeNotAlreadyInActiveReturn((int) $barcode->id, $order);
 
         $metadata = $barcode->location_metadata ?? [];
         $belongsToOrder = (int) ($orderItem->product_barcode_id ?? 0) === (int) $barcode->id

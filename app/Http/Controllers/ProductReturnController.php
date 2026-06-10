@@ -294,16 +294,13 @@ class ProductReturnController extends Controller
         try {
             // 1. Create the return (logic from store())
             $order = Order::with('items')->findOrFail($request->order_id);
-            $existingReturn = ProductReturn::where('order_id', $order->id)
-                ->whereNotIn('status', ['rejected', 'cancelled'])
-                ->first();
-            
-            if ($existingReturn) {
-                throw new \Exception("A return request (#{$existingReturn->return_number}) already exists for this order.");
-            }
+            // Multiple partial returns/exchanges are allowed for the same order.
+            // Validation below blocks only quantities/barcodes that were already returned.
 
             $returnItems = [];
             $totalReturnValue = 0;
+            $requestedQtyByOrderItem = [];
+            $requestedBarcodeIds = [];
 
             foreach ($request->items as $item) {
                 $orderItem = OrderItem::findOrFail($item['order_item_id']);
@@ -312,13 +309,23 @@ class ProductReturnController extends Controller
                 }
 
                 $alreadyReturned = $this->getReturnedQuantity($orderItem->id);
-                $availableForReturn = $orderItem->quantity - $alreadyReturned;
+                $requestedSoFar = (int) ($requestedQtyByOrderItem[$orderItem->id] ?? 0);
+                $availableForReturn = max(0, (int) $orderItem->quantity - $alreadyReturned - $requestedSoFar);
 
-                if ($item['quantity'] > $availableForReturn) {
-                    throw new \Exception("Cannot return {$item['quantity']} units. Only {$availableForReturn} available for return.");
+                if ((int) $item['quantity'] > $availableForReturn) {
+                    throw new \Exception("Cannot return {$item['quantity']} unit(s) of {$orderItem->product_name}. {$alreadyReturned} already returned/under return; {$availableForReturn} still available on this order item.");
                 }
+                $requestedQtyByOrderItem[$orderItem->id] = $requestedSoFar + (int) $item['quantity'];
 
                 $selectedBarcodeId = $item['product_barcode_id'] ?? $item['barcode_id'] ?? null;
+                if ($selectedBarcodeId) {
+                    $selectedBarcodeId = (int) $selectedBarcodeId;
+                    if (in_array($selectedBarcodeId, $requestedBarcodeIds, true)) {
+                        throw new \Exception('The same barcode was selected more than once in this return request. Scan each sold unit only once.');
+                    }
+                    $requestedBarcodeIds[] = $selectedBarcodeId;
+                }
+
                 $returnableBarcodes = $selectedBarcodeId
                     ? collect([$this->getExactReturnableBarcodeForOrderItem($order, $orderItem, (int) $selectedBarcodeId, (int) $item['quantity'])])
                     : $this->getReturnableBarcodesForOrderItem($order, $orderItem, (int) $item['quantity']);
@@ -437,18 +444,14 @@ class ProductReturnController extends Controller
         try {
             $order = Order::with('items')->findOrFail($request->order_id);
 
-            // Check for existing active returns for this order
-            $existingReturn = ProductReturn::where('order_id', $order->id)
-                ->whereNotIn('status', ['rejected', 'cancelled'])
-                ->first();
-            
-            if ($existingReturn) {
-                throw new \Exception("A return request (#{$existingReturn->return_number}) already exists for this order. Cannot create duplicate returns.");
-            }
+            // Multiple partial returns/exchanges are allowed for the same order.
+            // Validation below blocks only quantities/barcodes that were already returned.
 
             // Validate return items
             $returnItems = [];
             $totalReturnValue = 0;
+            $requestedQtyByOrderItem = [];
+            $requestedBarcodeIds = [];
 
             foreach ($request->items as $item) {
                 $orderItem = OrderItem::findOrFail($item['order_item_id']);
@@ -460,11 +463,13 @@ class ProductReturnController extends Controller
 
                 // Check quantity
                 $alreadyReturned = $this->getReturnedQuantity($orderItem->id);
-                $availableForReturn = $orderItem->quantity - $alreadyReturned;
+                $requestedSoFar = (int) ($requestedQtyByOrderItem[$orderItem->id] ?? 0);
+                $availableForReturn = max(0, (int) $orderItem->quantity - $alreadyReturned - $requestedSoFar);
 
-                if ($item['quantity'] > $availableForReturn) {
-                    throw new \Exception("Cannot return {$item['quantity']} units. Only {$availableForReturn} available for return.");
+                if ((int) $item['quantity'] > $availableForReturn) {
+                    throw new \Exception("Cannot return {$item['quantity']} unit(s) of {$orderItem->product_name}. {$alreadyReturned} already returned/under return; {$availableForReturn} still available on this order item.");
                 }
+                $requestedQtyByOrderItem[$orderItem->id] = $requestedSoFar + (int) $item['quantity'];
 
                 // Requirement: only barcode-tracked sold items are returnable.
                 if (empty($orderItem->product_barcode_id) && empty($orderItem->product_batch_id)) {
@@ -472,6 +477,14 @@ class ProductReturnController extends Controller
                 }
 
                 $selectedBarcodeId = $item['product_barcode_id'] ?? $item['barcode_id'] ?? null;
+                if ($selectedBarcodeId) {
+                    $selectedBarcodeId = (int) $selectedBarcodeId;
+                    if (in_array($selectedBarcodeId, $requestedBarcodeIds, true)) {
+                        throw new \Exception('The same barcode was selected more than once in this return request. Scan each sold unit only once.');
+                    }
+                    $requestedBarcodeIds[] = $selectedBarcodeId;
+                }
+
                 $returnableBarcodes = $selectedBarcodeId
                     ? collect([$this->getExactReturnableBarcodeForOrderItem($order, $orderItem, (int) $selectedBarcodeId, (int) $item['quantity'])])
                     : $this->getReturnableBarcodesForOrderItem($order, $orderItem, (int) $item['quantity']);
@@ -989,6 +1002,77 @@ class ProductReturnController extends Controller
         ], true);
     }
 
+    private function activeReturnStatuses(): array
+    {
+        return ['pending', 'approved', 'processing', 'processed', 'completed', 'refunded'];
+    }
+
+    private function getActiveReturnedBarcodeIds(?int $orderId = null, ?int $orderItemId = null): array
+    {
+        $query = ProductReturn::query()
+            ->whereIn('status', $this->activeReturnStatuses());
+
+        if ($orderId) {
+            $query->where('order_id', $orderId);
+        }
+
+        $ids = [];
+        foreach ($query->get(['id', 'return_number', 'return_items']) as $return) {
+            foreach ($return->return_items ?? [] as $item) {
+                if ($orderItemId && (int) ($item['order_item_id'] ?? 0) !== (int) $orderItemId) {
+                    continue;
+                }
+
+                foreach (($item['returned_barcode_ids'] ?? []) as $id) {
+                    if ($id) {
+                        $ids[] = (int) $id;
+                    }
+                }
+
+                foreach (['product_barcode_id', 'barcode_id'] as $key) {
+                    if (!empty($item[$key])) {
+                        $ids[] = (int) $item[$key];
+                    }
+                }
+            }
+        }
+
+        return array_values(array_unique(array_filter($ids)));
+    }
+
+    private function findActiveReturnUsingBarcode(int $barcodeId, ?int $orderId = null): ?ProductReturn
+    {
+        $query = ProductReturn::query()
+            ->whereIn('status', $this->activeReturnStatuses());
+
+        if ($orderId) {
+            $query->where('order_id', $orderId);
+        }
+
+        foreach ($query->get(['id', 'return_number', 'status', 'return_items']) as $return) {
+            foreach ($return->return_items ?? [] as $item) {
+                $ids = collect($item['returned_barcode_ids'] ?? [])
+                    ->merge([$item['product_barcode_id'] ?? null, $item['barcode_id'] ?? null])
+                    ->filter()
+                    ->map(fn ($id) => (int) $id);
+
+                if ($ids->contains((int) $barcodeId)) {
+                    return $return;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private function assertBarcodeNotAlreadyInActiveReturn(int $barcodeId, Order $order): void
+    {
+        $existingReturn = $this->findActiveReturnUsingBarcode($barcodeId, (int) $order->id);
+        if ($existingReturn) {
+            throw new \Exception("This barcode is already included in return #{$existingReturn->return_number} ({$existingReturn->status}). Scan another unit from this order.");
+        }
+    }
+
     private function getExactReturnableBarcodeForOrderItem(Order $order, OrderItem $orderItem, int $barcodeId, int $quantity): ProductBarcode
     {
         if ($quantity !== 1) {
@@ -1020,6 +1104,8 @@ class ProductReturnController extends Controller
             throw new \Exception("Barcode {$barcode->barcode} is already marked defective.");
         }
 
+        $this->assertBarcodeNotAlreadyInActiveReturn((int) $barcode->id, $order);
+
         $metadata = $barcode->location_metadata ?? [];
         $belongsToOrder = (int) ($orderItem->product_barcode_id ?? 0) === (int) $barcode->id
             || (int) ($metadata['order_id'] ?? 0) === (int) $order->id
@@ -1049,6 +1135,11 @@ class ProductReturnController extends Controller
                 $q->orWhere('id', $orderItem->product_barcode_id);
             }
         });
+
+        $alreadyReturnedBarcodeIds = $this->getActiveReturnedBarcodeIds((int) $order->id, (int) $orderItem->id);
+        if (!empty($alreadyReturnedBarcodeIds)) {
+            $query->whereNotIn('id', $alreadyReturnedBarcodeIds);
+        }
 
         return $query->take($requiredQty)->get();
     }
@@ -1546,14 +1637,14 @@ class ProductReturnController extends Controller
      */
     private function getReturnedQuantity($orderItemId): int
     {
-        $returns = ProductReturn::whereIn('status', ['approved', 'processed', 'completed', 'refunded'])->get();
+        $returns = ProductReturn::whereIn('status', $this->activeReturnStatuses())->get(['id', 'return_items']);
         
         $totalReturned = 0;
         foreach ($returns as $return) {
             if ($return->return_items) {
                 foreach ($return->return_items as $item) {
-                    if (isset($item['order_item_id']) && $item['order_item_id'] == $orderItemId) {
-                        $totalReturned += $item['quantity'];
+                    if (isset($item['order_item_id']) && (int) $item['order_item_id'] === (int) $orderItemId) {
+                        $totalReturned += (int) ($item['quantity'] ?? 0);
                     }
                 }
             }

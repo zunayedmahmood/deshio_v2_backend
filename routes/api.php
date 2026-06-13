@@ -44,6 +44,7 @@ use App\Http\Controllers\ManualSaleRelabelController;
 use App\Http\Controllers\HomepageSectionController;
 use App\Http\Controllers\SettingController;
 use App\Http\Controllers\MediaController;
+use App\Http\Controllers\SocialMediaLiveController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -71,6 +72,13 @@ Route::post('/login', [AuthController::class, 'login']);
 Route::post('/reset-password', [AuthController::class, 'resetPassword']);
 
 Route::get('/media/{path}', [MediaController::class, 'show'])->where('path', '.*');
+
+
+// ============================================
+// SOCIAL-MEDIA LIVE PRODUCT FEED (PUBLIC)
+// Customer-facing feed for Facebook Live catalog page
+// ============================================
+Route::get('/live/products-feed', [SocialMediaLiveController::class, 'publicFeed']);
 
 // ============================================
 // E-COMMERCE GUEST CHECKOUT (NO AUTH REQUIRED)
@@ -291,6 +299,19 @@ Route::middleware('auth:api')->group(function () {
     Route::prefix('settings')->group(function () {
         Route::get('/homepage', [SettingController::class, 'getAdminHomepageSettings']);
         Route::post('/homepage', [SettingController::class, 'updateHomepageSettings']);
+    });
+
+
+    // ============================================
+    // SOCIAL-MEDIA LIVE PRODUCT FEED MANAGEMENT
+    // Admins prepare the product list before Facebook Live
+    // ============================================
+    Route::prefix('live/products')->group(function () {
+        Route::get('/', [SocialMediaLiveController::class, 'adminIndex']);
+        Route::post('/items', [SocialMediaLiveController::class, 'addProduct']);
+        Route::delete('/items/{productId}', [SocialMediaLiveController::class, 'removeProduct']);
+        Route::patch('/status', [SocialMediaLiveController::class, 'updateStatus']);
+        Route::patch('/displaying-now', [SocialMediaLiveController::class, 'setDisplayingNow']);
     });
 
     Route::post('/logout', [AuthController::class, 'logout']);
